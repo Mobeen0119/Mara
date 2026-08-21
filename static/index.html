@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MARA</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="animated-bg"></div>
+<div class="grain"></div>
+
+<div id="authView">
+  <div class="auth-wrapper">
+    <div class="auth-card">
+      <div class="auth-logo">
+        <div class="mara-logo logo-pulse">
+          <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="20" cy="20" r="18" stroke="#e63946" stroke-width="1.5" opacity="0.3"/>
+            <circle cx="20" cy="20" r="12" fill="#e63946" opacity="0.15"/>
+            <text x="20" y="25" text-anchor="middle" fill="#e63946" font-family="Inter,sans-serif" font-size="16" font-weight="800">M</text>
+          </svg>
+        </div>
+        <h1>MARA</h1>
+        <div class="tagline">no motivation. no excuses. task gets done.</div>
+      </div>
+
+      <div class="auth-tabs" id="authModeToggle">
+        <button id="tabStart" class="active">Start</button>
+        <button id="tabLogin">Log in</button>
+      </div>
+
+      <div class="auth-panel" id="startPanel">
+        <div class="field">
+          <label>Your name</label>
+          <input type="text" id="stName" placeholder="what do I call you" />
+        </div>
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="stEmail" placeholder="where the daily message goes" />
+        </div>
+        <button type="button" class="add-constraint-btn" id="togglePasswordField">+ add a password (to log in from another device later)</button>
+        <div class="field hidden" id="passwordFieldWrap">
+          <label>Password</label>
+          <input type="password" id="stPassword" placeholder="optional" />
+        </div>
+        <div class="field hint">Works immediately either way. You'll get one confirmation email before Mara can message you.</div>
+        <button class="btn-primary" id="startSubmit">Start</button>
+        <div class="error-msg" id="startError"></div>
+      </div>
+
+      <div class="auth-panel hidden" id="loginPanel">
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="liEmail" />
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input type="password" id="liPassword" />
+        </div>
+        <div class="field hint">Only works if you set a password when you started.</div>
+        <button class="btn-primary" id="loginSubmit">Log in</button>
+        <div class="error-msg" id="loginError"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="dashView" class="hidden">
+  <div class="app-layout">
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-brand">
+          <div class="mara-logo logo-pulse">
+            <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <circle cx="20" cy="20" r="18" stroke="#e63946" stroke-width="1.5" opacity="0.3"/>
+              <circle cx="20" cy="20" r="12" fill="#e63946" opacity="0.15"/>
+              <text x="20" y="25" text-anchor="middle" fill="#e63946" font-family="Inter,sans-serif" font-size="16" font-weight="800">M</text>
+            </svg>
+          </div>
+          <div>
+            <h1>Mara</h1>
+            <div class="tagline">no excuses. task gets done.</div>
+          </div>
+        </div>
+        <div class="sidebar-status">
+          <span class="status-dot" id="sidebarStatusDot"></span>
+          <span id="sidebarStatusText">checking...</span>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="sidebar-section-label">Cases</div>
+        <div id="sidebarTaskList"></div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button id="settingsBtn">Settings</button>
+        <button id="signoutBtn">Sign out</button>
+      </div>
+    </aside>
+
+    <div class="main-content">
+      <header class="main-header">
+        <div class="header-left">
+          <button class="mobile-menu-btn" id="mobileMenuBtn">&#9776;</button>
+          <span class="mood-badge watching" id="moodBadge">WATCHING</span>
+          <span id="companionSub" style="font-size:11px;color:var(--text-muted);">watching tasks</span>
+        </div>
+        <div class="header-right">
+          <button class="header-btn" id="headerScheduleBtn">Schedule</button>
+        </div>
+      </header>
+
+      <div class="content-body">
+        <div class="content-main">
+          <div id="statusBanner" class="status-banner hidden"></div>
+
+          <div class="verdict-bar" id="verdictLine"></div>
+
+          <div class="new-task-section">
+            <button class="new-task-btn" id="newTaskBtn">
+              <span>+</span> File a new task
+            </button>
+            <div class="new-task-panel hidden" id="newTaskPanel">
+              <div class="field">
+                <label>What has to get done</label>
+                <textarea id="taskGoal" placeholder="the actual task, not a vague wish"></textarea>
+              </div>
+              <div class="field">
+                <label>Deadline</label>
+                <input type="date" id="taskDeadline" />
+              </div>
+              <div class="field">
+                <label>Daily reminder time</label>
+                <input type="time" id="taskTime" value="08:00" />
+              </div>
+              <div class="field">
+                <label>Constraints (off-limits times or activities)</label>
+                <div id="constraintList"></div>
+                <button class="add-constraint-btn" id="addConstraint">+ add a constraint</button>
+              </div>
+              <button class="btn-primary" id="createTaskBtn">File it</button>
+              <div class="error-msg" id="taskError"></div>
+            </div>
+          </div>
+
+          <div id="taskListActive"></div>
+          <div id="taskListClosed"></div>
+        </div>
+
+        <div class="content-side">
+          <div class="companion-section">
+            <div class="companion-avatar-area">
+              <div class="companion-orb">
+                <div class="orb-core"></div>
+                <div class="orb-ring"></div>
+                <div class="orb-ring"></div>
+              </div>
+              <div class="companion-title">MARA — LIVE</div>
+              <div class="companion-sub" id="companionSubSide">watching your tasks</div>
+            </div>
+            <div class="companion-chat-area">
+              <div class="chat-messages" id="globalChatMessages"></div>
+              <div class="chat-input-row">
+                <input type="text" id="globalChatInput" placeholder="talk to her" />
+                <button id="globalChatSend">Send</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="schedule-panel" id="schedulePanel">
+            <div class="schedule-header">Upcoming — 15 days</div>
+            <div class="schedule-body" id="scheduleStrip"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="settingsView" class="hidden">
+  <div class="app-layout">
+    <div class="main-content">
+      <header class="main-header">
+        <div class="header-left">
+          <button class="header-btn" id="closeSettingsBtn">&larr; Back</button>
+          <span style="font-size:14px;font-weight:600;">Settings</span>
+        </div>
+      </header>
+      <div class="settings-card">
+        <div class="settings-group">
+          <div class="settings-group-label">Account</div>
+          <div class="settings-row">
+            <span class="settings-row-label">Name</span>
+            <span class="settings-row-value" id="settingsName">-</span>
+          </div>
+          <div class="settings-row">
+            <span class="settings-row-label">Email</span>
+            <span class="settings-row-value" id="settingsEmail">-</span>
+          </div>
+          <div class="settings-row" id="settingsVerifyRow">
+            <span class="settings-row-label">Email status</span>
+            <span class="settings-row-value"><span id="settingsVerifiedStatus">-</span> <button class="btn-ghost" id="settingsResendBtn">Resend</button></span>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-group-label">Tasks</div>
+          <div class="field hint">Email-confirmed actions — confirmations are sent via email.</div>
+          <div id="settingsTaskList"></div>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-group-label">Session</div>
+          <button class="btn-secondary" id="settingsSignoutBtn">Sign out</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

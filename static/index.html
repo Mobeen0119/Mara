@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Eloise</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<!-- ===================== AUTH / VELVET ROOM ===================== -->
+<section id="auth-screen" class="auth-stage hidden">
+  <div class="auth-wrap">
+    <div class="brand-mark"><span class="brand-name">Eloise</span> <span class="brand-digit">//exe</span></div>
+    <p class="auth-tagline">execution is the only discipline</p>
+    <div class="auth-plate">
+      <div class="plate-ember"></div>
+      <div id="auth-form"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== APP / CONTROL DESK ===================== -->
+<section id="app-screen" class="hidden">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark"><span class="brand-name">Eloise</span><span class="brand-digit">//exe</span></span></div>
+    <p class="tagline">execution is the only discipline</p>
+    <nav class="nav">
+      <a class="nav-item" data-screen="today" onclick="navigate('today')"><span class="icon">&#x25B5;</span> Today</a>
+      <a class="nav-item" data-screen="goals" onclick="navigate('goals')"><span class="icon">&#x2197;</span> Goals</a>
+      <a class="nav-item" data-screen="new-goal" onclick="navigate('new-goal')"><span class="icon">+</span> File Goal</a>
+      <a class="nav-item" data-screen="schedule" onclick="navigate('schedule')"><span class="icon">&#x2140;</span> Schedule</a>
+      <a class="nav-item" data-screen="global-chat" onclick="navigate('global-chat')"><span class="icon">&#x2709;</span> Eloise</a>
+      <a class="nav-item" data-screen="settings" onclick="navigate('settings')"><span class="icon">&#x2699;</span> Settings</a>
+    </nav>
+    <div class="sidebar-foot"><span id="user-name" class="ember-dot"></span><span id="user-label"></span></div>
+  </aside>
+
+  <main id="main-content" class="main"></main>
+</section>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

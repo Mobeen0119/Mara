@@ -213,7 +213,7 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
 
 
 @router.post("/goals/{goal_id}/plan")
-def regen_plan(goal_id: int, body: RegenPlanRequest, user: dict = Depends(require_user)):
+def regen_plan(goal_id: int, user: dict = Depends(require_user), body: RegenPlanRequest = None):
     _goal_or_404(user, goal_id)
     threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
     return {"ok": True, "async": True}

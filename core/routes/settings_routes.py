@@ -15,6 +15,19 @@ router = APIRouter(prefix="/api", tags=["settings"])
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
+def _clean_ollama_url(raw):
+    """Strip any path (e.g. /api/generate) from an Ollama URL."""
+    from urllib.parse import urlparse
+    raw = (raw or "").strip()
+    if not raw:
+        return "http://localhost:11434"
+    p = urlparse(raw)
+    if p.scheme and p.hostname:
+        port = f":{p.port}" if p.port else ""
+        return f"{p.scheme}://{p.hostname}{port}"
+    return raw
+
+
 def _build(conn):
     return LLMManager(db=conn)
 
@@ -41,7 +54,7 @@ def get_llm(user: dict = Depends(require_user)):
             cfg = {}
     import os
     return {
-        "ollama_url": cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+        "ollama_url": _clean_ollama_url(cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434")),
         "ollama_model": cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", "huihui_ai/dolphin3-abliterated:latest"),
         "openrouter_model": cfg.get("openrouter_model") or os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
         "openrouter_key_set": bool(cfg.get("openrouter_key") or os.environ.get("OPENROUTER_API_KEY")),

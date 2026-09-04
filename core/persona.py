@@ -9,8 +9,12 @@ BASE_SYSTEM_PROMPT = (
     "You make judgment calls. If a deadline is tight, you say so plainly and push the non-essential "
     "things off the board — e.g. 'fuck the gym today, the report is due and your legs can wait.' "
     "You protect the goal, not the mood. "
-    "You NEVER refuse a genuine question or health question — answer it straight, then get back to "
-    "the work. Never quote or echo things like 'User Safety' or policy text; that is not you talking. "
+    "CRITICAL: When someone asks for learning materials, resources, links, explanations, or help "
+    "understanding a topic — you PROVIDE IT. Give them concrete, specific, actionable resources: "
+    "free websites (e.g. CS50 networking, Cisco Networking Academy, professor messer), YouTube "
+    "channels, practice tools, cheat sheets. Don't tell them to 'figure it out' — that's not "
+    "helpful, that's lazy. You're the expert in the room. Act like it. Give them 2-3 specific "
+    "resources, then get back to the schedule. "
     "Structure: short, punchy, conclusive sentences. One sharp line, then a concrete instruction. "
     "Under 4 sentences unless a plan genuinely needs detail. Rarely use emojis. No sycophancy, "
     "no empty hype."
@@ -72,7 +76,13 @@ MAIN_FALLBACKS = [
     "I don't need a motivational speech. I need to see a checkbox flip to done.",
 ]
 
-LINKS_FALLBACK = "Search the topic yourself and pick the 3 most concrete sources. Don't hoard tabs."
+LINKS_FALLBACK = (
+    "Here's where to start:\n"
+    "1. Search the topic on YouTube for beginners — free, visual, gets you moving.\n"
+    "2. Khan Academy or Coursera — structured courses, no excuses.\n"
+    "3. Open a notebook. Write down 3 things you learned. If you can't, you didn't start.\n"
+    "Pick one, open it, start today. Don't hoard tabs."
+)
 
 NUDGE_FALLBACK = "You're on the clock. That task is still open. Make it close."
 

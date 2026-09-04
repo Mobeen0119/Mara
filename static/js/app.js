@@ -459,13 +459,10 @@ async function renderBoard(el) {
       html += `</div>`;
     }
 
-    // stakes on the line
-    html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">On the line</div>
-      <h1>Debt.</h1><div class="header-rule"></div></div>`;
-    if (!m.stakes || m.stakes.length === 0) {
-      html += `<div class="empty-state"><h3>Nothing staked.</h3><p>Open a goal and pin a punishment to its deadline. Fear is a schedule too.</p></div>`;
-    } else {
-      html += `<div class="board-rows">`;
+    // — stakes removed per user request — //
+    /* if (m.stakes && m.stakes.length > 0) {
+      html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">On the line</div>
+        <h1>Debt.</h1><div class="header-rule"></div></div>`;
       m.stakes.forEach(s => {
         html += `<div class="card stake-card">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
@@ -475,8 +472,7 @@ async function renderBoard(el) {
           </div>
         </div>`;
       });
-      html += `</div>`;
-    }
+    } */
 
     html += `</div>`;  // close .screen-fill
     el.innerHTML = html;
@@ -547,7 +543,6 @@ async function renderGoalDetail(el, id) {
     // actions
     html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;">
       <button class="btn btn-sm btn-ghost" onclick="regenPlan(${g.id})">Redraw schedule</button>
-      <button class="btn btn-sm btn-ghost" onclick="pinStake(${g.id})">Pin a stake</button>
       <button class="btn btn-sm btn-ghost" onclick="completeGoal(${g.id})">Mark done</button>
       <button class="btn btn-sm btn-danger" style="color:#fff;" onclick="deleteGoal(${g.id})">Burn file</button>
     </div>`;
@@ -879,11 +874,6 @@ async function renderEloiseConsole() {
         const pc = s.top_pressure.score;
         const cls = pc >= 8 ? 'c-bad' : pc >= 6 ? 'c-hot' : pc >= 4 ? 'c-warn' : 'c-ok';
         cells.unshift({ k: `TOP PRESSURE · ${escHtml(s.top_pressure.goal)}`, v: `${pc}/10`, cls });
-      }
-      if (s.stakes && s.stakes.length) {
-        cells.push({ k: 'ON THE LINE', v: `${s.stakes.length} stake${s.stakes.length > 1 ? 's' : ''}`, cls: 'c-bad' });
-      } else {
-        cells.push({ k: 'ON THE LINE', v: 'none', cls: 'c-dim' });
       }
       tel.innerHTML = cells.map(c =>
         `<div class="cell ${c.cls || ''}"><span class="cell-k">${c.k}</span><span class="cell-v">${c.v}</span></div>`

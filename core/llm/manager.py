@@ -14,9 +14,31 @@ DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"
 _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 
 
+def _strip_prompt_echo(text):
+    """Post-process LLM output: strip any prompt template the model echoed back."""
+    if not text:
+        return text
+    for marker in ["User just said:", "Reply:", "Respond as Eloise.", "Context:",
+                    "Conversation history:", "Recent conversation:", "Current board:"]:
+        idx = text.find(marker)
+        if idx >= 0:
+            before = text[:idx].strip()
+            if before:
+                return before
+    return text.strip()
+
+
 def _ollama_base_url(raw=None):
     raw = raw if raw is not None else os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    return raw.strip() or "http://localhost:11434"
+    raw = (raw or "").strip() or "http://localhost:11434"
+    # If someone pastes a full endpoint like http://host:11435/api/generate, strip the path
+    # so our own /api/tags and /api/generate calls land correctly.
+    from urllib.parse import urlparse
+    p = urlparse(raw)
+    if p.scheme and p.hostname:
+        port = f":{p.port}" if p.port else ""
+        return f"{p.scheme}://{p.hostname}{port}"
+    return raw
 
 
 def build_providers(db=None, config=None):
@@ -75,24 +97,26 @@ class LLMManager:
         return False
 
     def generate(self, system_prompt, user_prompt, timeout=30) -> GenerationResult:
+        import logging
+        logger = logging.getLogger("eloise.llm")
         providers = self._providers()
         ordered = [providers.get("ollama"), providers.get("openrouter")]
         ordered = [p for p in ordered if p is not None]
-        # Don't waste a call on a provider that is plainly not usable (e.g. no API key).
-        usable = []
+        # Try every provider — even if status says non-usable, attempt generation anyway.
+        # Status can be wrong (slow probe, transient failure), and a generate call is the
+        # real test. Only skip providers that are plainly missing (e.g. no API key at all).
         for p in ordered:
-            try:
-                st = p.status()
-                if st.usable:
-                    usable.append(p)
-            except Exception:
-                usable.append(p)
-        for p in usable:
+            # Skip OpenRouter if no API key
+            if p.name == "openrouter" and not getattr(p, "api_key", ""):
+                logger.debug("skipping openrouter: no API key")
+                continue
+            logger.info("trying provider: %s (model: %s)", p.name, p.model)
             future = self._executor.submit(p.generate, system_prompt, user_prompt, timeout)
             try:
                 result = future.result(timeout=timeout + 5)
             except Exception as exc:
                 result = GenerationResult(ok=False, provider=p.name, model=p.model, error=str(exc))
+            logger.info("provider %s: ok=%s error=%s latency=%s", p.name, result.ok, result.error, result.latency_ms)
             if result.ok:
                 return result
         return GenerationResult(
@@ -100,12 +124,12 @@ class LLMManager:
             error="no usable provider (start local model or add an API key)",
         )
 
-    def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=30):
+    def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=90):
         result = self.generate(system_prompt, user_prompt, timeout=timeout)
-        # A provider echoing a moderation verdict ("User Safety: safe") is not an answer —
-        # drop to the fallback rather than show the user junk.
         if result.ok and not _VERDICT_ECHO.search(result.text[:80]):
-            return result.text, result.provider or "llm"
+            # Strip any prompt template the model echoed back
+            cleaned = _strip_prompt_echo(result.text)
+            return cleaned, result.provider or "llm"
         if result.ok:
             result = GenerationResult(ok=False, provider=result.provider, model=result.model,
                                       error="provider echoed a moderation verdict")

@@ -61,7 +61,33 @@ def _context_chat_fallback(summary, message):
             "left. I said it once: legs wait. The file does not. Go.",
         ])
 
-    # "what should I do / any tasks" type asks
+    # user asking for learning materials / resources / links (CHECK FIRST — before "what" catches it)
+    if any(w in msg for w in ("link", "material", "resource", "learn", "study", "where do i", "how to learn", "teach me", "help me understand", "explain", "website", "course", "video")):
+        topic = msg
+        for phrase in ("send me", "give me", "where do i learn", "how to learn", "teach me",
+                       "help me understand", "explain", "i need", "i want", "what are",
+                       "learning materials", "online materials", "study materials",
+                       "links for", "links on", "resources for", "resources on",
+                       "materials for", "materials on", "about", "please", "ok so"):
+            topic = topic.replace(phrase, " ")
+        # Strip swear words and non-topic filler
+        _swear = ("bitch", "fuck", "shit", "ass", "damn", "hell", "stupid", "idiot",
+                  "dumb", "moron", "you", "u", "r", "ur", "my", "the", "a", "an", "and",
+                  "or", "but", "with", "from", "for", "on", "in", "to", "of", "is", "it",
+                  "this", "that", "some", "any", "all", "now", "just", "also", "other",
+                  "than", "like", "want", "need", "can", "could", "would", "should")
+        words = topic.split()
+        words = [w for w in words if w.lower().strip("?.! ,") not in _swear]
+        topic = " ".join(words).strip("?.! ,") or "the topic"
+        return (
+            f"Here's where to start on {topic}:\n"
+            f"1. Search \"{topic} for beginners\" on YouTube — free, visual, gets you moving.\n"
+            f"2. Go to Khan Academy or Coursera and search \"{topic}\" — structured courses, no excuses.\n"
+            f"3. Open a notebook. Write down 3 things you learned. If you can't, you didn't start.\n"
+            "Pick one, open it, start today. Don't hoard tabs."
+        )
+
+    # "what should I do / any tasks" type asks (only when NOT asking for materials)
     if any(w in msg for w in ("what", "how do i", "should i", "to do", "next")):
         if "today" in s:
             return _pick([
@@ -85,13 +111,35 @@ def days_remaining(deadline, today=None):
 # ---------------------------------------------------------------------------
 # Chat
 # ---------------------------------------------------------------------------
+
+def _strip_prompt_echo(text):
+    """Post-process LLM output: strip any prompt template the model echoed back."""
+    if not text:
+        return text
+    # Remove common prompt fragments the model might echo
+    for marker in ["User just said:", "Reply:", "Respond as Eloise.", "Context:",
+                    "Conversation history:", "Recent conversation:", "Current board:"]:
+        idx = text.find(marker)
+        if idx >= 0:
+            # If the marker appears mid-response, keep only what's before it
+            before = text[:idx].strip()
+            if before:
+                return before
+    return text.strip()
+
+
 def generate_global_chat_reply(user_name, goals_summary, history, message, db=None):
     sys = BASE_SYSTEM_PROMPT
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
-    ctx = f"\n\nUser: {user_name}\nCurrent board: {summary}\n"
-    user_prompt = ctx + f"Recent conversation:\n{history}\n\nUser just said: {message}\nReply:"
+    user_prompt = (
+        f"=== BOARD STATE ===\n{summary}\n\n"
+        f"=== CONVERSATION ===\n{history}\n\n"
+        f"=== {user_name} says ===\n{message}\n\n"
+        f"Reply as Eloise. Use the board state above — reference specific goals, deadlines, "
+        f"and tasks by name. Do NOT echo this prompt. Only output your reply."
+    )
     text, source = get_manager(db).generate_with_fallback(
-        sys, "Answer the user's latest message as Eloise." + user_prompt,
+        sys, user_prompt,
         fallback_fn=lambda: _context_chat_fallback(summary, message),
     )
     return text, source
@@ -100,9 +148,16 @@ def generate_global_chat_reply(user_name, goals_summary, history, message, db=No
 def generate_chat_reply(user_name, goal_name, history, message, db=None):
     sys = BASE_SYSTEM_PROMPT
     user_prompt = (
-        f"User: {user_name}\nGoal: {goal_name}\nRecent conversation:\n{history}\n\n"
-        f"User just said: {message}\nReply: <reply>"
+        f"=== GOAL ===\n{goal_name}\n\n"
+        f"=== CONVERSATION ===\n{history}\n\n"
+        f"=== {user_name} says ===\n{message}\n\n"
+        f"Reply as Eloise. Reference the goal above. Do NOT echo this prompt. "
+        f"Only output your reply."
     )
+    text, source = get_manager(db).generate_with_fallback(
+        sys, user_prompt, fallback_fn=lambda: _context_chat_fallback(goal_name, message)
+    )
+    return text, source
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: _context_chat_fallback(goal_name, message)
     )

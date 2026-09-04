@@ -77,26 +77,31 @@ class OllamaProvider(LLMProvider):
         return [m.get("name", "") for m in resp.json().get("models", [])]
 
     def probe_fast(self, timeout=1.5) -> bool:
-        """Quick readiness check against the primary URL only (no WSL host sweeping).
-        Returns True only when reachable AND the model is installed. Capped so it can't hang."""
+        """Quick readiness check: try primary URL, then WSL host IPs. Returns True
+        only when reachable AND the model is installed. Capped so it can't hang."""
         import socket
         deadline = time.monotonic() + timeout
-        try:
-            socket.setdefaulttimeout(timeout)
-            host = self.base_url.replace("http://", "").replace("https://", "")
-            if ":" in host:
-                h, p = host.rsplit(":", 1)
-                port = int(p) if p.isdigit() else 11434
-            else:
-                h, port = host, 11434
-            with socket.create_connection((h, port), timeout=timeout):
-                pass
-        except Exception:
+        connected_url = None
+        # Try all candidate URLs (primary + WSL host IPs)
+        for url in self._candidates():
+            try:
+                host = url.replace("http://", "").replace("https://", "")
+                if ":" in host:
+                    h, p = host.rsplit(":", 1)
+                    port = int(p) if p.isdigit() else 11434
+                else:
+                    h, port = host, 11434
+                with socket.create_connection((h, port), timeout=min(timeout, 1)):
+                    connected_url = url
+                    break
+            except Exception:
+                continue
+        if not connected_url:
             return False
         if time.monotonic() > deadline:
             return False
         try:
-            installed = requests.get(f"{self.base_url}/api/tags", timeout=timeout)
+            installed = requests.get(f"{connected_url}/api/tags", timeout=timeout)
             self._last_models = [m.get("name", "") for m in installed.json().get("models", [])]
             return any(_tag_matches(m, self.model) for m in self._last_models)
         except Exception:
@@ -132,9 +137,9 @@ class OllamaProvider(LLMProvider):
     def generate(self, system_prompt, user_prompt, timeout=30) -> GenerationResult:
         payload = {"model": self.model, "system": system_prompt, "prompt": user_prompt, "stream": False}
         last_err = None
-        # Per-endpoint budget: connection-refused fails instantly; but a host that accepts
-        # yet stalls should not cost the full `timeout` per candidate. Cap each try short.
-        per_try = min(int(timeout), 8)
+        # Ollama can take 30-60s to load a large model from disk on first call.
+        # Use the full timeout per candidate instead of capping at 8s.
+        per_try = max(int(timeout), 60)
         for url in self._candidates():
             started = time.monotonic()
             try:

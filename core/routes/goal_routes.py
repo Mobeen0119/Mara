@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 import time
 from datetime import date, timedelta
@@ -18,7 +19,10 @@ from core.models import (
     GoalUpdateRequest,
     RegenPlanRequest,
     ReminderSetRequest,
+    StakeCreateRequest,
 )
+
+logger = logging.getLogger("eloise")
 
 router = APIRouter(prefix="/api", tags=["goals"])
 
@@ -35,12 +39,28 @@ def _goal_or_404(user, goal_id):
     return dict(row)
 
 
-def _goal_payload(g):
+def _goal_payload(g, conn=None):
+    g = dict(g) if not isinstance(g, dict) else g
     today = date.today().isoformat()
     try:
         dl = generation.days_remaining(g["deadline"], today)
     except Exception:
         dl = 0
+    pressure = None
+    if conn is not None:
+        try:
+            actions = [
+                dict(a) for a in conn.execute(
+                    "SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (g["id"],)
+                ).fetchall()
+            ]
+            blockers = conn.execute(
+                "SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)
+            ).fetchone()["c"]
+            missed = sum(1 for a in actions if a["status"] == "missed")
+            pressure = generation.pressure_rating(g, actions, open_blockers=blockers, missed_days=missed)
+        except Exception:
+            pressure = None
     return {
         "id": g["id"],
         "title": g["title"],
@@ -52,6 +72,7 @@ def _goal_payload(g):
         "constraints": json.loads(g["constraints"] or "[]"),
         "plan_status": g["plan_status"],
         "plan_summary": g["plan_summary"],
+        "pressure": pressure,
     }
 
 
@@ -66,7 +87,12 @@ def _insert_actions(conn, goal, entries):
 
 
 def _regenerate_plan_bg(user, goal_id):
-    goal = _goal_or_404(user, goal_id)
+    logger.warning("plan bg: goal %s thread started", goal_id)
+    try:
+        goal = _goal_or_404(user, goal_id)
+    except Exception as exc:
+        logger.warning("plan bg: goal %s lookup failed: %s", goal_id, exc)
+        return
     lock = _plan_locks.setdefault(goal_id, threading.Lock())
     acquired = lock.acquire(blocking=False)
     if not acquired:
@@ -76,8 +102,9 @@ def _regenerate_plan_bg(user, goal_id):
         conn = get_connection()
         conn.execute("DELETE FROM actions WHERE goal_id=?", (goal_id,))
         conn.commit()
-        user_row = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-        entries = generation.generate_plan(goal, dict(user_row), db=conn)
+        # Deterministic constraint-aware plan: fast and reliable (never blocks on the LLM).
+        entries = generation.build_plan_quick(goal)
+        logger.warning("plan bg: goal %s generated %s entries", goal_id, len(entries))
         sel = {}
         for e in entries:
             d = e["date"]
@@ -92,6 +119,8 @@ def _regenerate_plan_bg(user, goal_id):
             (f"{len(final)} blocks across {len(set(e['date'] for e in final))} days", goal_id),
         )
         conn.commit()
+    except Exception as exc:
+        logger.warning("plan bg: goal %s failed: %r", goal_id, exc)
     finally:
         lock.release()
 
@@ -120,7 +149,7 @@ def list_goals(user: dict = Depends(require_user)):
     rows = conn.execute("SELECT * FROM goals WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
     goals = []
     for g in rows:
-        payload = _goal_payload(g)
+        payload = _goal_payload(g, conn=conn)
         open_iv = conn.execute(
             "SELECT type FROM interventions WHERE goal_id=? AND user_id=? AND acknowledged=0",
             (g["id"], user["id"]),
@@ -146,7 +175,7 @@ def get_goal(goal_id: int, user: dict = Depends(require_user)):
     ]
     chat_history = json.loads(goal["chat_history"] or "[]")
     progress = generation.progress_stats(goal, actions)
-    payload = _goal_payload(goal)
+    payload = _goal_payload(goal, conn=conn)
     payload["plan"] = actions
     payload["blockers"] = blockers
     payload["chat_history"] = chat_history
@@ -176,11 +205,11 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
         fields.append("constraints=?")
         vals.append(json.dumps([c.strip() for c in body.constraints if c.strip()]))
     if not fields:
-        return _goal_payload(goal)
+        return _goal_payload(goal, conn=conn)
     vals.append(goal_id)
     conn.execute(f"UPDATE goals SET {', '.join(fields)} WHERE id=?", vals)
     conn.commit()
-    return _goal_payload(_goal_or_404(user, goal_id))
+    return _goal_payload(_goal_or_404(user, goal_id), conn=conn)
 
 
 @router.post("/goals/{goal_id}/plan")
@@ -214,6 +243,134 @@ def complete_goal(goal_id: int, body: CompleteGoalRequest, user: dict = Depends(
         conn.execute("UPDATE goals SET status='active' WHERE id=?", (goal_id,))
     conn.commit()
     return {"status": conn.execute("SELECT status FROM goals WHERE id=?", (goal_id,)).fetchone()["status"]}
+
+
+@router.post("/actions/{action_id}/toggle")
+def toggle_action(action_id: int, user: dict = Depends(require_user)):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT a.id, a.status, g.id AS goal_id FROM actions a JOIN goals g ON g.id=a.goal_id "
+        "WHERE a.id=? AND a.user_id=?",
+        (action_id, user["id"]),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="action not found")
+    new = "done" if row["status"] != "done" else "pending"
+    conn.execute("UPDATE actions SET status=? WHERE id=?", (new, action_id))
+    conn.commit()
+    return {"id": action_id, "status": new}
+
+
+@router.post("/goals/{goal_id}/stake")
+def place_stake(goal_id: int, body: StakeCreateRequest, user: dict = Depends(require_user)):
+    """Pin a loss on the line: if this file misses its deadline, the punishment comes due."""
+    _goal_or_404(user, goal_id)
+    conn = get_connection()
+    existing = conn.execute(
+        "SELECT * FROM stakes WHERE user_id=? AND goal_id=? AND status='active'", (user["id"], goal_id)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE stakes SET punishment=? WHERE id=?", (body.punishment.strip(), existing["id"])
+        )
+        conn.commit()
+        return {"ok": True, "stake": {"id": existing["id"], "punishment": body.punishment.strip(), "status": "active"}}
+    cur = conn.execute(
+        "INSERT INTO stakes (user_id, goal_id, punishment, status) VALUES (?,?,?,'active')",
+        (user["id"], goal_id, body.punishment.strip()),
+    )
+    conn.commit()
+    return {"ok": True, "stake": {"id": cur.lastrowid, "punishment": body.punishment.strip(), "status": "active"}}
+
+
+@router.delete("/goals/{goal_id}/stake")
+def remove_stake(goal_id: int, user: dict = Depends(require_user)):
+    _goal_or_404(user, goal_id)
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM stakes WHERE user_id=? AND goal_id=? AND status='active'", (user["id"], goal_id)
+    )
+    conn.commit()
+    return {"ok": True}
+
+
+@router.get("/momentum")
+def momentum(user: dict = Depends(require_user)):
+    """Streak + burn-rate + a 0-100 momentum meter derived from work actually done."""
+    conn = get_connection()
+    stats = generation.momentum_stats(user["id"], db=conn)
+    # attach current stakes so the board can show what's on the line
+    stakes = [
+        dict(s) for s in conn.execute(
+            "SELECT s.id, s.goal_id, s.punishment, s.status, g.display_title "
+            "FROM stakes s JOIN goals g ON g.id=s.goal_id "
+            "WHERE s.user_id=? AND s.status='active'", (user["id"],)
+        ).fetchall()
+    ]
+    stats["stakes"] = stakes
+    return stats
+
+
+@router.post("/goals/{goal_id}/stake/enforce")
+def enforce_stake(goal_id: int, user: dict = Depends(require_user)):
+    """Eloise calls the debt in and writes the enforcement into the ledger."""
+    goal = _goal_or_404(user, goal_id)
+    conn = get_connection()
+    stake = conn.execute(
+        "SELECT * FROM stakes WHERE user_id=? AND goal_id=? AND status='active'", (user["id"], goal_id)
+    ).fetchone()
+    if not stake:
+        raise HTTPException(status_code=404, detail="no stake on this file")
+    from datetime import datetime
+    conn.execute(
+        "UPDATE stakes SET status='enforced', enforced_at=? WHERE id=?",
+        (datetime.utcnow().isoformat(), stake["id"]),
+    )
+    conn.commit()
+    roast = (
+        f"The bet's as good as dead and so is the debt. You owe the punishment: "
+        f"{stake['punishment']}. I'll be watching the ledger."
+    )
+    return {"ok": True, "roast": roast, "stake": {"id": stake["id"], "punishment": stake["punishment"], "status": "enforced"}}
+
+
+@router.post("/onboarding/seed")
+def seed_demo(user: dict = Depends(require_user)):
+    """First-run: seed two live demo goals so the board has shape the moment you sit down."""
+    conn = get_connection()
+    cnt = conn.execute("SELECT COUNT(*) c FROM goals WHERE user_id=?", (user["id"],)).fetchone()["c"]
+    if cnt > 0:
+        conn.execute("UPDATE users SET onboarding_done=1 WHERE id=?", (user["id"],))
+        conn.commit()
+        return {"seeded": False, "seeded_goals": [], "already": True}
+    today = date.today()
+    from datetime import timedelta as _td
+    demos = [
+        {
+            "title": "Ship the v3 launch",
+            "deadline": (today + _td(days=5)).isoformat(),
+            "constraints": ["gym 5-7pm"],
+        },
+        {
+            "title": "Read the floor report",
+            "deadline": (today + _td(days=2)).isoformat(),
+            "constraints": [],
+        },
+    ]
+    seeded = []
+    for d in demos:
+        display = d["title"] if len(d["title"]) <= 24 else d["title"][:21] + "..."
+        cur = conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, plan_status) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (user["id"], d["title"], d["deadline"], "09:00", json.dumps(d["constraints"]), display, "pending"),
+        )
+        seeded.append(cur.lastrowid)
+    conn.execute("UPDATE users SET onboarding_done=1 WHERE id=?", (user["id"],))
+    conn.commit()
+    for gid in seeded:
+        threading.Thread(target=_regenerate_plan_bg, args=(user, gid), daemon=True).start()
+    return {"seeded": True, "seeded_goals": seeded, "already": False}
 
 
 @router.post("/goals/{goal_id}/delete")

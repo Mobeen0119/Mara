@@ -131,6 +131,16 @@ CREATE TABLE IF NOT EXISTS attachments (
   path TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS stakes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  goal_id INTEGER NOT NULL,
+  punishment TEXT NOT NULL,
+  status TEXT DEFAULT 'active',
+  enforced_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -166,10 +176,10 @@ def get_connection():
 
 
 MIGRATIONS = [
-    # add per-user fields for the 24h check-in
     "ALTER TABLE users ADD COLUMN checkin_time TEXT DEFAULT '08:00'",
     "ALTER TABLE users ADD COLUMN last_checkin_at TEXT",
     "ALTER TABLE users ADD COLUMN last_checkin_result TEXT",
+    "ALTER TABLE users ADD COLUMN onboarding_done INTEGER DEFAULT 0",
 ]
 
 

@@ -26,14 +26,24 @@
     <div class="brand"><span class="brand-mark"><span class="brand-name">Eloise</span><span class="brand-digit">//exe</span></span></div>
     <p class="tagline">execution is the only discipline</p>
     <nav class="nav">
-      <a class="nav-item" data-screen="today" onclick="navigate('today')"><span class="icon">&#x25B5;</span> Today</a>
-      <a class="nav-item" data-screen="goals" onclick="navigate('goals')"><span class="icon">&#x2197;</span> Goals</a>
-      <a class="nav-item" data-screen="new-goal" onclick="navigate('new-goal')"><span class="icon">+</span> File Goal</a>
-      <a class="nav-item" data-screen="schedule" onclick="navigate('schedule')"><span class="icon">&#x2140;</span> Schedule</a>
-      <a class="nav-item" data-screen="global-chat" onclick="navigate('global-chat')"><span class="icon">&#x2709;</span> Eloise</a>
-      <a class="nav-item" data-screen="settings" onclick="navigate('settings')"><span class="icon">&#x2699;</span> Settings</a>
+      <div class="nav-group">
+        <div class="nav-group-title">Desk</div>
+        <a class="nav-item" data-screen="today" onclick="navigate('today')"><span class="icon">&#x25B5;</span> Today</a>
+        <a class="nav-item" data-screen="board" onclick="navigate('board')"><span class="icon">&#x27A1;</span> Board</a>
+        <a class="nav-item" data-screen="goals" onclick="navigate('goals')"><span class="icon">&#x2197;</span> Goals</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-title">Lines</div>
+        <a class="nav-item" data-screen="new-goal" onclick="navigate('new-goal')"><span class="icon">+</span> File Goal</a>
+        <a class="nav-item" data-screen="schedule" onclick="navigate('schedule')"><span class="icon">&#x2140;</span> Schedule</a>
+        <a class="nav-item" data-screen="global-chat" onclick="navigate('global-chat')"><span class="icon">&#x2709;</span> Eloise</a>
+        <a class="nav-item" data-screen="settings" onclick="navigate('settings')"><span class="icon">&#x2699;</span> Settings</a>
+      </div>
     </nav>
-    <div class="sidebar-foot"><span id="user-name" class="ember-dot"></span><span id="user-label"></span></div>
+    <div class="sidebar-foot">
+      <div class="foot-row"><span id="user-name" class="ember-dot"></span><span id="user-label"></span></div>
+      <div class="foot-momentum" id="foot-momentum"></div>
+    </div>
   </aside>
 
   <main id="main-content" class="main"></main>

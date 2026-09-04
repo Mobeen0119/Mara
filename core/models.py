@@ -11,6 +11,7 @@ class SignupRequest(BaseModel):
 
 class GuestLoginRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
+    email: Optional[EmailStr] = None
 
 
 class LoginRequest(BaseModel):
@@ -84,3 +85,12 @@ class ConstraintAddRequest(BaseModel):
 
 class ReminderSetRequest(BaseModel):
     reminder_time: str
+
+
+class StakeCreateRequest(BaseModel):
+    goal_id: int
+    punishment: str = Field(min_length=1, max_length=200)
+
+
+class StakeSettleRequest(BaseModel):
+    reason: str = ""

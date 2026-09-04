@@ -23,7 +23,10 @@ def _build(conn):
 def status(user: dict = Depends(require_user)):
     conn = get_connection()
     mgr = _build(conn)
-    return mgr.status_dict()
+    s = mgr.status_dict()
+    from core.mailer import smtp_configured
+    s["email_configured"] = smtp_configured()
+    return s
 
 
 @router.get("/settings/llm")
@@ -93,6 +96,84 @@ def get_settings(user: dict = Depends(require_user)):
         except Exception:
             cfg = {}
     return {"checkin_time": user["checkin_time"] or "08:00", "llm": get_llm(user=user)}
+
+
+@router.post("/email/digest")
+def email_digest(user: dict = Depends(require_user)):
+    """Send the full upcoming schedule to the user's email right now. Best-effort."""
+    from core.mailer import smtp_configured, send_email
+    from core.persona import build_daily_email_html
+    conn = get_connection()
+    if not user["email"]:
+        return {"ok": False, "reason": "no email on file", "hint": sched_email_hint("no-email")}
+    if not smtp_configured():
+        return {"ok": False, "reason": "SMTP not configured", "hint": sched_email_hint("smtp")}
+    today = date.today().isoformat()
+    horizon = (date.today() + timedelta(days=7)).isoformat()
+    goals = conn.execute(
+        "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
+    ).fetchall()
+    tasks = []
+    total_hours = 0.0
+    days_to_nearest = 999
+    for g in goals:
+        for a in conn.execute(
+            "SELECT * FROM actions WHERE goal_id=? AND date>=? AND date<=? ORDER BY date, order_idx",
+            (g["id"], today, horizon),
+        ).fetchall():
+            tasks.append({
+                "date": a["date"], "title": a["title"], "start_time": a["start_time"],
+                "end_time": a["end_time"], "status": a["status"], "goal": g["display_title"],
+                "goal_id": g["id"],
+            })
+            total_hours += (a["duration_min"] or 60) / 60.0
+        dl = generation.days_remaining(g["deadline"], today)
+        if dl >= 0:
+            days_to_nearest = min(days_to_nearest, dl)
+    body_lines = [f"{user['name']}, here's the week ahead. No improvising."]
+    if tasks:
+        by_day = {}
+        for t in tasks:
+            by_day.setdefault(t["date"], []).append(t)
+        for d in sorted(by_day):
+            head = "TODAY" if d == today else d
+            body_lines.append(f"\n— {head} —")
+            for t in by_day[d]:
+                ts = f"{t['start_time']}–{t['end_time']}" if t["start_time"] else ""
+                body_lines.append(f"  {ts} {t['title']} ({t['goal']}) [{t['status']}]")
+    else:
+        body_lines.append("Nothing booked for the week. That's suspicious.")
+    body_lines.append(f"\n~{round(total_hours)}h total in the week. Nearest deadline in {days_to_nearest} days.")
+    body_lines.append("\nEloise")
+    text = "\n".join(body_lines)
+    html = build_daily_email_html(user["name"], tasks, round(total_hours, 1), days_to_nearest)
+    ok = send_email(user["email"], "Eloise - your week, no improvising", text, html)
+    return {"ok": ok, "reason": "sent" if ok else "send failed", "hint": sched_email_hint("ok") if ok else sched_email_hint("send")}
+
+
+@router.get("/email/status")
+def email_status(user: dict = Depends(require_user)):
+    from core.mailer import smtp_configured
+    conn = get_connection()
+    host = None
+    import os
+    if os.environ.get("SMTP_HOST"):
+        host = os.environ["SMTP_HOST"]
+    return {
+        "configured": smtp_configured(),
+        "host": host,
+        "user_has_email": bool(user["email"]),
+        "hint": sched_email_hint("ok" if smtp_configured() and user["email"] else "smtp"),
+    }
+
+
+def sched_email_hint(code):
+    return {
+        "no-email": "Add an email to get the schedule mailed to you.",
+        "smtp": "SMTP isn't armed — set SMTP_HOST/MAIL_FROM in your .env and restart.",
+        "send": "SMTP accepted the config but the send didn't land (bad login or relay).",
+        "ok": "Mail channel is live.",
+    }.get(code, "")
 
 
 @router.get("/today")
@@ -200,7 +281,7 @@ def schedule(user: dict = Depends(require_user)):
         by_date = {}
         for a in acts:
             by_date.setdefault(a["date"], []).append({
-                "title": a["title"], "start_time": a["start_time"], "end_time": a["end_time"],
+                "id": a["id"], "title": a["title"], "start_time": a["start_time"], "end_time": a["end_time"],
                 "status": a["status"], "goal_id": g["id"],
             })
         out[str(g["id"])] = {"title": g["display_title"], "by_date": by_date}

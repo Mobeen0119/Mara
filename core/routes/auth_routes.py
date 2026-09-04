@@ -37,6 +37,21 @@ def _new_user(name, email, password_hash, is_guest=0, verified=1):
     return conn.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
 
 
+def _confirm_email(user):
+    """Best-effort confirmation mail when the account has an email. Never blocks sign-in."""
+    if not user["email"]:
+        return False
+    from core.mailer import smtp_configured, send_email
+    if not smtp_configured():
+        return False
+    body = (
+        f"{user['name']}, your seat at Eloise is confirmed.\n\n"
+        "Your schedule lands here when the day's plan is ready, and at your check-in.\n"
+        "Take a seat. The clock's already running."
+    )
+    return send_email(user["email"], "Eloise - seat confirmed", body)
+
+
 @router.post("/signup")
 def signup(body: SignupRequest):
     name = _sanitize_name(body.name)
@@ -45,6 +60,7 @@ def signup(body: SignupRequest):
     if exists:
         raise HTTPException(status_code=409, detail="email already registered")
     user = _new_user(name, body.email, _hash(body.password), is_guest=0, verified=1)
+    _confirm_email(user)
     return {"token": user["token"], "name": user["name"], "email": user["email"]}
 
 
@@ -62,10 +78,24 @@ def login(body: LoginRequest):
 @router.post("/guest")
 def guest(body: GuestLoginRequest):
     name = _sanitize_name(body.name)
-    email = None
+    email = str(body.email) if body.email else None
     password_hash = _hash(secrets.token_urlsafe(16))
+    conn = get_connection()
+    if email:
+        taken = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if taken:
+            # email already on the books — keep it for the schedule, own the row, no crash
+            user = dict(conn.execute("SELECT * FROM users WHERE id=?", (taken["id"],)).fetchone())
+            return {
+                "token": user["token"], "name": user.get("name") or name, "is_guest": True,
+                "email": user["email"], "has_email": True,
+            }
     user = _new_user(name, email, password_hash, is_guest=1, verified=1)
-    return {"token": user["token"], "name": user["name"], "is_guest": True}
+    _confirm_email(user)
+    return {
+        "token": user["token"], "name": user["name"], "is_guest": True,
+        "email": user["email"], "has_email": bool(user["email"]),
+    }
 
 
 @router.get("/me")

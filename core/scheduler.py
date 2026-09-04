@@ -60,16 +60,22 @@ class EloiseScheduler:
                 total += (a["duration_min"] or 60) / 60.0
         if not tasks:
             return
+        if not user["email"]:
+            return
         try:
             from core.persona import build_daily_email_html
             html = build_daily_email_html(
                 user["name"], tasks, round(total, 1), 0, goal_title=goals[0]["display_title"] if goals else None
             )
+            from core.mailer import send_email
+            ok = send_email(user["email"], "Eloise - your day", "See your schedule in the app.", html)
+            kind = "daily_digest" if ok else "daily_digest_failed"
         except Exception:
-            html = ""
+            kind = "daily_digest_failed"
+            ok = False
         conn.execute(
             "INSERT INTO logs (user_id, kind, message) VALUES (?,?,?)",
-            (user["id"], "daily_digest", f"digest ready: {len(tasks)} tasks, {round(total,1)}h"),
+            (user["id"], kind, f"digest: {len(tasks)} tasks, {round(total,1)}h" + ("" if ok else " (mail failed)")),
         )
         conn.commit()
 

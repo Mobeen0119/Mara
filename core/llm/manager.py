@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -7,7 +8,10 @@ from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
 from core.llm.ollama_provider import OllamaProvider
 from core.llm.openrouter_provider import OpenRouterProvider
 
-DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"
+
+# OpenRouter free-tier can echo a moderation verdict instead of a reply. Never treat that as a win.
+_VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 
 
 def _ollama_base_url(raw=None):
@@ -57,11 +61,33 @@ class LLMManager:
             self._by_name = by_name
             return by_name
 
+    def any_usable(self):
+        """Fast check: is any provider immediately usable? Avoids slow probes when none is up."""
+        for p in self._providers().values():
+            try:
+                if p.name == "ollama":
+                    if p.probe_fast():
+                        return True
+                elif p.status().usable:
+                    return True
+            except Exception:
+                continue
+        return False
+
     def generate(self, system_prompt, user_prompt, timeout=30) -> GenerationResult:
         providers = self._providers()
         ordered = [providers.get("ollama"), providers.get("openrouter")]
         ordered = [p for p in ordered if p is not None]
+        # Don't waste a call on a provider that is plainly not usable (e.g. no API key).
+        usable = []
         for p in ordered:
+            try:
+                st = p.status()
+                if st.usable:
+                    usable.append(p)
+            except Exception:
+                usable.append(p)
+        for p in usable:
             future = self._executor.submit(p.generate, system_prompt, user_prompt, timeout)
             try:
                 result = future.result(timeout=timeout + 5)
@@ -69,13 +95,20 @@ class LLMManager:
                 result = GenerationResult(ok=False, provider=p.name, model=p.model, error=str(exc))
             if result.ok:
                 return result
-        return result if 'result' in locals() else GenerationResult(
-            ok=False, provider="none", model="none", error="no providers available")
+        return GenerationResult(
+            ok=False, provider="none", model="none",
+            error="no usable provider (start local model or add an API key)",
+        )
 
     def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=30):
         result = self.generate(system_prompt, user_prompt, timeout=timeout)
+        # A provider echoing a moderation verdict ("User Safety: safe") is not an answer —
+        # drop to the fallback rather than show the user junk.
+        if result.ok and not _VERDICT_ECHO.search(result.text[:80]):
+            return result.text, result.provider or "llm"
         if result.ok:
-            return result.text, "llm"
+            result = GenerationResult(ok=False, provider=result.provider, model=result.model,
+                                      error="provider echoed a moderation verdict")
         fallback_text = fallback_fn()
         return fallback_text, "fallback"
 

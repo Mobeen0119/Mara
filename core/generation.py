@@ -35,11 +35,34 @@ def _pick(items):
     return items[(datetime.now().microsecond // 100) % len(items)]
 
 
+def _is_truly_harmful(msg):
+    """Detect requests for real-world harm that Eloise must refuse rather than plan.
+    Returns True for sexual abuse of a family member/child or credible real-world
+    violence. This is a safety guardrail, not a personality quirk."""
+    t = (msg or "").lower()
+    # sexual abuse involving a family relationship, a child/minor disproportionate — refuse
+    family = ["sister", "brother", "mom", "mother", "dad", "father", "daughter", "son", "aunt", "uncle", "niece", "nephew", "child", "kid", "minor"]
+    sexual = ["dick", "penis", "inside", "fuck", "sex", "rape", "pussy", "vagina", "suck", "cum"]
+    harm = ["kill", "murder", "hurt", "shoot", "stab", "bomb", "poison", "beat up", "assault"]
+    if any(f in t for f in family) and any(x in t for x in sexual):
+        return True
+    # credible violence against a person
+    if any(h in t for h in ["kill my", "murder", "stab", "bomb my", "shoot my", "assault", "rape"]):
+        return True
+    return False
+
+
 def _context_chat_fallback(summary, message):
     """A decisive, sarcastic Eloise line that uses whatever board context we have,
     so even a dead model still sounds like her and still answers the actual point."""
     s = (summary or "").lower()
     msg = (message or "").lower()
+
+    # Content safety: refuse harmful requests outright — Eloise is a task agent,
+    # not a planner for abuse/harm. Firm, in-character, no coaching.
+    if _is_truly_harmful(msg):
+        return "That kind of request doesn't belong on this board, and I won't build a plan for it. Let's put it back on a real goal — what do you actually need to get done?"
+
     tight = False
     days_left = 999
     m = re.search(r"(\d+) days left", s)
@@ -145,19 +168,21 @@ def generate_global_chat_reply(user_name, goals_summary, history, message, db=No
     return text, source
 
 
-def generate_chat_reply(user_name, goal_name, history, message, db=None):
+def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_lines=""):
     sys = BASE_SYSTEM_PROMPT
+    plan_section = ""
+    if plan_lines:
+        plan_section = f"=== THE PLAN (your scheduled tasks) ===\n{plan_lines}\n\n"
     user_prompt = (
         f"=== GOAL ===\n{goal_name}\n\n"
+        f"{plan_section}"
         f"=== CONVERSATION ===\n{history}\n\n"
         f"=== {user_name} says ===\n{message}\n\n"
-        f"Reply as Eloise. Reference the goal above. Do NOT echo this prompt. "
-        f"Only output your reply."
+        f"Reply as Eloise. Be DIRECT and CONCRETE. When the user asks 'what do I do', point at a "
+        f"specific task from THE PLAN by name and tell them exactly what to do first. "
+        f"Do NOT invent generic advice or tell them to 'break it down' — that's hand-waving. "
+        f"Do NOT echo this prompt. Only output your reply."
     )
-    text, source = get_manager(db).generate_with_fallback(
-        sys, user_prompt, fallback_fn=lambda: _context_chat_fallback(goal_name, message)
-    )
-    return text, source
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: _context_chat_fallback(goal_name, message)
     )
@@ -270,6 +295,70 @@ def _hh_12_to_24(hh, mer):
     return hh + 12 if mer == "pm" else hh
 
 
+def goal_questionnaire(title):
+    """Return 2-3 clarifying questions based on what kind of goal this is.
+    The answers help generate a specific, actionable schedule instead of generic blocks."""
+    t = (title or "").lower()
+    questions = []
+    # Exam / test
+    if any(w in t for w in ("exam", "test", "quiz", "assessment", "certification", "cert")):
+        questions = [
+            {"key": "syllabus", "q": "What's the syllabus / topics covered?", "hint": "e.g. networking fundamentals, subnetting, OSI model"},
+            {"key": "weak_areas", "q": "What topics are you weakest on?", "hint": "e.g. I don't know subnetting at all"},
+            {"key": "study_format", "q": "How do you learn best?", "hint": "videos, reading, practice problems, flashcards"},
+        ]
+    # Startup / business
+    elif any(w in t for w in ("startup", "business", "company", "launch", "mvp", "product")):
+        questions = [
+            {"key": "domain", "q": "What's your domain / industry?", "hint": "e.g. edtech, fintech, saas, ecommerce"},
+            {"key": "stage", "q": "What stage are you at?", "hint": "idea, prototype, mvp, launched, growing"},
+            {"key": "first_step", "q": "What's the first concrete thing you need to build?", "hint": "landing page, backend api, user interviews, pitch deck"},
+        ]
+    # Project / assignment / report
+    elif any(w in t for w in ("project", "assignment", "report", "paper", "essay", "presentation", "deck")):
+        questions = [
+            {"key": "requirements", "q": "What are the requirements / deliverables?", "hint": "e.g. 20-page report, slides, working prototype"},
+            {"key": "topic", "q": "What's the specific topic or subject?", "hint": "e.g. networking security, market analysis, user research"},
+            {"key": "resources", "q": "What resources do you already have?", "hint": "e.g. templates, data, reference documents, prior work"},
+        ]
+    # Learning / skill
+    elif any(w in t for w in ("learn", "study", "skill", "course", "training", "master")):
+        questions = [
+            {"key": "current_level", "q": "What's your current level?", "hint": "complete beginner, some basics, intermediate"},
+            {"key": "goal_level", "q": "What level do you need to reach?", "hint": "pass an exam, build a project, job-ready"},
+            {"key": "time_per_day", "q": "How many hours per day can you commit?", "hint": "1h, 2h, 3h+"},
+        ]
+    # Fitness / health
+    elif any(w in t for w in ("fitness", "gym", "workout", "health", "weight", "run", "marathon")):
+        questions = [
+            {"key": "current_fitness", "q": "What's your current fitness level?", "hint": "sedentary, light activity, active"},
+            {"key": "target", "q": "What's the specific target?", "hint": "lose 5kg, run 5k, bench press 100kg"},
+            {"key": "equipment", "q": "What equipment / facilities do you have?", "hint": "home gym, commercial gym, no equipment"},
+        ]
+    else:
+        # Generic — always ask what "done" looks like
+        questions = [
+            {"key": "done_looks_like", "q": "What does 'done' look like? Describe the specific outcome.", "hint": "e.g. shipped to production, grade A, 10k users"},
+            {"key": "biggest_blocker", "q": "What's the biggest thing blocking you right now?", "hint": "e.g. don't know where to start, missing info, no time"},
+        ]
+    return questions
+
+
+def goal_details_summary(details_json):
+    """Convert stored details JSON to a human-readable summary for the chat prompt."""
+    try:
+        d = json.loads(details_json or "{}")
+    except Exception:
+        d = {}
+    if not d:
+        return ""
+    parts = []
+    for k, v in d.items():
+        if v:
+            parts.append(f"{k}: {v}")
+    return "; ".join(parts) if parts else ""
+
+
 def build_plan_quick(goal):
     """Fast, deterministic, constraint-aware fallback schedule. Never blocks on the LLM."""
     return _build_fallback_plan(goal)
@@ -281,6 +370,13 @@ def _build_fallback_plan(goal, today=None):
     days = max(days_remaining(deadline, today), 1)
     reminder = normalize_time(goal.get("reminder_time") or "09:00") or "09:00"
     reminder_hh, reminder_mm = map(int, reminder.split(":"))
+
+    # Load questionnaire details (if any) — these make the schedule specific.
+    details = {}
+    try:
+        details = json.loads(goal.get("details") or "{}")
+    except Exception:
+        details = {}
 
     constraints = []
     try:
@@ -326,12 +422,47 @@ def _build_fallback_plan(goal, today=None):
         return slots[:3]
 
     entries = []
-    for i in range(min(days, 15)):
+    total_days = min(days, 15)
+    # Derive real per-day tasks. First try splitting the questionnaire "syllabus" (comma
+    # separated topics) into one concrete day each, then fall back to sensible short verbs
+    # for each day. NEVER just repeat "Research / review / polish" — those are filler.
+    split_topics = None
+    for key in ("syllabus", "topic", "domain", "requirements"):
+        val = (details.get(key) or "").strip()
+        if val:
+            parts = [p.strip() for p in re.split(r"[,;]|\band\b|\.", val) if p.strip()]
+            if len(parts) >= 2:
+                split_topics = parts
+                break
+    weak = details.get("weak_areas")
+    action_verbs = ["Work through", "Dig into", "Write up", "Build", "Go deep on", "Finish", "Lock down"]
+    definitive = ["finish and check", "wrap up", "submit-style review of", "close out"]
+    for i in range(total_days):
         day = (date.fromisoformat(today) + timedelta(days=i)).isoformat()
+        remaining = max(days - i, 0)
+        if total_days == 1:
+            task_desc = goal["display_title"]
+        elif split_topics:
+            topic = split_topics[i % len(split_topics)]
+            if remaining <= 2:
+                task_desc = f"{definitive[i % len(definitive)]} {topic} — {goal['display_title']} ({remaining}d)"
+            else:
+                task_desc = f"{action_verbs[i % len(action_verbs)]} {topic} — {goal['display_title']}"
+        else:
+            progress = i / max(total_days - 1, 1) if total_days > 1 else 1
+            verb = "Focus on" if i < total_days - 1 else "Close out"
+            if remaining <= 2 and weak:
+                task_desc = f"FINAL: {goal['display_title']} — push on {weak} ({remaining}d)"
+            elif progress < 0.2:
+                task_desc = f"Get moving: {action_verbs[0]} {goal['display_title']}"
+            elif progress < 0.75:
+                task_desc = f"{verb} the core of {goal['display_title']}"
+            else:
+                task_desc = f"Shell out the last {goal['display_title']} pieces"
         for s, e in slots_in_day():
             entries.append({
                 "date": day,
-                "title": goal["display_title"],
+                "title": task_desc,
                 "start_time": f"{s // 60:02d}:{s % 60:02d}",
                 "end_time": f"{e // 60:02d}:{e % 60:02d}",
                 "status": "pending",
@@ -358,25 +489,55 @@ def generate_plan(goal, user, db=None):
         return entries
     # Try the LLM for a richer plan; on any failure fall back to the deterministic one.
     try:
-        sys = BASE_SYSTEM_PROMPT
-        deadline = goal["deadline"]
-        title = goal["display_title"]
-        cons = goal.get("constraints") or "[]"
-        user_prompt = (
-            f"Build a day-by-day plan from {date.today().isoformat()} to {deadline} for: {title}\n"
-            f"Constraints: {cons}\n"
-            "Return ONLY a JSON array of objects: "
-            '{"date":"YYYY-MM-DD","title":"short task","start_time":"HH:MM","end_time":"HH:MM"}. '
-            "Keep grouped tasks concrete and non-overlapping with constraints. Detect overrun by pushing, never past deadline."
-        )
-        res = get_manager(db).generate(sys, user_prompt, timeout=45)
-        if res.ok:
-            parsed = _parse_plan_json(res.text, deadline)
-            if parsed:
-                return parsed
+        res = _llm_plan_call(goal, db)
+        if res:
+            return res
     except Exception:
         pass
     return entries
+
+
+def generate_plan_or_none(goal, user, db=None):
+    """Like generate_plan but returns None (not the fallback) when no LLM can serve a
+    plan, so callers can keep a previously-drawn plan instead of overwriting it with the
+    same deterministic fallback. Used for background schedule upgrades."""
+    try:
+        if not get_manager(db).any_usable():
+            return None
+    except Exception:
+        return None
+    try:
+        return _llm_plan_call(goal, db)
+    except Exception:
+        return None
+
+
+def _llm_plan_call(goal, db, timeout=180):
+    sys = BASE_SYSTEM_PROMPT
+    deadline = goal["deadline"]
+    title = goal["display_title"]
+    cons = goal.get("constraints") or "[]"
+    detail_line = ""
+    details_summary = goal_details_summary(goal.get("details"))
+    if details_summary:
+        detail_line = f"\nClarified answers from Mobeen: {details_summary}"
+    user_prompt = (
+        f"Build a day-by-day plan from {date.today().isoformat()} to {deadline} for: {title}\n"
+        f"Constraints: {cons}"
+        f"{detail_line}\n"
+        "Return ONLY a JSON array (no markdown, no commentary). No more than ONE entry per day. "
+        'Each object: {"date":"YYYY-MM-DD","title":"VERY-SHORT concrete task (max 8 words)","start_time":"HH:MM","end_time":"HH:MM"}. '
+        "The title must be a REAL action for THIS goal on THAT day — e.g. 'draft outline of networking syllabus', "
+        "'implement bubble-sort in C++', 'write intro paragraph of report'. Do NOT use generic filler like "
+        "'research', 'review', 'polish', 'work on project'. Each day gets a different, specific task."
+        f" If a day has the word FINAL near deadline, still give a concrete task for it."
+    )
+    res = get_manager(db).generate(sys, user_prompt, timeout=timeout)
+    if res.ok:
+        parsed = _parse_plan_json(res.text, deadline)
+        if parsed:
+            return parsed
+    return None
 
 
 def _parse_plan_json(text, deadline):

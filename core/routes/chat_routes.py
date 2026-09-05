@@ -59,7 +59,7 @@ def _active_board_snapshot(conn, user_id):
     """A compact, live digest of the user's current board: active goals with their
     deadlines, today's pending/done tasks, and any unresolved open flags."""
     rows = conn.execute(
-        "SELECT display_title, deadline, constraints FROM goals WHERE user_id=? AND status='active'", (user_id,)
+        "SELECT display_title, deadline, constraints, details FROM goals WHERE user_id=? AND status='active'", (user_id,)
     ).fetchall()
     today = date.today().isoformat()
     goals = []
@@ -75,7 +75,9 @@ def _active_board_snapshot(conn, user_id):
                 cons = f", blocked: {', '.join(clist[:3])}"
         except Exception:
             cons = ""
-        goals.append(f"'{r['display_title']}' (due {r['deadline']}, {dd} days left{cons})")
+        details = generation.goal_details_summary(r["details"])
+        detail_str = f" [details: {details}]" if details else ""
+        goals.append(f"'{r['display_title']}' (due {r['deadline']}, {dd} days left{cons}{detail_str})")
     pending = []
     done = []
     tasks = conn.execute(
@@ -171,9 +173,26 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
 
     history = "\n".join(_history(conn, goal_id, user["id"]))
     goal_name = goal["display_title"] if goal else "general"
+
+    # Content safety: refuse harmful requests before they reach the LLM.
+    if generation._is_truly_harmful(body.message):
+        refusal = "That kind of request doesn't belong on this board, and I won't help plan it. Whatever this is hoping to be — it isn't a task I'll execute. Put a real goal on the table and we'll move."
+        _add_message(conn, user["id"], goal_id, "eloise", refusal)
+        return {"reply": refusal, "source": "guardrail"}
+
     if goal_id:
-        # goal-scoped chat: keep it tight but aware of today's tasks for that goal
-        text, source = generation.generate_chat_reply(user["name"], goal_name, history, body.message, db=conn)
+        # goal-scoped chat: pull that goal's actual scheduled tasks so the model can
+        # point at real concrete next steps instead of hand-waving.
+        plan_rows = conn.execute(
+            "SELECT date, title, start_time FROM actions WHERE goal_id=? AND status!='done' ORDER BY date, start_time LIMIT 12",
+            (goal_id,),
+        ).fetchall()
+        plan_lines = "\n".join(
+            f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows
+        )
+        text, source = generation.generate_chat_reply(
+            user["name"], goal_name, history, body.message, db=conn, plan_lines=plan_lines
+        )
     else:
         board = _active_board_snapshot(conn, user["id"])
         text, source = generation.generate_global_chat_reply(

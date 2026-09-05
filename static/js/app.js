@@ -543,8 +543,8 @@ async function renderGoalDetail(el, id) {
     // actions
     html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;">
       <button class="btn btn-sm btn-ghost" onclick="regenPlan(${g.id})">Redraw schedule</button>
-      <button class="btn btn-sm btn-ghost" onclick="completeGoal(${g.id})">Mark done</button>
-      <button class="btn btn-sm btn-danger" style="color:#fff;" onclick="deleteGoal(${g.id})">Burn file</button>
+      <button class="btn btn-sm btn-ghost" onclick="completeGoalFlow(${g.id})">Mark done</button>
+      <button class="btn btn-sm btn-ghost" onclick="cancelGoalFlow(${g.id})">Cancel / Delay</button>
     </div>`;
 
     // pressure meter header strip
@@ -644,6 +644,24 @@ async function completeGoal(id) {
   try { await api(`/goals/${id}/complete`, { method: 'POST', body: JSON.stringify({ claimed_success: true }) }); showToast('Closed out', 'success'); } catch (e) {}
   navigate('goals');
 }
+async function completeGoalFlow(id) {
+  const reason = await askModal('Mark done?', 'Confirm this goal is actually complete. No lies — the next check-in will find out.');
+  if (reason === null) return;  // user cancelled
+  try {
+    await api(`/goals/${id}/complete`, { method: 'POST', body: JSON.stringify({ claimed_success: true, reason: reason || 'User confirmed completion' }) });
+    showToast('Closed out. If you\'re lying, the next check-in will find out.', 'success');
+    navigate('goals');
+  } catch (e) { showToast(e.message, 'error'); }
+}
+async function cancelGoalFlow(id) {
+  const reason = await askModal('Cancel or delay?', 'Give a real reason — exam cancelled, project delayed, scope changed. Not "I don\'t feel like it".');
+  if (reason === null || !reason) return;
+  try {
+    const r = await api(`/goals/${id}/complete`, { method: 'POST', body: JSON.stringify({ claimed_success: false, reason }) });
+    showToast(r.roast || 'File closed.', 'success');
+    navigate('goals');
+  } catch (e) { showToast(e.message, 'error'); }
+}
 async function pinStake(id) {
   const punishment = await askModal('Pin a stake', 'What happens if this slips? e.g. \u00A350 to a charity I hate');
   if (!punishment) return;
@@ -654,7 +672,12 @@ async function pinStake(id) {
   } catch (e) { showToast(e.message, 'error'); }
 }
 async function regenPlan(id) {
-  try { await api(`/goals/${id}/plan`, { method: 'POST' }); showToast('Redrawing...', 'success'); setTimeout(() => navigate('goal', id), 1800); } catch (e) {}
+  showToast('Eloise is drawing the schedule...', 'success');
+  try {
+    await api(`/goals/${id}/plan`, { method: 'POST' });
+    showToast('Schedule redrawn.', 'success');
+  } catch (e) { showToast(e.message, 'error'); }
+  navigate('goal', id);
 }
 async function deleteGoal(id) {
   const ok = await confirmModal('Burn the file?', 'This deletes the goal and every schedule tied to it. Eloise will not miss it.', 'Burn it', true);
@@ -712,10 +735,47 @@ async function createGoal() {
   const reminder = document.getElementById('new-goal-reminder').value;
   if (!title || !deadline) { showToast('Name and deadline needed', 'error'); return; }
   try {
-    await api('/goals', { method: 'POST', body: JSON.stringify({ title, deadline, reminder_time: reminder, constraints: window._constraints || [] }) });
-    showToast('Filed. Eloise draws the lines.', 'success');
-    navigate('goals');
+    const r = await api('/goals', { method: 'POST', body: JSON.stringify({ title, deadline, reminder_time: reminder, constraints: window._constraints || [] }) });
+    // if questionnaire questions returned, show them before finishing
+    if (r.questions && r.questions.length > 0) {
+      showQuestionnaire(r.id, title, r.questions);
+    } else {
+      showToast('Filed. Eloise draws the lines.', 'success');
+      navigate('goals');
+    }
   } catch (e) { showToast(e.message, 'error'); }
+}
+
+function showQuestionnaire(goalId, goalTitle, questions) {
+  const main = document.getElementById('main-content');
+  let html = `<div class="page-header"><div class="kicker">Filing: ${escHtml(goalTitle)}</div>
+    <h1>Answer these.</h1><p class="sub">Eloise needs specifics to build a real schedule. Not vibes.</p>
+    <div class="header-rule"></div></div>`;
+  html += `<form id="questionnaire-form" onsubmit="submitQuestionnaire(event, ${goalId})">`;
+  questions.forEach((q, i) => {
+    html += `<div class="card" style="margin-bottom:16px;">
+      <label style="display:block;font-weight:700;color:var(--bone);margin-bottom:6px;">${escHtml(q.q)}</label>
+      <p style="font-size:12px;color:var(--bone-dim);margin:0 0 8px;">${escHtml(q.hint)}</p>
+      <input type="text" name="${escHtml(q.key)}" placeholder="${escHtml(q.hint)}" style="width:100%;padding:10px;background:var(--ink);border:1px solid var(--line);border-radius:4px;color:var(--bone);font-size:14px;">
+    </div>`;
+  });
+  html += `<div style="display:flex;gap:10px;">
+    <button type="submit" class="btn">Save & regenerate schedule</button>
+    <button type="button" class="btn btn-ghost" onclick="navigate('goals')">Skip</button>
+  </div></form>`;
+  main.innerHTML = html;
+}
+
+async function submitQuestionnaire(e, goalId) {
+  e.preventDefault();
+  const form = e.target;
+  const data = {};
+  new FormData(form).forEach((v, k) => { if (v.trim()) data[k] = v.trim(); });
+  try {
+    await api(`/goals/${goalId}/details`, { method: 'POST', body: JSON.stringify(data) });
+    showToast('Details saved. Schedule regenerating...', 'success');
+  } catch (err) { showToast(err.message, 'error'); }
+  navigate('goal', goalId);
 }
 
 /* ============================================================

@@ -180,6 +180,7 @@ MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN last_checkin_at TEXT",
     "ALTER TABLE users ADD COLUMN last_checkin_result TEXT",
     "ALTER TABLE users ADD COLUMN onboarding_done INTEGER DEFAULT 0",
+    "ALTER TABLE goals ADD COLUMN details TEXT DEFAULT '{}'",
 ]
 
 

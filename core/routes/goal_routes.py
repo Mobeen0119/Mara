@@ -4,7 +4,7 @@ import threading
 import time
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
@@ -98,31 +98,49 @@ def _regenerate_plan_bg(user, goal_id):
     if not acquired:
         return
     try:
-        time.sleep(1)
+        time.sleep(0.5)
         conn = get_connection()
         conn.execute("DELETE FROM actions WHERE goal_id=?", (goal_id,))
         conn.commit()
-        # Deterministic constraint-aware plan: fast and reliable (never blocks on the LLM).
-        entries = generation.build_plan_quick(goal)
-        logger.warning("plan bg: goal %s generated %s entries", goal_id, len(entries))
-        sel = {}
-        for e in entries:
-            d = e["date"]
-            hh = int(e["start_time"].split(":")[0]) if e.get("start_time") else 9
-            if d not in sel or hh < sel[d]["hh"]:
-                sel[d] = {"hh": hh, "entry": e}
-        final = [v["entry"] for v in sel.values()]
-        _insert_actions(conn, goal, final)
-        conn.commit()
-        conn.execute(
-            "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
-            (f"{len(final)} blocks across {len(set(e['date'] for e in final))} days", goal_id),
-        )
-        conn.commit()
+        # Write the fast deterministic plan immediately so the schedule is NEVER empty.
+        # The questionnaire details make even this specific to the goal.
+        fast = generation.build_plan_quick(goal)
+        _write_plan(conn, goal, fast)
+        logger.warning("plan bg: goal %s wrote %s fallback entries", goal_id, len(fast))
+        # Then opportunistically upgrade with the LLM (blocking the faster fallback).
+        # This makes the schedule real/concrete rather than phase-generic. If no model
+        # is up or it times out, the fallback plan already drawn holds.
+        try:
+            better = generation.generate_plan_or_none(goal, user, db=conn)
+            if better:
+                _write_plan(conn, goal, better)
+                logger.warning("plan bg: goal %s upgraded to %s LLM entries", goal_id, len(better))
+        except Exception as exc:
+            logger.warning("plan bg: goal %s LLM upgrade failed, keeping fallback: %r", goal_id, exc)
     except Exception as exc:
         logger.warning("plan bg: goal %s failed: %r", goal_id, exc)
     finally:
         lock.release()
+
+
+def _write_plan(conn, goal, entries):
+    """Insert the chosen entries and update plan_status/summary. One entry per date
+    (earliest slot), mirroring the prior behavior."""
+    sel = {}
+    for e in entries:
+        d = e["date"]
+        hh = int(e["start_time"].split(":")[0]) if e.get("start_time") else 9
+        if d not in sel or hh < sel[d]["hh"]:
+            sel[d] = {"hh": hh, "entry": e}
+    final = [v["entry"] for v in sel.values()]
+    conn.execute("DELETE FROM actions WHERE goal_id=?", (goal["id"],))
+    _insert_actions(conn, goal, final)
+    conn.execute(
+        "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
+        (f"{len(final)} blocks across {len(set(e['date'] for e in final))} days", goal["id"]),
+    )
+    conn.commit()
+    return final
 
 
 @router.post("/goals")
@@ -140,7 +158,21 @@ def create_goal(body: GoalCreateRequest, user: dict = Depends(require_user)):
     goal = dict(conn.execute("SELECT * FROM goals WHERE id=?", (cur.lastrowid,)).fetchone())
     # kick off plan generation in the background thread so response is immediate
     threading.Thread(target=_regenerate_plan_bg, args=(user, goal["id"]), daemon=True).start()
-    return {"id": goal["id"], "async": True}
+    # return questionnaire questions so the frontend can ask them
+    questions = generation.goal_questionnaire(title)
+    return {"id": goal["id"], "async": True, "questions": questions}
+
+
+@router.post("/goals/{goal_id}/details")
+def save_goal_details(goal_id: int, user: dict = Depends(require_user), answers: dict = Body(default={})):
+    """Save questionnaire answers and regenerate the schedule with them."""
+    goal = _goal_or_404(user, goal_id)
+    conn = get_connection()
+    conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps(answers), goal_id))
+    conn.commit()
+    # regenerate schedule with the new details
+    threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
+    return {"ok": True}
 
 
 @router.get("/goals")
@@ -214,9 +246,16 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
 
 @router.post("/goals/{goal_id}/plan")
 def regen_plan(goal_id: int, user: dict = Depends(require_user), body: RegenPlanRequest = None):
-    _goal_or_404(user, goal_id)
-    threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
-    return {"ok": True, "async": True}
+    """Redraw a goal's schedule — synchronously waits for the LLM when it's usable,
+    so the user gets the real plan (not a forgotten background ghost)."""
+    goal = _goal_or_404(user, goal_id)
+    conn = get_connection()
+    try:
+        entries = generation.generate_plan(goal, user, db=conn)
+    except Exception:
+        entries = generation.build_plan_quick(goal)
+    schedule = _write_plan(conn, goal, entries)
+    return {"ok": True, "plan": schedule}
 
 
 # Reads progress (deprecated/compat path, primary is in GET goal)
@@ -239,10 +278,24 @@ def complete_goal(goal_id: int, body: CompleteGoalRequest, user: dict = Depends(
     if body.claimed_success:
         conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=?", (goal_id,))
         conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (goal_id,))
+        conn.commit()
+        return {"status": "succeeded"}
     else:
-        conn.execute("UPDATE goals SET status='active' WHERE id=?", (goal_id,))
-    conn.commit()
-    return {"status": conn.execute("SELECT status FROM goals WHERE id=?", (goal_id,)).fetchone()["status"]}
+        # Cancellation or delay — require a real reason
+        reason = (body.reason or "").strip()
+        if not reason:
+            raise HTTPException(status_code=400, detail="cancellation requires a reason")
+        conn.execute(
+            "UPDATE goals SET status='cancelled', plan_status=?, display_title=? WHERE id=?",
+            (f"cancelled: {reason}", goal["display_title"], goal_id),
+        )
+        conn.execute("DELETE FROM actions WHERE goal_id=?", (goal_id,))
+        conn.commit()
+        roast = (
+            f"File closed. Reason: \"{reason}\". "
+            "If this is real, fine. If you're just quitting, the next goal won't be easier."
+        )
+        return {"status": "cancelled", "roast": roast}
 
 
 @router.post("/actions/{action_id}/toggle")

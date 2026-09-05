@@ -69,39 +69,9 @@ FALLBACK_CHECK_IN_NO = (
     "suggestion; I've redrawn the board to make the gap impossible to hide in."
 )
 
-NO_OPENER = "Right. Another day where you reply to nothing. Let's fix that."
-
-GLOBAL_OPENER = "Direct line. No trigger-happy enthusiasm, just the schedule. What's the hold-up?"
-
-MAIN_FALLBACKS = [
-    "You've told me what's stuck. Good. The problem isn't the task, it's the 40 seconds before you start. Start there.",
-    "The schedule already says what today looks like. The only open question is whether you actually move.",
-    "No excuses, one task, right now. Come back to me when it's done.",
-    "Whatever you're procrastinating, it's cheaper to just do it than to keep negotiating with yourself.",
-    "I don't need a motivational speech. I need to see a checkbox flip to done.",
-]
-
-LINKS_FALLBACK = (
-    "Here's where to start:\n"
-    "1. Search the topic on YouTube for beginners — free, visual, gets you moving.\n"
-    "2. Khan Academy or Coursera — structured courses, no excuses.\n"
-    "3. Open a notebook. Write down 3 things you learned. If you can't, you didn't start.\n"
-    "Pick one, open it, start today. Don't hoard tabs."
-)
-
 NUDGE_FALLBACK = "You're on the clock. That task is still open. Make it close."
 
 OPENING_FALLBACK = "New file, same discipline. State the outcome in one sentence and give me a deadline."
-
-PLAN_FALLBACK = [
-    "Clarify the outcome — one sentence.",
-    "Audit the work into 3-5 real chunks.",
-    "Strictest constraint decides the non-working hours.",
-    "Drop each chunk into a daily slot; overrun pushes the next day, never the deadline.",
-    "Each block named and billable; no 'work on it vaguely' slots.",
-]
-
-DAILY_DIGEST_FALLBACK = "Daily digest generated offline."
 
 
 def fallback_greeting(name):
@@ -130,9 +100,3 @@ def build_daily_email_html(user_name, tasks, total_hours, days_left, goal_title=
         f"<p style='color:#6f6550;'>Reply to the check-in when a block is done. No 'almost'.</p>"
         "</body></html>"
     )
-
-
-GOAL_OPENING_FALLBACK = (
-    "Right. You've filed a goal, which means you've committed. I'll build the run of show — "
-    "you bring the follow-through."
-)

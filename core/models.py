@@ -83,6 +83,10 @@ class ConstraintAddRequest(BaseModel):
     text: str = Field(min_length=1)
 
 
+class BlockedWindowsRequest(BaseModel):
+    blocked_windows: List[str] = Field(default_factory=list)
+
+
 class ReminderSetRequest(BaseModel):
     reminder_time: str
 

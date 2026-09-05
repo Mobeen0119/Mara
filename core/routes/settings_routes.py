@@ -8,7 +8,8 @@ from core.database import get_connection
 from core.deps import require_user
 from core import generation
 from core.llm import LLMManager
-from core.models import CheckinTimeRequest, LLMSettingsRequest
+from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest
+from core.routes.goal_routes import regenerate_plan_bg
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -96,6 +97,37 @@ def set_checkin_time(body: CheckinTimeRequest, user: dict = Depends(require_user
     conn.execute("UPDATE users SET checkin_time=? WHERE id=?", (body.checkin_time, user["id"]))
     conn.commit()
     return {"ok": True}
+
+
+@router.get("/settings/blocked-windows")
+def get_blocked_windows(user: dict = Depends(require_user)):
+    from core.generation import user_blocked_windows
+    return {"blocked_windows": json.loads(user.get("blocked_windows") or "[]")}
+
+
+@router.put("/settings/blocked-windows")
+def put_blocked_windows(body: BlockedWindowsRequest, user: dict = Depends(require_user)):
+    from core.generation import parse_time_window
+    cleaned = []
+    for w in body.blocked_windows:
+        text = (w or "").strip()
+        if not text:
+            continue
+        if not parse_time_window(text):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{text}' doesn't look like a time window (e.g. '5pm-7pm', 'gym 5-7').",
+            )
+        cleaned.append(text)
+    conn = get_connection()
+    conn.execute("UPDATE users SET blocked_windows=? WHERE id=?", (json.dumps(cleaned), user["id"]))
+    conn.commit()
+    # Redraw every active goal so the new "always busy" windows are respected immediately.
+    for g in conn.execute(
+        "SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)
+    ).fetchall():
+        regenerate_plan_bg(user, g["id"])
+    return {"ok": True, "blocked_windows": cleaned}
 
 
 @router.get("/settings")

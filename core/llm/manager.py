@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import threading
@@ -96,12 +97,19 @@ class LLMManager:
                 continue
         return False
 
-    def generate(self, system_prompt, user_prompt, timeout=30) -> GenerationResult:
+    def _ordered(self):
+        """Provider attempt order. The LOCAL model is always tried FIRST — the user
+        explicitly wants local generation to win when it's up, so plans and chat are
+        drawn on his own machine. OpenRouter is the fallback only when a key is set
+        and the local model can't answer (down / no model / timeout)."""
+        providers = self._providers()
+        o, l = providers.get("openrouter"), providers.get("ollama")
+        return [p for p in (l, o) if p is not None]
+
+    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None) -> GenerationResult:
         import logging
         logger = logging.getLogger("eloise.llm")
-        providers = self._providers()
-        ordered = [providers.get("ollama"), providers.get("openrouter")]
-        ordered = [p for p in ordered if p is not None]
+        ordered = self._ordered()
         # Try every provider — even if status says non-usable, attempt generation anyway.
         # Status can be wrong (slow probe, transient failure), and a generate call is the
         # real test. Only skip providers that are plainly missing (e.g. no API key at all).
@@ -111,7 +119,7 @@ class LLMManager:
                 logger.debug("skipping openrouter: no API key")
                 continue
             logger.info("trying provider: %s (model: %s)", p.name, p.model)
-            future = self._executor.submit(p.generate, system_prompt, user_prompt, timeout)
+            future = self._executor.submit(p.generate, system_prompt, user_prompt, timeout, max_tokens)
             try:
                 result = future.result(timeout=timeout + 5)
             except Exception as exc:
@@ -124,8 +132,8 @@ class LLMManager:
             error="no usable provider (start local model or add an API key)",
         )
 
-    def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=90):
-        result = self.generate(system_prompt, user_prompt, timeout=timeout)
+    def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=90, max_tokens=None):
+        result = self.generate(system_prompt, user_prompt, timeout=timeout, max_tokens=max_tokens)
         if result.ok and not _VERDICT_ECHO.search(result.text[:80]):
             # Strip any prompt template the model echoed back
             cleaned = _strip_prompt_echo(result.text)
@@ -135,6 +143,36 @@ class LLMManager:
                                       error="provider echoed a moderation verdict")
         fallback_text = fallback_fn()
         return fallback_text, "fallback"
+
+    def stream_generate(self, system_prompt, user_prompt, timeout=90, max_tokens=None):
+        """Yield (chunk_text, provider_name) as the first usable provider streams.
+        After the last chunk, yields ('', provider_name) to signal clean completion.
+        Raises RuntimeError if no provider can stream."""
+        ordered = self._ordered()
+        for p in ordered:
+            if p.name == "openrouter" and not getattr(p, "api_key", ""):
+                continue
+            stream = getattr(p, "generate_stream", None)
+            if stream is None:
+                continue
+            logger = logging.getLogger("eloise.llm")
+            logger.info("streaming from provider: %s (model: %s)", p.name, p.model)
+            try:
+                chunk = ""
+                for chunk in stream(system_prompt, user_prompt, timeout, max_tokens):
+                    if chunk is None:
+                        yield "", p.name
+                        return
+                    yield chunk, p.name
+                yield "", p.name
+                return
+            except RuntimeError as exc:
+                logger.warning("provider %s stream failed: %s", p.name, exc)
+                continue
+            except Exception as exc:
+                logger.warning("provider %s stream errored: %s", p.name, exc)
+                continue
+        raise RuntimeError("no usable provider (start local model or add an API key)")
 
     def statuses(self):
         providers = self._providers()

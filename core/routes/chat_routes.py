@@ -2,7 +2,7 @@ import json
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.database import get_connection
 from core.deps import require_user
@@ -124,7 +124,7 @@ def _add_message(conn, user_id, goal_id, role, content):
     conn.commit()
 
 
-def _history(conn, goal_id, user_id, limit=8):
+def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
     if goal_id:
         rows = conn.execute(
             "SELECT * FROM chat_messages WHERE goal_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
@@ -135,13 +135,36 @@ def _history(conn, goal_id, user_id, limit=8):
             "SELECT * FROM general_chat WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
-    return [f"{r['role']}: {r['content']}" for r in reversed(rows)]
+    # Speed: a bloated context makes the (CPU) model slower. Cap each message's size and
+    # drop the OLDEST turns once the whole history exceeds a token budget. The model only
+    # ever needs the recent tail + the current question to answer.
+    _MAX_TOTAL_CHARS = 2200
+    _MAX_MSG_CHARS = 400
+    lines = []
+    for r in reversed(rows):
+        content = r["content"]
+        if len(content) > _MAX_MSG_CHARS:
+            content = content[:_MAX_MSG_CHARS] + "…"
+        lines.append(f"{r['role']}: {content}")
+    while sum(len(l) for l in lines) > _MAX_TOTAL_CHARS and len(lines) > 1:
+        lines.pop(0)
+    # Structural anti-repeat: when the user re-asks the same question, drop the last
+    # Eloise answer from context so a weak model can't just copy it verbatim.
+    if drop_reply_to and len(lines) >= 2:
+        last = lines[-1].strip()
+        prev = lines[-2].strip()
+        if last.startswith("eloise:") and prev.startswith("user:"):
+            if prev[len("user:"):].strip() == (drop_reply_to or "").strip():
+                lines.pop()
+    return lines
 
 
 @router.post("/chat")
 def chat(body: ChatRequest, user: dict = Depends(require_user)):
     conn = get_connection()
     goal_id = body.goal_id
+    _msg = (body.message or "").strip()[:2000]
+    message = _msg
     goal = None
     if goal_id:
         goal = conn.execute(
@@ -151,7 +174,7 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
             raise HTTPException(status_code=404, detail="goal not found")
         goal = dict(goal)
 
-    _add_message(conn, user["id"], goal_id, "user", body.message)
+    _add_message(conn, user["id"], goal_id, "user", message)
 
     goals_summary = [
         r["display_title"]
@@ -160,7 +183,7 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         ).fetchall()
     ]
 
-    if goal_id and goal and generation.completion_detected(body.message):
+    if goal_id and goal and generation.completion_detected(message):
         conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=?", (goal_id,))
         conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (goal_id,))
         conn.commit()
@@ -171,12 +194,13 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         _add_message(conn, user["id"], goal_id, "eloise", reply)
         return {"reply": reply, "goal_status": "succeeded", "source": "completion"}
 
-    history = "\n".join(_history(conn, goal_id, user["id"]))
-    goal_name = goal["display_title"] if goal else "general"
+    history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
+    goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
 
-    # Content safety: refuse harmful requests before they reach the LLM.
-    if generation._is_truly_harmful(body.message):
-        refusal = "That kind of request doesn't belong on this board, and I won't help plan it. Whatever this is hoping to be — it isn't a task I'll execute. Put a real goal on the table and we'll move."
+    # Content safety: refuse harmful requests before they reach the LLM. Context-aware:
+    # "sister" alone is fine, but as a follow-up to an incest message it must refuse too.
+    if generation._is_truly_harmful(message, context=history):
+        refusal = generation.GUARDRAIL_REFUSAL
         _add_message(conn, user["id"], goal_id, "eloise", refusal)
         return {"reply": refusal, "source": "guardrail"}
 
@@ -191,15 +215,128 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
             f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows
         )
         text, source = generation.generate_chat_reply(
-            user["name"], goal_name, history, body.message, db=conn, plan_lines=plan_lines
+            user["name"], goal_name, history, message, db=conn, plan_lines=plan_lines
         )
     else:
         board = _active_board_snapshot(conn, user["id"])
         text, source = generation.generate_global_chat_reply(
-            user["name"], [board], history, body.message, db=conn
+            user["name"], [board], history, message, db=conn
+        )
+    if source == "offline" or not text:
+        conn.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="The model didn't answer, and I won't fake one. Ollama is off or unreachable — start it (or check the LLM settings), then send that again.",
         )
     _add_message(conn, user["id"], goal_id, "eloise", text)
     return {"reply": text, "source": source}
+
+
+class _SSEBodySerializer:
+    pass
+
+
+@router.post("/chat/stream")
+def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
+    """SSE variant of /chat: reply tokens are pushed as they're generated so the
+    frontend can render text live instead of staring at a spinner for up to 90s."""
+    import json as _json
+
+    def send(data: dict) -> str:
+        return f"data: {_json.dumps(data)}\n\n"
+
+    conn = get_connection()
+    goal_id = body.goal_id
+    message = (body.message or "").strip()[:2000]
+    goal = None
+    if goal_id:
+        goal = conn.execute(
+            "SELECT * FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])
+        ).fetchone()
+        if not goal:
+            raise HTTPException(status_code=404, detail="goal not found")
+        goal = dict(goal)
+
+    _add_message(conn, user["id"], goal_id, "user", message)
+
+    if goal_id and goal and generation.completion_detected(message):
+        conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=?", (goal_id,))
+        conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (goal_id,))
+        conn.commit()
+        reply = (
+            "Claimed and closed. You said it's done, so the file reads done. If you're lying, "
+            "the next check-in will find out. Don't insult my ledger with a fake 'done'."
+        )
+        _add_message(conn, user["id"], goal_id, "eloise", reply)
+        return StreamingResponse(
+            [send({"delta": reply}), send({"done": True, "goal_status": "succeeded", "source": "completion"})],
+            media_type="text/event-stream",
+        )
+
+    history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
+    goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
+
+    if generation._is_truly_harmful(message, context=history):
+        refusal = generation.GUARDRAIL_REFUSAL
+        _add_message(conn, user["id"], goal_id, "eloise", refusal)
+        return StreamingResponse(
+            [send({"delta": refusal}), send({"done": True, "source": "guardrail"})],
+            media_type="text/event-stream",
+        )
+
+    # No canned replies: if the model can't be reached right now, say so with a real
+    # error instead of fabricating an Eloise answer. A streaming response can't change
+    # status mid-frame, so check reachability BEFORE starting the stream and wait for
+    # the genuine response — never substitute hardcoded text.
+    if not generation.get_manager(conn).any_usable():
+        conn.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="The model isn't reachable right now, and I won't fake a reply. Start Ollama (or check the LLM settings), then send that again.",
+        )
+
+    def generate():
+        collected = []
+        gconn = get_connection()
+        if goal_id:
+            plan_rows = gconn.execute(
+                "SELECT date, title, start_time FROM actions WHERE goal_id=? AND status!='done' ORDER BY date, start_time LIMIT 12",
+                (goal_id,),
+            ).fetchall()
+            plan_lines = "\n".join(
+                f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows
+            )
+            stream = generation.stream_chat_reply(
+                user["name"], goal_name, history, message, db=gconn, plan_lines=plan_lines
+            )
+        else:
+            board = _active_board_snapshot(gconn, user["id"])
+            stream = generation.stream_global_chat_reply(
+                user["name"], [board], history, message, db=gconn
+            )
+        source = None
+        try:
+            for chunk, src in stream:
+                if not chunk:
+                    continue
+                source = source or src
+                collected.append(chunk)
+                yield _json.dumps({"delta": chunk})
+            if collected:
+                try:
+                    _add_message(gconn, user["id"], goal_id, "eloise", "".join(collected))
+                except Exception:
+                    pass
+            yield _json.dumps({"done": True, "source": source or "offline"})
+        except Exception:
+            yield _json.dumps({"error": True, "done": True, "source": "offline",
+                               "detail": "The model connection dropped mid-reply."})
+
+    return StreamingResponse(
+        (f"data: {frame}\n\n" for frame in generate()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/chat")
@@ -324,16 +461,6 @@ def quick_command(body: dict, user: dict = Depends(require_user)):
         }
 
     return {"reply": "I don't know that command. Try Today, Score, Fire, Momentum, Fuck it, or Stakes.", "source": "quick"}
-    conn = get_connection()
-    goals_summary = [
-        r["display_title"]
-        for r in conn.execute(
-            "SELECT display_title FROM goals WHERE user_id=? AND status='active'", (user["id"],)
-        ).fetchall()
-    ]
-    goal_name = goals_summary[0] if goals_summary else "your goal"
-    text, source = generation.generate_link_suggestion(user["name"], goal_name, body.message, db=conn)
-    return {"reply": text, "source": source}
 
 
 @router.post("/chat/nudge")

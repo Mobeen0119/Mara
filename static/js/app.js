@@ -324,7 +324,7 @@ async function renderToday(el) {
     <div class="page-header">
       <div class="kicker">Today — ${escHtml(today.date)}</div>
       <h1>The run of show.</h1>
-      <p class="sub">${escHtml(today.items.length)} blocks on the board${today.items.length ? ' · none of them moved themselves' : '.'}</p>
+      <p class="sub">${escHtml(today.items.length)} tasks on the board${today.items.length ? ' · none of them moved themselves' : '.'}</p>
       <div class="header-rule"></div>
     </div>`;
 
@@ -427,7 +427,7 @@ async function renderBoard(el) {
             <span class="chip off">current streak ${m.current_streak}d</span>
             <span class="chip off">${m.burn_hours_per_day}h/day burn</span>
           </div>
-          <p class="sub" style="margin:0;">${m.done_days_total} days with real completed blocks count toward this.</p>
+          <p class="sub" style="margin:0;">${m.done_days_total} days with real completed tasks count toward this.</p>
         </div>
       </div>
     </div>`;
@@ -671,13 +671,57 @@ async function pinStake(id) {
     navigate('goal', id);
   } catch (e) { showToast(e.message, 'error'); }
 }
+async function refreshGoal(id) {
+  const main = document.getElementById('main-content');
+  if (main && currentScreen === 'goal') await renderGoalDetail(main, id);
+}
+
 async function regenPlan(id) {
-  showToast('Eloise is drawing the schedule...', 'success');
+  const main = document.getElementById('main-content');
+  if (!main) return;
+  const note = document.createElement('div');
+  note.className = 'plan-generating';
+  note.id = 'plan-generating-note';
+  note.innerHTML = `<span class="typing-bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span>
+    <div><strong>Redraw kicked off.</strong><br>
+    <span style="font-size:13px;color:var(--bone-dim);">The brain is redrawing in the background. Your current schedule stays until the new one lands.</span></div>`;
+  main.prepend(note);
+  note.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  let posted = false;
   try {
     await api(`/goals/${id}/plan`, { method: 'POST' });
-    showToast('Schedule redrawn.', 'success');
+    posted = true;
   } catch (e) { showToast(e.message, 'error'); }
-  navigate('goal', id);
+  // Keep showing the current schedule while the model works. When the redraw
+  // settles, render the result: the NEW schedule on success, or the OLD one if
+  // the model couldn't be reached (the server keeps it and queues a retry).
+  let settled = null;
+  if (posted) settled = await waitPlanSettles(id);
+  const nx = document.getElementById('plan-generating-note');
+  if (nx) nx.remove();
+  if (posted && settled && String(settled.plan_summary).startsWith('kept previous')) {
+    showToast('Couldn\u2019t reach the model \u2014 kept your current schedule. Retrying in a minute.', 'error');
+  } else if (posted && settled) {
+    showToast('New schedule drawn' + (settled.plan_summary ? ' \u2014 ' + settled.plan_summary : '') + '.', 'success');
+  } else if (posted) {
+    showToast('Still drawing in the background \u2014 it will appear here shortly.', 'info');
+  }
+  try {
+    if (currentScreen === 'goal') await renderGoalDetail(main, id);
+  } catch (e) {}
+}
+
+async function waitPlanSettles(id, attempts = 36) {
+  // Poll the goal until the background draw is no longer 'generating'
+  // (it flips back to 'active' on success OR failure — old plan kept).
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const g = await api(`/goals/${id}`);
+      if (g.plan_status !== 'generating') return g;
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 2500));
+  }
+  return null;
 }
 async function deleteGoal(id) {
   const ok = await confirmModal('Burn the file?', 'This deletes the goal and every schedule tied to it. Eloise will not miss it.', 'Burn it', true);
@@ -786,7 +830,7 @@ async function renderSchedule(el) {
   try {
     const schedule = await api('/schedule');
     const today = new Date().toISOString().slice(0, 10);
-    let html = `<div class="page-header"><div class="kicker">15 days out</div><h1>The run of show.</h1><p class="sub">Tap a day to open it. Tick blocks as they close.</p><div class="header-rule"></div></div>`;
+    let html = `<div class="page-header"><div class="kicker">15 days out</div><h1>The run of show.</h1><p class="sub">Tap a day to open it. Tick tasks as they close.</p><div class="header-rule"></div></div>`;
     const dates = {};
     for (const goalId of Object.keys(schedule)) {
       const data = schedule[goalId];
@@ -962,16 +1006,33 @@ function appendChatMsg(container, role, text, source) {
   return div;
 }
 
-/* Live typing indicator: animated dots bubble shown while Eloise is "thinking". */
+/* Live typing indicator. Instead of static dots that read as "stalled", we show
+   animated equalizer bars + rotating status phrases so the wait feels like motion.
+   People tolerate waits when they see believable progress, not empty bouncing dots. */
 function addTyping(container) {
   const div = document.createElement('div');
   div.className = 'chat-msg eloise typing';
-  div.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
+  const phrases = [
+    'reading your message...',
+    'checking the board...',
+    'thinking...',
+    'writing the reply...',
+    'wrapping up...',
+    'nearly there...',
+  ];
+  div.innerHTML = `<span class="typing-bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span><span class="typing-status">${phrases[0]}</span>`;
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
+  let i = 0;
+  const statusEl = div.querySelector('.typing-status');
+  div._typingTimer = setInterval(() => {
+    i = (i + 1) % phrases.length;
+    if (statusEl && div.parentNode) statusEl.textContent = phrases[i];
+  }, 2600);
   return div;
 }
 function finishTyping(bubble, text, source) {
+  if (bubble._typingTimer) { clearInterval(bubble._typingTimer); bubble._typingTimer = null; }
   bubble.classList.remove('typing');
   bubble.innerHTML = '';
   const txt = document.createElement('span');
@@ -983,6 +1044,19 @@ function finishTyping(bubble, text, source) {
     tag.textContent = (source === 'ollama' ? 'local' : source);
     bubble.appendChild(tag);
   }
+  bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
+}
+
+/* Live text while streaming: swap the typing animation for actual words as they
+   arrive, so the bubble reads as "writing right now" instead of a frozen spinner. */
+function setTypingText(bubble, text) {
+  if (!bubble || !bubble.parentNode) return;
+  if (bubble._typingTimer) { clearInterval(bubble._typingTimer); bubble._typingTimer = null; }
+  bubble.classList.remove('typing');
+  bubble.innerHTML = '';
+  const txt = document.createElement('span');
+  txt.textContent = text;
+  bubble.appendChild(txt);
   bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
 }
 
@@ -998,6 +1072,46 @@ async function quickChat(cmd) {
   }
 }
 
+async function streamChatReply(goalId, message, onDelta) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const res = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ goal_id: goalId, message }),
+  });
+  if (res.status === 401) { logout(); throw new Error('unauthorized'); }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let full = '';
+  let source = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      if (!raw.startsWith('data: ')) continue;
+      let ev;
+      try { ev = JSON.parse(raw.slice(6)); } catch (e) { continue; }
+      if (ev.error) { const msg = ev.detail || 'model connection dropped'; throw new Error(msg); }
+      if (ev.delta) { full += ev.delta; onDelta(full); }
+      if (ev.done) { source = ev.source || source; }
+    }
+  }
+  if (!full && (!source || source === 'offline')) {
+    throw new Error("The model didn't answer, and I won't fake one. Start Ollama (or check the LLM settings), then send that again.");
+  }
+  return { text: full, source: source || 'llm' };
+}
+
 async function sendGlobalChat() {
   const inp = document.getElementById('global-chat-input');
   const chatEl = document.getElementById('chat-container');
@@ -1008,8 +1122,11 @@ async function sendGlobalChat() {
   const bubble = addTyping(chatEl);
   flashTyping();
   try {
-    const r = await api('/chat', { method: 'POST', body: JSON.stringify({ goal_id: null, message: msg }) });
-    finishTyping(bubble, r.reply, r.source);
+    const r = await streamChatReply(null, msg, (partial) => {
+      setTypingText(bubble, partial);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    });
+    finishTyping(bubble, r.text, r.source);
   } catch (e) {
     finishTyping(bubble, e.message, null);
   }
@@ -1039,9 +1156,12 @@ async function sendGoalChat(goalId) {
   appendChatMsg(cc, 'user', msg);
   const bubble = addTyping(cc);
   try {
-    const r = await api('/chat', { method: 'POST', body: JSON.stringify({ goal_id: goalId, message: msg }) });
-    finishTyping(bubble, r.reply, r.source);
-    if (r.goal_status === 'succeeded') setTimeout(() => navigate('goals'), 1000);
+    const r = await streamChatReply(goalId, msg, (partial) => {
+      setTypingText(bubble, partial);
+      cc.scrollTop = cc.scrollHeight;
+    });
+    finishTyping(bubble, r.text, r.source);
+    if (r.source === 'completion') setTimeout(() => navigate('goals'), 1000);
   } catch (e) { finishTyping(bubble, e.message, null); }
 }
 
@@ -1075,6 +1195,17 @@ async function renderSettings(el) {
         <button class="btn btn-ghost" style="width:auto;" onclick="saveCheckinTime()">Save Time</button>
       </div>
     </div>`;
+    html += `<div class="settings-section"><h3>Always-Busy Windows</h3>
+      <div class="card">
+        <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">Windows Eloise never schedules anything in — set once, respected by every goal. E.g. <strong>gym 5pm-7pm</strong>, <strong>class 9-11am</strong>.</p>
+        <div id="busy-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input type="text" id="busy-new" placeholder="gym 5-7pm" style="flex:1;min-width:180px;">
+          <button class="btn btn-ghost" style="width:auto;" onclick="addBusyWindow()">Add</button>
+          <button class="btn" style="width:auto;" onclick="saveBusyWindows()">Save</button>
+        </div>
+      </div>
+    </div>`;
     html += `<div class="settings-section"><h3>Account</h3>
       <div class="card">
         <p style="font-size:13px;margin-bottom:12px;color:var(--bone-dim);">On the board as <strong style="color:var(--bone);">${escHtml(userName || '')}</strong></p>
@@ -1085,6 +1216,12 @@ async function renderSettings(el) {
       const me = await api('/me');
       const inp = document.getElementById('set-checkin-time');
       if (me.checkin_time && inp) inp.value = me.checkin_time;
+    } catch (e) {}
+    // Always-busy windows list
+    window._busyWindows = [];
+    try {
+      const bw = await api('/settings/blocked-windows');
+      window._busyWindows = bw.blocked_windows || [];
     } catch (e) {}
     // Email channel section + on-demand digest
     let em = null;
@@ -1110,6 +1247,7 @@ async function renderSettings(el) {
     html += `<p style="color:#ff8b7a;">Failed to load settings.</p>`;
   }
   el.innerHTML = html;
+  renderBusyWindows();
 }
 async function saveLLMSettings() {
   const body = {
@@ -1124,6 +1262,34 @@ async function saveCheckinTime() {
   const t = document.getElementById('set-checkin-time').value;
   if (!t) { showToast('Pick a time', 'error'); return; }
   try { await api('/settings/checkin-time', { method: 'PUT', body: JSON.stringify({ checkin_time: t }) }); showToast('Check-in time saved', 'success'); } catch (e) { showToast(e.message, 'error'); }
+}
+function renderBusyWindows() {
+  const wrap = document.getElementById('busy-list');
+  if (!wrap) return;
+  wrap.innerHTML = (window._busyWindows || []).map((w, i) =>
+    `<div class="cons-chip"><span>${escHtml(w)}</span><button class="x-btn" onclick="removeBusyWindow(${i})" title="Remove">&times;</button></div>`
+  ).join('') || '<p style="font-size:13px;color:var(--bone-dim);margin:0;">None set — Eloise will plan around nothing.</p>';
+}
+function addBusyWindow() {
+  const inp = document.getElementById('busy-new');
+  const val = (inp && inp.value || '').trim();
+  if (!val) { showToast('Type a window like gym 5-7pm', 'error'); return; }
+  window._busyWindows = window._busyWindows || [];
+  if (!window._busyWindows.includes(val.toLowerCase())) window._busyWindows.push(val.toLowerCase());
+  if (inp) inp.value = '';
+  renderBusyWindows();
+}
+function removeBusyWindow(i) {
+  (window._busyWindows || []).splice(i, 1);
+  renderBusyWindows();
+}
+async function saveBusyWindows() {
+  try {
+    const r = await api('/settings/blocked-windows', { method: 'PUT', body: JSON.stringify({ blocked_windows: window._busyWindows || [] }) });
+    window._busyWindows = r.blocked_windows || [];
+    renderBusyWindows();
+    showToast('Saved — every schedule now avoids those windows', 'success');
+  } catch (e) { showToast(e.message, 'error'); }
 }
 async function sendDigest() {
   try {

@@ -96,58 +96,213 @@ def _regenerate_plan_bg(user, goal_id):
     lock = _plan_locks.setdefault(goal_id, threading.Lock())
     acquired = lock.acquire(blocking=False)
     if not acquired:
+        try:
+            conn = get_connection()
+            conn.execute("UPDATE goals SET plan_status='active' WHERE id=?", (goal_id,))
+            conn.commit()
+        except Exception:
+            pass
         return
     try:
         time.sleep(0.5)
         conn = get_connection()
-        conn.execute("DELETE FROM actions WHERE goal_id=?", (goal_id,))
-        conn.commit()
-        # Write the fast deterministic plan immediately so the schedule is NEVER empty.
-        # The questionnaire details make even this specific to the goal.
-        fast = generation.build_plan_quick(goal)
-        _write_plan(conn, goal, fast)
-        logger.warning("plan bg: goal %s wrote %s fallback entries", goal_id, len(fast))
-        # Then opportunistically upgrade with the LLM (blocking the faster fallback).
-        # This makes the schedule real/concrete rather than phase-generic. If no model
-        # is up or it times out, the fallback plan already drawn holds.
+        blocked = generation.user_blocked_windows(user)
+        # NO hardcoded fallback schedule. Only a real LLM plan is written. We try the
+        # model; if it is down or times out, we KEEP whatever plan already exists and
+        # retry in a minute. A hardcoded fill-in is never shown to the user.
         try:
-            better = generation.generate_plan_or_none(goal, user, db=conn)
-            if better:
-                _write_plan(conn, goal, better)
-                logger.warning("plan bg: goal %s upgraded to %s LLM entries", goal_id, len(better))
+            better = generation.generate_plan_or_none(goal, user, db=conn, extra_blocked=blocked)
         except Exception as exc:
-            logger.warning("plan bg: goal %s LLM upgrade failed, keeping fallback: %r", goal_id, exc)
+            logger.warning("plan bg: goal %s LLM attempt failed: %r", goal_id, exc)
+            better = None
+        if better:
+            _write_plan(conn, goal, better, blocked_min=blocked,
+                        provider=generation.last_provider())
+            logger.warning("plan bg: goal %s wrote %s LLM entries", goal_id, len(better))
+        else:
+            existing = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (goal_id,)).fetchone()[0]
+            if existing:
+                logger.warning("plan bg: goal %s LLM down, keeping %s existing entries", goal_id, existing)
+                conn.execute(
+                    "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
+                    ("kept previous schedule (model unavailable, retrying)", goal_id),
+                )
+            else:
+                logger.warning("plan bg: goal %s LLM down, no plan yet", goal_id)
+                conn.execute("UPDATE goals SET plan_status='active' WHERE id=?", (goal_id,))
+            conn.commit()
+            _schedule_plan_retry(user, goal_id)
     except Exception as exc:
         logger.warning("plan bg: goal %s failed: %r", goal_id, exc)
+        try:
+            conn = get_connection()
+            conn.execute("UPDATE goals SET plan_status='active' WHERE id=?", (goal_id,))
+            conn.commit()
+        except Exception:
+            pass
     finally:
         lock.release()
 
 
-def _write_plan(conn, goal, entries):
-    """Insert the chosen entries and update plan_status/summary. One entry per date
-    (earliest slot), mirroring the prior behavior."""
-    sel = {}
+def _schedule_plan_retry(user, goal_id, delay=60):
+    """Try the plan again in ~a minute, as the user wants: 'if there is some issue
+    while creating a new one, try in a minute and keep the old one until then'."""
+    def _retry():
+        time.sleep(delay)
+        try:
+            _regenerate_plan_bg(user, goal_id)
+        except Exception:
+            pass
+    threading.Thread(target=_retry, daemon=True).start()
+
+
+def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
+    """Insert the chosen entries and update plan_status/summary. Keeps up to three
+    blocks per date (so a day is actually managed, not a single slot). Then re-slot
+    so no two goals own the same time block on a date."""
+    by_date = {}
     for e in entries:
         d = e["date"]
-        hh = int(e["start_time"].split(":")[0]) if e.get("start_time") else 9
-        if d not in sel or hh < sel[d]["hh"]:
-            sel[d] = {"hh": hh, "entry": e}
-    final = [v["entry"] for v in sel.values()]
+        by_date.setdefault(d, []).append(e)
+    final = []
+    for d, day_entries in sorted(by_date.items()):
+        # keep the earliest 3 distinct blocks for that date
+        day_entries.sort(key=lambda e: (_to_min(e.get("start_time")) or 0))
+        final.extend(day_entries[:3])
+    # Cross-goal conflict resolution: pull this user's OTHER goals' blocks and this
+    # user's global blocked windows, shift any overlapping entry to the next free slot.
+    final = _resolve_cross_goal_slots(conn, goal, final, blocked_min=blocked_min)
     conn.execute("DELETE FROM actions WHERE goal_id=?", (goal["id"],))
     _insert_actions(conn, goal, final)
+    summary = f"{len(final)} tasks across {len(set(e['date'] for e in final))} days"
+    if provider in ("ollama", "openrouter"):
+        summary += f" · via {provider}"
     conn.execute(
         "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
-        (f"{len(final)} blocks across {len(set(e['date'] for e in final))} days", goal["id"]),
+        (summary, goal["id"]),
     )
     conn.commit()
     return final
+
+
+def _to_min(t):
+    try:
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def _resolve_cross_goal_slots(conn, goal, entries, blocked_min=None):
+    """For each date in `entries`, collect time blocks already scheduled by OTHER goals
+    for this user, plus the user's global "always busy" windows. If an entry overlaps,
+    shift it to the earliest free 90-min window (9:00, 12:00, 15:00, 18:00 anchors).
+    Returns re-slotted entries."""
+    if not entries:
+        return entries
+    user_id = goal["user_id"]
+    dates = sorted({e["date"] for e in entries})
+    placeholders = ",".join("?" * len(dates))
+    busy = {}
+    rows = conn.execute(
+        f"SELECT date, start_time, end_time FROM actions "
+        f"WHERE user_id=? AND goal_id!=? AND date IN ({placeholders}) AND status!='done'",
+        (user_id, goal["id"], *dates),
+    ).fetchall()
+    for r in rows:
+        s, e = _to_min(r["start_time"]), _to_min(r["end_time"])
+        if s is None or e is None:
+            continue
+        busy.setdefault(r["date"], []).append((s, e))
+    # the user's global windows (e.g. gym 5-7pm) apply to EVERY day in the plan
+    if blocked_min:
+        for d in dates:
+            busy.setdefault(d, []).extend(blocked_min)
+    if not busy:
+        return entries
+    anchors = [(9, 0), (12, 0), (15, 0), (18, 0)]
+
+    def _merge(b):
+        b = sorted(b)
+        out = []
+        for (s, e) in b:
+            if out and s < out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], e))
+            else:
+                out.append((s, e))
+        return out
+
+    def _first_free(taken_set, from_min):
+        """Earliest 90-min slot starting >= from_min that avoids every busy window.
+        Searches the whole day (not just anchors) so it slides past any busy block."""
+        obstacles = _merge(list(taken_set))
+        cur = from_min
+        for (bs, be) in obstacles:
+            if be <= cur:
+                continue
+            if bs >= cur + 90:
+                break
+            cur = be
+        if cur + 90 > 22 * 60:
+            return None
+        return (cur, cur + 90)
+
+    out = []
+    for e in entries:
+        d = e["date"]
+        s, e2 = _to_min(e.get("start_time")), _to_min(e.get("end_time"))
+        taken = busy.get(d, [])
+        overlap = s is not None and e2 is not None and any(
+            s < be and bs < e2 for (bs, be) in taken
+        )
+        if not overlap:
+            out.append(e)
+            continue
+        # Prefer the earliest anchor that fits; otherwise slide the whole day for any
+        # free 90-min window after the anchor. If the day is genuinely full, drop the
+        # block instead of double-booking — a skipped slot beats a liar's schedule.
+        placed = None
+        surf = _merge(list(taken))
+        candidate_starts = [ah * 60 + am for (ah, am) in anchors]
+        if s is not None and s not in candidate_starts:
+            candidate_starts.append(s)
+        for cs in sorted(filter(lambda x: x < 22 * 60, candidate_starts)):
+            ce = min(cs + 90, 22 * 60)
+            if ce - cs < 90:
+                continue
+            if any(cs < be and bs < ce for (bs, be) in surf):
+                continue
+            placed = (cs, ce)
+            break
+        if placed is None:
+            # whole-day slide: find first free gap at/after the anchor, then anywhere
+            for cs in sorted(set([a * 60 for a in (9, 12, 15, 18)]) | {s or 540}):
+                if cs >= 22 * 60:
+                    continue
+                f = _first_free(taken, cs)
+                if f and (placed is None or f[0] < placed[0]):
+                    placed = f
+            if placed is None:
+                continue  # day is full of your own life; don't fake a slot
+        if placed:
+            cs, ce = placed
+            taken.append((cs, ce))
+            busy[d] = taken
+            e = {**e, "start_time": f"{cs // 60:02d}:{cs % 60:02d}", "end_time": f"{ce // 60:02d}:{ce % 60:02d}"}
+        out.append(e)
+    return out
 
 
 @router.post("/goals")
 def create_goal(body: GoalCreateRequest, user: dict = Depends(require_user)):
     conn = get_connection()
     title = body.title.strip()[:120]
-    display = title if len(title) <= 24 else title[:21] + "..."
+    if generation._is_truly_harmful(title):
+        raise HTTPException(
+            status_code=400,
+            detail="That goal doesn't go on this board — Eloise plans real goals, not incest or coercion. A date, a hookup with protection, a memorable night for a partner: all in. That: no.",
+        )
+    display = title if len(title) <= 60 else title[:57] + "..."
     constraints = json.dumps([c.strip() for c in body.constraints if c.strip()])
     cur = conn.execute(
         "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title) "
@@ -226,7 +381,7 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
         vals.append(body.title.strip()[:120])
         fields.append("display_title=?")
         d = body.title.strip()[:120]
-        vals.append(d if len(d) <= 24 else d[:21] + "...")
+        vals.append(d if len(d) <= 60 else d[:57] + "...")
     if body.deadline is not None:
         fields.append("deadline=?")
         vals.append(body.deadline)
@@ -246,16 +401,21 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
 
 @router.post("/goals/{goal_id}/plan")
 def regen_plan(goal_id: int, user: dict = Depends(require_user), body: RegenPlanRequest = None):
-    """Redraw a goal's schedule — synchronously waits for the LLM when it's usable,
-    so the user gets the real plan (not a forgotten background ghost)."""
+    """Redraw a goal's schedule — returns INSTANTLY. The real LLM draw happens in a
+    background thread so Redraw never blocks the UI for a minute+ of model time.
+    Whatever plan exists stays up while the model works (never filler): on success the
+    new schedule replaces it; on failure the OLD schedule stays and a retry is queued.
+    The goal is flagged plan_status='generating' so the UI can keep showing the current
+    schedule and render the result when it settles."""
     goal = _goal_or_404(user, goal_id)
     conn = get_connection()
-    try:
-        entries = generation.generate_plan(goal, user, db=conn)
-    except Exception:
-        entries = generation.build_plan_quick(goal)
-    schedule = _write_plan(conn, goal, entries)
-    return {"ok": True, "plan": schedule}
+    existing = [dict(a) for a in conn.execute(
+        "SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (goal_id,)
+    ).fetchall()]
+    conn.execute("UPDATE goals SET plan_status='generating' WHERE id=?", (goal_id,))
+    conn.commit()
+    threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
+    return {"ok": True, "plan": existing, "source": "redraw-bg"}
 
 
 # Reads progress (deprecated/compat path, primary is in GET goal)
@@ -412,7 +572,7 @@ def seed_demo(user: dict = Depends(require_user)):
     ]
     seeded = []
     for d in demos:
-        display = d["title"] if len(d["title"]) <= 24 else d["title"][:21] + "..."
+        display = d["title"] if len(d["title"]) <= 60 else d["title"][:57] + "..."
         cur = conn.execute(
             "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, plan_status) "
             "VALUES (?,?,?,?,?,?,?)",

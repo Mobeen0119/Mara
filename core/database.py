@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
   checkin_time TEXT DEFAULT '08:00',
   last_checkin_at TEXT,
   last_checkin_result TEXT,
+  blocked_windows TEXT DEFAULT '[]',
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -167,6 +168,12 @@ def get_connection():
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        # Serialize concurrent writers/readers (plan bg threads, scheduler, HTTP
+        # workers all open their own thread-local connection). Without a busy
+        # timeout, a writer can get "database is locked" and readers can see
+        # transient stale/empty rows. 8s is plenty for local writes.
+        conn.execute("PRAGMA busy_timeout=8000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         _thread_local.conn = conn
         with _SCHEMA_LOCK:
             conn.executescript(SCHEMA)
@@ -180,6 +187,7 @@ MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN last_checkin_at TEXT",
     "ALTER TABLE users ADD COLUMN last_checkin_result TEXT",
     "ALTER TABLE users ADD COLUMN onboarding_done INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN blocked_windows TEXT DEFAULT '[]'",
     "ALTER TABLE goals ADD COLUMN details TEXT DEFAULT '{}'",
 ]
 

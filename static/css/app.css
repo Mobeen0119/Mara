@@ -254,6 +254,17 @@ input:focus, textarea:focus, select:focus {
 .chip.bad { color: #ff6b6b; border-color: rgba(193,30,35,0.5); background: rgba(193,30,35,0.14); }
 .chip.off { color: var(--bone-mute); }
 
+.cons-chip {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--ink-3); border: 1px solid var(--line); border-radius: 4px;
+  padding: 8px 12px; font-size: 13px; color: var(--bone);
+}
+.cons-chip .x-btn {
+  background: none; border: none; color: var(--bone-dim); font-size: 16px; line-height: 1;
+  cursor: pointer; padding: 2px 4px; border-radius: 3px;
+}
+.cons-chip .x-btn:hover { color: #ff6b6b; background: rgba(255,107,107,0.12); }
+
 /* ============================================================
    GOALS
    ============================================================ */
@@ -391,18 +402,41 @@ input:focus, textarea:focus, select:focus {
   font-weight: 800; color: var(--amber); border: 1px solid rgba(255,140,66,0.35); border-radius: 3px; padding: 1px 6px; width: fit-content;
 }
 
-/* animated typing indicator while Eloise "thinks" */
-.chat-msg.typing { display: inline-flex; align-items: center; gap: 5px; padding: 14px 16px; }
-.chat-msg.typing .dot {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--rose); opacity: 0.4;
-  animation: typingBounce 0.9s ease-in-out infinite;
+/* animated typing indicator while Eloise "thinks" — equalizer bars + rotating status
+   so the wait reads as motion and believable progress, not stalled dots */
+.chat-msg.typing { display: inline-flex; align-items: center; gap: 10px; padding: 14px 16px; }
+.chat-msg.typing .typing-bars { display: inline-flex; align-items: flex-end; gap: 3px; height: 16px; }
+.chat-msg.typing .bar {
+  width: 4px; height: 30%; border-radius: 2px; background: var(--rose); opacity: 0.75;
+  animation: eq 1.05s ease-in-out infinite;
 }
-.chat-msg.typing .dot:nth-child(2) { animation-delay: 0.15s; }
-.chat-msg.typing .dot:nth-child(3) { animation-delay: 0.3s; }
-@keyframes typingBounce {
-  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
-  30% { transform: translateY(-4px); opacity: 1; }
+.chat-msg.typing .bar:nth-child(2) { animation-delay: 0.18s; }
+.chat-msg.typing .bar:nth-child(3) { animation-delay: 0.36s; }
+.chat-msg.typing .bar:nth-child(4) { animation-delay: 0.54s; }
+.chat-msg.typing .typing-status {
+  font-size: 13px; color: var(--rose); font-style: italic; opacity: 0.85;
+  animation: statusBlink 2.6s ease-in-out infinite;
 }
+@keyframes eq {
+  0%, 100% { height: 30%; opacity: 0.4; }
+  50% { height: 100%; opacity: 0.9; }
+}
+@keyframes statusBlink {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 0.4; }
+}
+
+/* persistent "schedule is generating — keep working" note */
+.plan-generating {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--ink-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 16px 18px; margin: 4px 0 22px; border-left: 3px solid var(--rose);
+}
+.plan-generating .typing-bars { display: inline-flex; align-items: flex-end; gap: 3px; height: 26px; }
+.plan-generating .bar { width: 5px; height: 30%; border-radius: 2px; background: var(--rose); animation: eq 1.05s ease-in-out infinite; }
+.plan-generating .bar:nth-child(2) { animation-delay: 0.18s; }
+.plan-generating .bar:nth-child(3) { animation-delay: 0.36s; }
+.plan-generating .bar:nth-child(4) { animation-delay: 0.54s; }
 
 /* inline goal chat box */
 .goal-chat {

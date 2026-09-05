@@ -1,3 +1,5 @@
+import json
+import os
 import subprocess
 import time
 
@@ -59,12 +61,35 @@ class OllamaProvider(LLMProvider):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.connect_timeout = connect_timeout
+        try:
+            self.keep_alive = int(os.environ.get("OLLAMA_KEEP_ALIVE", "1800"))
+        except ValueError:
+            self.keep_alive = 1800
 
     def _candidates(self):
+        from urllib.parse import urlparse
         base = self.base_url.rstrip("/")
-        hosts = [
-            base,
-        ] + [f"http://{ip}:11434" for ip in _wsl_host_ip()]
+        port = 11434
+        try:
+            p = urlparse(base)
+            if p.port:
+                port = p.port
+        except Exception:
+            pass
+        alt_port = 11434 if port != 11434 else 11435
+        wsl_ips = _wsl_host_ip()
+        # Order matters: localhost variants first (fail fast, and the common case),
+        # host-IP variants last (they can hang for seconds when unroutable).
+        hosts = [base]
+        if base != f"http://localhost:{port}":
+            hosts.append(f"http://localhost:{port}")
+        if base != f"http://localhost:{alt_port}":
+            hosts.append(f"http://localhost:{alt_port}")
+        hosts += [f"http://{ip}:{port}" for ip in wsl_ips]
+        # If the configured port is wrong (e.g. .env says 11435 but Ollama listens on
+        # the default 11434), probing only the configured port makes everything 503.
+        # Also try the other common Ollama port on the WSL host IPs.
+        hosts += [f"http://{ip}:{alt_port}" for ip in wsl_ips]
         out = []
         for h in hosts:
             if h not in out:
@@ -134,8 +159,13 @@ class OllamaProvider(LLMProvider):
             detail=last_err or "no Ollama endpoint reachable", model=self.model,
         )
 
-    def generate(self, system_prompt, user_prompt, timeout=30) -> GenerationResult:
-        payload = {"model": self.model, "system": system_prompt, "prompt": user_prompt, "stream": False}
+    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None) -> GenerationResult:
+        payload = {
+            "model": self.model, "system": system_prompt, "prompt": user_prompt,
+            "stream": False, "keep_alive": self.keep_alive,
+        }
+        if max_tokens:
+            payload["options"] = {"num_predict": int(max_tokens)}
         last_err = None
         # Ollama can take 30-60s to load a large model from disk on first call.
         # Use the full timeout per candidate instead of capping at 8s.
@@ -145,7 +175,7 @@ class OllamaProvider(LLMProvider):
             try:
                 resp = requests.post(
                     f"{url}/api/generate", json=payload,
-                    timeout=(min(self.connect_timeout, 3), per_try),
+                    timeout=(min(self.connect_timeout, 1.5), per_try),
                 )
             except requests.exceptions.ConnectionError:
                 last_err = f"connection refused — is `ollama serve` running at {url}?"
@@ -180,3 +210,60 @@ class OllamaProvider(LLMProvider):
                 ok=True, provider=self.name, model=self.model, text=text.strip(), latency_ms=latency_ms,
             )
         return GenerationResult(ok=False, provider=self.name, model=self.model, error=last_err or "no endpoint")
+
+    def generate_stream(self, system_prompt, user_prompt, timeout=30, max_tokens=None):
+        """Yield text chunks as the model generates (NDJSON streaming). Yields an empty
+        string when done so callers know generation finished cleanly."""
+        payload = {
+            "model": self.model, "system": system_prompt, "prompt": user_prompt,
+            "stream": True, "keep_alive": self.keep_alive,
+        }
+        if max_tokens:
+            payload["options"] = {"num_predict": int(max_tokens)}
+        last_err = None
+        per_try = max(int(timeout), 60)
+        for url in self._candidates():
+            try:
+                resp = requests.post(
+                    f"{url}/api/generate", json=payload, stream=True,
+                    timeout=(min(self.connect_timeout, 1.5), per_try),
+                )
+            except requests.exceptions.ConnectionError:
+                last_err = f"connection refused — is `ollama serve` running at {url}?"
+                continue
+            except requests.exceptions.Timeout:
+                last_err = f"timed out after {per_try}s at {url} — model may still be loading"
+                continue
+            except Exception as exc:
+                last_err = str(exc)
+                continue
+
+            if resp.status_code == 404:
+                raise RuntimeError(f"model '{self.model}' not found — run: ollama pull {self.model}")
+            if not resp.ok:
+                last_err = f"Ollama returned HTTP {resp.status_code}: {resp.text[:200]}"
+                continue
+            try:
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if data.get("error"):
+                        raise RuntimeError(data["error"])
+                    chunk = (data.get("response") or "")
+                    if chunk:
+                        yield chunk
+                    if data.get("done"):
+                        yield ""
+                        return
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                last_err = str(exc)
+                continue
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        raise RuntimeError(last_err or "no endpoint reachable")

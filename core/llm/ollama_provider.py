@@ -7,7 +7,7 @@ import requests
 
 from core.llm.base import GenerationResult, LLMProvider, ProviderState, ProviderStatus
 
-DEFAULT_MODEL = "huihui_ai/dolphin3-abliterated:latest"
+DEFAULT_MODEL = "huihui_ai/qwen3-abliterated:4b"
 
 
 def _wsl_host_ip():
@@ -65,6 +65,12 @@ class OllamaProvider(LLMProvider):
             self.keep_alive = int(os.environ.get("OLLAMA_KEEP_ALIVE", "1800"))
         except ValueError:
             self.keep_alive = 1800
+        # Qwen3-class thinking models waste their entire output budget on a long
+        # reasoning trace before saying anything — on CPU that's most of the latency
+        # and it can eat the whole num_predict cap, leaving an empty reply. Disable
+        # it by default (top-level `think`, the only place Ollama honors it);
+        # set OLLAMA_THINKING=1 to turn reasoning back on for the local model.
+        self.think = os.environ.get("OLLAMA_THINKING", "0") == "1"
 
     def _candidates(self):
         from urllib.parse import urlparse
@@ -161,13 +167,23 @@ class OllamaProvider(LLMProvider):
             detail=last_err or "no Ollama endpoint reachable", model=self.model,
         )
 
-    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None) -> GenerationResult:
-        payload = {
-            "model": self.model, "system": system_prompt, "prompt": user_prompt,
-            "stream": False, "keep_alive": self.keep_alive,
-        }
+    def _options(self, max_tokens):
+        # Qwen3-class models default to a huge ~32K context window. On a single CPU
+        # that 32K of KV-cache overhead makes even a 2-line chat reply crawl. Pin the
+        # context to something the actual prompts fit in: short capped chat calls get
+        # 2048, big uncapped schedule draws get 8192.
+        options = {"num_ctx": 2048 if max_tokens else 8192}
         if max_tokens:
-            payload["options"] = {"num_predict": int(max_tokens)}
+            options["num_predict"] = int(max_tokens)
+        return options
+
+    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None,
+                 model_override=None) -> GenerationResult:
+        payload = {
+            "model": model_override or self.model, "system": system_prompt, "prompt": user_prompt,
+            "stream": False, "keep_alive": self.keep_alive,
+            "think": self.think, "options": self._options(max_tokens),
+        }
         last_err = None
         # Ollama can take 30-60s to load a large model from disk on first call.
         # Use the full timeout per candidate instead of capping at 8s.
@@ -213,15 +229,15 @@ class OllamaProvider(LLMProvider):
             )
         return GenerationResult(ok=False, provider=self.name, model=self.model, error=last_err or "no endpoint")
 
-    def generate_stream(self, system_prompt, user_prompt, timeout=30, max_tokens=None):
+    def generate_stream(self, system_prompt, user_prompt, timeout=30, max_tokens=None,
+                        model_override=None):
         """Yield text chunks as the model generates (NDJSON streaming). Yields an empty
         string when done so callers know generation finished cleanly."""
         payload = {
-            "model": self.model, "system": system_prompt, "prompt": user_prompt,
+            "model": model_override or self.model, "system": system_prompt, "prompt": user_prompt,
             "stream": True, "keep_alive": self.keep_alive,
+            "think": self.think, "options": self._options(max_tokens),
         }
-        if max_tokens:
-            payload["options"] = {"num_predict": int(max_tokens)}
         last_err = None
         per_try = max(int(timeout), 60)
         for url in self._candidates():

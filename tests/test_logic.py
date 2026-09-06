@@ -280,10 +280,11 @@ def test_plan_prompt_covers_every_day():
     assert "chat notes say is already done" in p.replace("\n", " ")
 
 
-def test_startup_plan_is_ship_day1_sprint_and_chat_links_feed_the_plan():
-    # The user's "startup" goal must get a lean-sprint guidance (landing page live day 1,
-    # launch within first 3 days, no textbook padding), and any URL the user shared in
-    # chat notes must be handed to the plan so it references the user's real resources.
+def test_startup_plan_gets_universal_deadline_pacing_and_chat_links_feed_the_plan():
+    # Right-sizing is UNIVERSAL, not startup-specific: ANY goal's schedule follows the
+    # deadline — a far-off goal is a sustainable one-real-action-a-day plan (no padding),
+    # a pressing one is a grind with many sessions/day — and any URL the user shared in
+    # chat notes is handed to the plan so it references the user's real resources.
     import sqlite3
     from core import generation
     conn = sqlite3.connect(":memory:")
@@ -317,18 +318,28 @@ def test_startup_plan_is_ship_day1_sprint_and_chat_links_feed_the_plan():
 
     generation.get_manager = fake_gen
     try:
-        goal = {"id": 7, "user_id": 1, "deadline": "2027-06-01",
-                "title": "i have to start my startup complete",
-                "display_title": "i have to start my startup complete",
+        far = {"id": 7, "user_id": 1, "deadline": "2026-11-30",
+               "title": "learn guitar", "display_title": "learn guitar",
+               "reminder_time": "09:00", "constraints": "[]", "details": "{}"}
+        generation._llm_plan_call(far, conn, timeout=10)
+        far_p = calls.get("prompt", "")
+        urgi = {"id": 7, "user_id": 1, "deadline": "2026-09-07",
+                "title": "paper due tomorrow", "display_title": "paper due tomorrow",
                 "reminder_time": "09:00", "constraints": "[]", "details": "{}"}
-        generation._llm_plan_call(goal, conn, timeout=10)
+        generation._llm_plan_call(urgi, conn, timeout=10)
+        near_p = calls.get("prompt", "")
     finally:
         generation.get_manager = orig
-    p = calls.get("prompt", "")
-    assert "lean startup sprint" in p
-    assert "landing page" in p and "FIRST LAUNCH happens within the first 3 days" in p
-    assert "business model canvas" in p  # explicitly forbidden as padding
-    assert "https://yoursite.app/idea" in p and "https://tools.dev/board" in p
+    # the SAME deadline-driven rule applies to any goal kind — no startup template
+    assert "RIGHT-SIZE THIS TO THE DEADLINE" in far_p
+    assert "sustainable" in far_p and "do NOT pad" in far_p
+    assert "GRIND" in near_p
+    assert "8+ sessions" in near_p
+    assert "lean startup sprint" not in far_p + near_p
+    assert "landing page" not in far_p + near_p  # not a startup special-case
+    # chat links reach the plan for either goal
+    assert "https://yoursite.app/idea" in far_p and "https://tools.dev/board" in far_p
+    assert "https://yoursite.app/idea" in near_p
     conn.close()
 
 
@@ -492,9 +503,11 @@ def test_hookup_arc_plan():
         assert "consent" not in e["title"] and "protection" not in e["title"], e["title"]
 
 
-def test_urgent_goals_concentrate_effort():
-    # A goal due in a day is a full-day grind (2-3 sessions that day), a month-long
-    # goal is spread thin. A real person does NOT give a paper-tomorrow 1 block.
+def test_day_density_follows_deadline_and_free_time():
+    # NOT a fixed 2-3 per day. The count follows the deadline and how much of that day
+    # is actually free: a goal due in a day on a fully free day packs it (MORE than 8
+    # blocks when the time is there), a month-long goal is light, an easy distant goal
+    # is as little as one real block a day.
     urgent = {
         "deadline": "2026-09-06",
         "title": "paper due tomorrow",
@@ -504,7 +517,14 @@ def test_urgent_goals_concentrate_effort():
     }
     u = generation._build_fallback_plan(urgent, today="2026-09-05")
     today_paper = [e for e in u if e["date"] == "2026-09-05"]
-    assert len(today_paper) == 3, [e["title"] for e in today_paper]  # go full
+    assert len(today_paper) >= 9, [e["title"] for e in today_paper]  # free day, grinding
+    # distinct non-overlapping blocks even when a day is packed
+    blocks = sorted((int(e["start_time"][:2]) * 60 + int(e["start_time"][3:5]),
+                     int(e["end_time"][:2]) * 60 + int(e["end_time"][3:5])) for e in today_paper)
+    for i in range(1, len(blocks)):
+        assert blocks[i][0] >= blocks[i - 1][1], (i, blocks)
+    assert len(set(e["title"] for e in today_paper)) == len(today_paper)
+    assert len(blocks) == len(today_paper)
 
     relaxed = {
         "deadline": "2026-09-20",
@@ -515,7 +535,21 @@ def test_urgent_goals_concentrate_effort():
     }
     r = generation._build_fallback_plan(relaxed, today="2026-09-05")
     from collections import Counter
-    assert max(Counter(e["date"] for e in r).values()) <= 2  # light, spread out
+    assert max(Counter(e["date"] for e in r).values()) <= 2  # steady, not crammed
+
+    long_goal = {
+        "deadline": "2026-10-15",
+        "title": "start a business",
+        "display_title": "start a business",
+        "reminder_time": "09:00",
+        "constraints": "[]",
+    }
+    l = generation._build_fallback_plan(long_goal, today="2026-09-05")
+    per_day = Counter(e["date"] for e in l)
+    assert max(per_day.values()) == 1  # month+ goal: one real action a day, every day
+    from datetime import date, timedelta
+    expected = [(date(2026, 9, 5) + timedelta(days=i)).isoformat() for i in range(40)]
+    assert sorted(per_day) == expected  # no gaps, no contraction
 
 
 def test_goal_chat_prompt_picks_when_asked():
@@ -718,6 +752,36 @@ def test_probe_fast_default_timeout_is_8s():
     assert params["timeout"].default == 8.0
 
 
+def test_ollama_options_pin_context_for_cpu_speed():
+    # Qwen3-class models default to a huge ~32K context; on CPU that KV overhead makes
+    # even a 2-line reply crawl. Short capped chat calls must pin num_ctx=2048, big
+    # schedule draws 8192, and num_predict is only set when actually capping output.
+    from core.llm.ollama_provider import OllamaProvider
+    p = OllamaProvider("http://localhost:9", "x")
+    chat = p._options(180)
+    assert chat["num_ctx"] == 2048 and chat["num_predict"] == 180
+    draw = p._options(None)
+    assert draw["num_ctx"] == 8192 and "num_predict" not in draw
+
+
+def test_ollama_thinking_disabled_by_default():
+    # Qwen3 thinking mode burns the whole output budget on a hidden reasoning trace
+    # (latency + sometimes an empty final reply). It must be OFF for the local model
+    # unless OLLAMA_THINKING=1 is set.
+    import os
+    from core.llm.ollama_provider import OllamaProvider
+    old = os.environ.pop("OLLAMA_THINKING", None)
+    try:
+        assert OllamaProvider("http://localhost:9", "x").think is False
+        os.environ["OLLAMA_THINKING"] = "1"
+        assert OllamaProvider("http://localhost:9", "x").think is True
+    finally:
+        if old is not None:
+            os.environ["OLLAMA_THINKING"] = old
+        else:
+            os.environ.pop("OLLAMA_THINKING", None)
+
+
 def test_plan_prefers_cloud_and_chat_prefers_local():
     # Explicit Redraw uses OpenRouter-first (prefer_cloud=True) so a schedule draw runs
     # in parallel with chat. Auto/retry paths and chat default to local-first
@@ -771,3 +835,334 @@ def test_plan_prefers_cloud_and_chat_prefers_local():
     # explicit Redraw must be the only call that forces OpenRouter first
     assert geom["plan_calls"] == [True, False]
     assert geom["chat"] is False            # chat -> local first
+
+
+def test_goal_prompt_answers_personal_questions_without_plan():
+    # The user asked Eloise for guidance, got her task list recited back at them, and
+    # the exact same line twice. A personal/emotional question must be answered directly
+    # and must NOT drag the schedule into it — and copying an earlier Eloise reply is
+    # forbidden outright.
+    p = generation._goal_chat_prompt(
+        "study", "=== THE PLAN (your scheduled tasks) ===\n- 2026-09-06 09:00: Security+ videos\n\n",
+        "user: tell me complete study materials\neloise: Messer's Security+ playlist, 30 minutes a day. Start there.\n",
+        "mobeen", "i m feeling distressed should we masturbate for relaxation and study with fresh mind",
+    )
+    assert "should I/we" in p
+    assert "do NOT bring up THE PLAN" in p
+    assert "identical" in p
+
+
+def test_write_plan_refuses_empty():
+    # An empty LLM result was written as "0 tasks across 0 days · via openrouter",
+    # badging the goal 'active' with a blank schedule. That must never happen: an empty
+    # write returns None and leaves the goal untouched so the retry path can fix it.
+    import os
+    import tempfile
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+    import core.routes.goal_routes as gr
+
+    tmp = tempfile.mkdtemp(prefix="eloise_empty_plan_")
+    os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    orig_conn = gr.get_connection
+    gr.get_connection = real_get
+    try:
+        conn = real_get()
+        conn.execute("INSERT INTO users (name, email, password_hash, is_guest) VALUES ('tester','t@empty.io','x',1)")
+        conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, plan_status, plan_summary) "
+            "VALUES (1,'g','2026-09-12','09:00','[]','g','generating','')"
+        )
+        gid = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.commit()
+        goal = dict(conn.execute("SELECT * FROM goals WHERE id=?", (gid,)).fetchone())
+        rv = gr._write_plan(conn, goal, [], provider="openrouter")
+        assert rv is None
+        st = dict(conn.execute("SELECT plan_status, plan_summary FROM goals WHERE id=?", (gid,)).fetchone())
+        assert st["plan_status"] == "generating", st
+        assert st["plan_summary"] == "", st
+        assert conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (gid,)).fetchone()["c"] == 0
+    finally:
+        gr.get_connection = orig_conn
+        _thread_local.conn = None
+        del os.environ["ELOISE_STORAGE_DIR"]
+
+
+def test_heal_stale_plans_recovers_generating():
+    # A redraw that died mid-draw (process kill, or the daemon thread dying in its 0.5s
+    # lead-in sleep) leaves the goal flagged 'generating' forever with zero tasks — that
+    # is exactly the "schedule not generating" the user reported. Startup heal must reset
+    # the flag AND re-draw ANY goal that ended up 'active' but silently empty (the old
+    # empty-write bug), while leaving goals that actually have tasks alone.
+    import os
+    import tempfile
+    import time as _time
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+    import core.routes.goal_routes as gr
+
+    tmp = tempfile.mkdtemp(prefix="eloise_heal_")
+    os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    orig_conn = gr.get_connection
+    gr.get_connection = real_get
+    calls = []
+    orig_bg = gr._regenerate_plan_bg
+    gr._regenerate_plan_bg = lambda user, gid, prefer_cloud=False: calls.append((user["id"], gid, prefer_cloud, gr._goal_or_404(user, gid)["plan_status"]))
+    try:
+        conn = real_get()
+        conn.execute("INSERT INTO users (name, email, password_hash, is_guest) VALUES ('tester','t@heal.io','x',1)")
+        # (status, has_actions, future_deadline)
+        cases = [
+            ("generating", False, "2026-09-12"),   # stuck mid-draw, empty  -> regenerate
+            ("generating", True,  "2026-09-12"),   # stuck mid-draw, has plan -> reset only
+            ("active",     False, "2026-09-12"),   # silent empty write       -> regenerate
+            ("active",     True,  "2026-09-12"),   # fine                     -> untouched
+            ("active",     False, "2026-01-01"),   # stale expired goal       -> untouched
+        ]
+        for i, (status, n_acts, deadline) in enumerate(cases):
+            conn.execute(
+                "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, plan_status, plan_summary) "
+                "VALUES (1,?, ?, '09:00','[]', ?, ?, '')",
+                (f"g{i}", deadline, f"g{i}", status),
+            )
+            gid = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+            if n_acts:
+                conn.execute(
+                    "INSERT INTO actions (goal_id,user_id,date,start_time,end_time,title,status) "
+                    "VALUES (?,?,?,?,?,?,?)", (gid, 1, "2026-09-06", "09:00", "10:00", "has a plan", "pending"),
+                )
+        conn.commit()
+        gr.heal_stale_plans()
+        deadline_ts = _time.monotonic() + 3
+        while _time.monotonic() < deadline_ts and len(calls) < 2:
+            _time.sleep(0.1)
+        statuses = [r["plan_status"] for r in conn.execute("SELECT plan_status FROM goals ORDER BY id").fetchall()]
+        assert statuses == ["active", "active", "active", "active", "active"], statuses
+        regen = sorted(c[1] for c in calls)
+        ids = [r["id"] for r in conn.execute("SELECT id FROM goals ORDER BY id").fetchall()]
+        assert regen == [ids[0], ids[2]], (regen, ids)  # only the two empty ones
+        assert all(c[2] is False for c in calls), calls    # local-first
+    finally:
+        gr._regenerate_plan_bg = orig_bg
+        gr.get_connection = orig_conn
+        _thread_local.conn = None
+        del os.environ["ELOISE_STORAGE_DIR"]
+
+
+def test_guardrail_does_not_poison_on_eloises_own_words():
+    # The general-chat guardrail false-positived on a benign "tell me what to prioritize".
+    # Cause: the scanned context included Eloise's OWN messages — her guardrail text
+    # ("minor") plus a plan line quoting the goal "'i have to fuck someone'" ("fuck").
+    # Eloise's prose is not user intent and must never trip the guardrail.
+    import core.generation as g
+    refusal = g.GUARDRAIL_REFUSAL
+    hist = (
+        "user: i have plenty of task what should priortized and what should left\n"
+        f"eloise: {refusal}\n"
+        "eloise: today's focus is on the 'i have to fuck someone' project and the C++ project\n"
+        "user: tell me what to priortize"
+    )
+    assert g._is_truly_harmful("tell me what to priortize", context=hist) is False
+    # a genuine follow-up on abuse must STILL refuse (thread-aware via user lines only)
+    assert g._is_truly_harmful("today then", context="user: i want to fuck my sister") is True
+
+
+def test_chat_falls_back_when_local_busy_past_lock_wait():
+    # A background plan draw holds the single Ollama lock for a minute+. An interactive
+    # chat must NOT wait behind it forever: past its lock_wait cap it skips the busy
+    # local model and streams from OpenRouter so the user actually gets an answer.
+    import core.llm.manager as mm
+    from core.llm.base import GenerationResult
+    from core.llm.manager import OLLAMA_LOCK
+    calls = []
+
+    class FakeOllama:
+        name = "ollama"
+        api_key = ""
+        model = "big"
+        def generate_stream(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            calls.append(("ollama-stream", model_override))
+            yield "local"; yield ""
+
+    class FakeOpenRouter:
+        name = "openrouter"
+        api_key = "sk-x"
+        model = "cloud"
+        def generate_stream(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            calls.append(("openrouter-stream", model_override))
+            yield "fast"; yield ""
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama(), FakeOpenRouter()]
+    m = mm.LLMManager(db=None)
+    OLLAMA_LOCK.acquire()
+    try:
+        out = list(m.stream_generate("s", "u", timeout=5,
+                                     model_override="huihui_ai/qwen3-abliterated:1.7b",
+                                     lock_wait=0.15))
+    finally:
+        OLLAMA_LOCK.release()
+        mm.build_providers = orig_build
+    assert "ollama-stream" not in calls, calls          # local WAS busy, never used
+    assert calls[0][0] == "openrouter-stream", calls    # fell back to cloud
+    assert calls[0][1] == "huihui_ai/qwen3-abliterated:1.7b", calls
+    assert "".join(c for c, _ in out) == "fast"
+
+
+def test_chat_model_override_reaches_local_provider():
+    # OLLAMA_CHAT_MODEL lets chat run on a small fast model while plans keep the bigger
+    # one. The override must reach the local provider's /api/generate payload.
+    import core.llm.manager as mm
+    from core.llm.base import GenerationResult
+    calls = []
+
+    class FakeOllama:
+        name = "ollama"
+        api_key = ""
+        model = "big"
+        def generate(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            calls.append((sys, up, model_override))
+            return GenerationResult(ok=True, provider="ollama", model="big", text="ok")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama()]
+    m = mm.LLMManager(db=None)
+    try:
+        r = m.generate("s", "u", timeout=5, model_override="huihui_ai/qwen3-abliterated:1.7b")
+    finally:
+        mm.build_providers = orig_build
+    assert r.ok and r.text == "ok"
+    assert len(calls) == 1 and calls[0][2] == "huihui_ai/qwen3-abliterated:1.7b", calls
+
+
+def test_plan_draws_keep_the_big_model_without_override():
+    # Plans ('_llm_plan_call') must NOT pass a chat model override — they stay on the
+    # configured plan model even when a fast chat model is set.
+    import core.llm.manager as mm
+    from core.llm.base import GenerationResult
+    calls = []
+
+    class FakeOllama:
+        name = "ollama"
+        api_key = ""
+        model = "big"
+        def generate(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            calls.append(model_override)
+            return GenerationResult(ok=True, provider="ollama", model="big", text="[]")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama()]
+    m = mm.LLMManager(db=None)
+    try:
+        goal = {"deadline": "2099-01-01", "title": "g", "display_title": "g",
+                "reminder_time": "09:00", "constraints": "[]", "details": "{}", "user_id": 1,
+                "id": 1}
+        orig_mgr = generation.get_manager
+        generation.get_manager = lambda db=None: m
+        try:
+            generation._llm_plan_call(goal, None, timeout=10)
+        finally:
+            generation.get_manager = orig_mgr
+    finally:
+        mm.build_providers = orig_build
+    assert calls == [None], calls
+
+
+def test_plan_draw_is_bounded_and_matches_slots():
+    # A slow CPU model can time out mid-draw and leave the board empty. The plan call
+    # must cap its own output (so it FINISHES) and the parsed titles must match every
+    # trigger slot, never producing fewer blocks than the deterministic skeleton.
+    import core.llm.manager as mm
+    from core.llm.base import GenerationResult
+    from datetime import date as _date, timedelta as _delta
+    seen = {}
+
+    class FakeOllama:
+        name = "ollama"
+        api_key = ""
+        model = "big"
+        def generate(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            seen["max_tokens"] = max_tokens
+            import re as _re
+            m = _re.findall(r'"date": "([^"]+)", "start_time": "([^"]+)"', up)
+            items = []
+            for d, st in m:
+                items.append(f'{{"date":"{d}","start_time":"{st}","end_time":"10:30","title":"Study {d} {st}"}}')
+            return GenerationResult(ok=True, provider="ollama", model="big",
+                                    text="[\n" + ",\n".join(items) + "\n]")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama()]
+    m = mm.LLMManager(db=None)
+    orig_mgr = generation.get_manager
+    generation.get_manager = lambda db=None: m
+    try:
+        dl = (_date.today() + _delta(days=15)).isoformat()
+        goal = {"deadline": dl, "title": "cybersecurity exam",
+                "display_title": "cybersecurity exam", "reminder_time": "09:00",
+                "constraints": "[]", "details": "{}", "user_id": 1, "id": 1}
+        out = generation._llm_plan_call(goal, None, timeout=10)
+    finally:
+        generation.get_manager = orig_mgr
+        mm.build_providers = orig_build
+    assert seen["max_tokens"] == generation._MAX_PLAN_TOKENS, seen  # bounded output
+    assert out, "plan must not be empty"
+    skeleton = generation._build_fallback_plan(goal)
+    assert len(out) == len(skeleton), (len(out), len(skeleton))
+    assert all("Study" in e["title"] for e in out)  # titles parsed through
+
+
+def test_regenerate_writes_guaranteed_schedule_when_model_down():
+    # On a CPU box the plan model can time out on EVERY draw. The background regenerate
+    # must then write the deterministic, right-sized schedule IMMEDIATELY (never leaving
+    # the board empty) and schedule a retry that can later refine the titles.
+    import os
+    import tempfile
+    import time as _time
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+    import core.routes.goal_routes as gr
+    from core import generation as g
+
+    tmp = tempfile.mkdtemp(prefix="eloise_guaranteed_")
+    os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    orig_conn = gr.get_connection
+    gr.get_connection = real_get
+    orig_gen = g.generate_plan_or_none
+    orig_blocked = g.user_blocked_windows
+    orig_sched = gr._schedule_plan_retry
+    gr._schedule_plan_retry = lambda user, gid, delay=None: None  # don't spawn threads
+    g.user_blocked_windows = lambda user: []
+    g.generate_plan_or_none = lambda *a, **k: None   # model always fails
+    try:
+        conn = real_get()
+        conn.execute("INSERT INTO users (name, email, password_hash, is_guest) VALUES ('tester','t@guar.io','x',1)")
+        conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, plan_status) "
+            "VALUES (1,'cybersecurity exam','2026-09-12','09:00','[]','cybersecurity exam','generating')"
+        )
+        gid = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.commit()
+        goal = dict(conn.execute("SELECT * FROM goals WHERE id=?", (gid,)).fetchone())
+        user = {"id": 1, "name": "tester"}
+        gr._regenerate_plan_bg(user, gid)
+        deadline_ts = _time.monotonic() + 5
+        n = 0
+        while _time.monotonic() < deadline_ts:
+            n = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (gid,)).fetchone()["c"]
+            if n > 0:
+                break
+            _time.sleep(0.1)
+        assert n > 0, "guaranteed schedule must be written even with the model down"
+        st = dict(conn.execute("SELECT plan_status, plan_summary FROM goals WHERE id=?", (gid,)).fetchone())
+        assert st["plan_status"] == "active", st
+    finally:
+        g.generate_plan_or_none = orig_gen
+        g.user_blocked_windows = orig_blocked
+        gr._schedule_plan_retry = orig_sched
+        gr.get_connection = orig_conn
+        _thread_local.conn = None
+        del os.environ["ELOISE_STORAGE_DIR"]

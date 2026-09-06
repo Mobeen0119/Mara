@@ -23,7 +23,8 @@ class OpenRouterProvider(LLMProvider):
             detail="configured", model=self.model,
         )
 
-    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None) -> GenerationResult:
+    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None,
+                 model_override=None) -> GenerationResult:
         started = time.monotonic()
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -67,7 +68,8 @@ class OpenRouterProvider(LLMProvider):
         return GenerationResult(ok=True, provider=self.name, model=self.model,
                                 text=text.strip(), latency_ms=latency_ms)
 
-    def generate_stream(self, system_prompt, user_prompt, timeout=30, max_tokens=None):
+    def generate_stream(self, system_prompt, user_prompt, timeout=30, max_tokens=None,
+                        model_override=None):
         """Yield text chunks as they arrive (SSE streaming). None when done."""
         if not self.api_key:
             raise RuntimeError("no API key configured")

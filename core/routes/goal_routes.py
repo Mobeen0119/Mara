@@ -138,10 +138,27 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
                     "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
                     ("kept previous schedule (model unavailable, retrying)", goal_id),
                 )
+                conn.commit()
             else:
-                logger.warning("plan bg: goal %s LLM down, no plan yet", goal_id)
-                conn.execute("UPDATE goals SET plan_status='active' WHERE id=?", (goal_id,))
-            conn.commit()
+                # GUARANTEE: never leave the board empty. The deterministic fallback is a
+                # real, right-sized schedule (every day covered, blocked windows honored,
+                # concrete per-slot tasks) — the LLM only ever REFINED its titles, it never
+                # invented the dates/times. On a slow CPU the model can time out on the
+                # draw, so write the fallback NOW and refine titles in a background retry.
+                logger.warning("plan bg: goal %s LLM unavailable — writing guaranteed schedule", goal_id)
+                try:
+                    fallback = generation._build_fallback_plan(
+                        goal, today=date.today().isoformat(), extra_blocked=blocked
+                    ) or []
+                except Exception as exc:
+                    logger.warning("plan bg: goal %s fallback build failed: %r", goal_id, exc)
+                    fallback = []
+                if fallback:
+                    _write_plan(conn, goal, fallback, blocked_min=blocked)
+                    logger.warning("plan bg: goal %s wrote guaranteed schedule (%s slots)", goal_id, len(fallback))
+                else:
+                    conn.execute("UPDATE goals SET plan_status='active' WHERE id=?", (goal_id,))
+                    conn.commit()
             _schedule_plan_retry(user, goal_id)
     except Exception as exc:
         logger.warning("plan bg: goal %s failed: %r", goal_id, exc)
@@ -153,6 +170,55 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
             pass
     finally:
         lock.release()
+
+
+def heal_stale_plans():
+    """Startup repair for plans that never materialized:
+    - goals stranded in 'generating' (a redraw thread died mid-draw, e.g. on a process
+      kill — the 0.5s lead-in sleep means it can die before ever writing its status),
+    - goals 'active' but with ZERO tasks (an old empty-write badged them 'active' with a
+      confidently wrong '0 tasks across 0 days' summary and nothing ever re-drew them).
+    Both get reset to 'active' and, if they still have no tasks, a fresh LOCAL-first
+    generation is kicked at boot so the board and chat have something real to work with."""
+    today = date.today().isoformat()
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            """
+            SELECT g.id, g.user_id, g.plan_status
+            FROM goals g
+            WHERE g.plan_status NOT IN ('cancelled', 'succeeded')
+              AND g.deadline >= ?
+              AND (g.plan_status = 'generating'
+                   OR NOT EXISTS (SELECT 1 FROM actions a WHERE a.goal_id = g.id))
+            """,
+            (today,),
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("plan bg: heal scan failed: %r", exc)
+        return
+    for g in rows:
+        gid, uid = g["id"], g["user_id"]
+        try:
+            conn.execute(
+                "UPDATE goals SET plan_status='active' WHERE id=? AND plan_status='generating'",
+                (gid,),
+            )
+            n = conn.execute(
+                "SELECT COUNT(*) c FROM actions WHERE goal_id=?", (gid,)
+            ).fetchone()[0]
+            conn.commit()
+            if n == 0:
+                user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+                if user:
+                    logger.warning(
+                        "plan bg: goal %s has no tasks — regenerating (was %s)", gid, g["plan_status"]
+                    )
+                    threading.Thread(
+                        target=_regenerate_plan_bg, args=(dict(user), gid), daemon=True
+                    ).start()
+        except Exception as exc:
+            logger.warning("plan bg: heal goal %s failed: %r", gid, exc)
 
 
 def _reset_plan_retries(goal_id):
@@ -206,6 +272,11 @@ def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
     """Insert the chosen entries and update plan_status/summary. Keeps up to three
     blocks per date (so a day is actually managed, not a single slot). Then re-slot
     so no two goals own the same time block on a date."""
+    if not entries:
+        # An empty write must NEVER succeed: it would badge the goal "active" with a
+        # confidently wrong "0 tasks across 0 days" summary and leave the schedule
+        # blank. Treat it as a failed draw and let the retry path handle it.
+        return None
     by_date = {}
     for e in entries:
         d = e["date"]

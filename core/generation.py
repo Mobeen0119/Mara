@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 
@@ -22,7 +23,29 @@ _manager = None
 # A chat reply is short by contract (at most 2 lines). Capping the model's output
 # turns that contract into a hard guarantee AND makes replies fast (fewer generated
 # tokens, especially on the CPU-bound local model).
-_MAX_CHAT_TOKENS = 220
+_MAX_CHAT_TOKENS = 120
+
+# Plan draws have their own output ceiling so a slow CPU box FINISHES instead of
+# timing out mid-JSON. If the cap cuts a reply short, the titles fall back to the
+# deterministic schedule's titles — the schedule is never left empty by a slow model.
+_MAX_PLAN_TOKENS = 1536
+
+# Chat can be routed to a FASTER local model (e.g. a 1.7b instead of the 4b used for
+# plans) so conversations feel instant while background plan draws keep the bigger
+# model's quality. Set OLLAMA_CHAT_MODEL=huihui_ai/qwen3-abliterated:1.7b in .env.
+# Empty/None = chat uses the same model as plans.
+def _chat_model_override():
+    try:
+        return os.environ.get("OLLAMA_CHAT_MODEL") or None
+    except Exception:
+        return None
+
+
+def _chat_lock_wait():
+    """How long an interactive chat waits for the shared local model before giving up
+    on it and falling back to OpenRouter. Short: a plan draw hogging the CPU must not
+    freeze the conversation."""
+    return 12
 
 # Which provider drew the most recent plan (set by _llm_plan_call / _chat_llm), so
 # the UI can honestly report "drawn by local / drawn by openrouter".
@@ -53,8 +76,10 @@ def _chat_llm(sys_prompt, user_prompt, db):
     returns ("", "offline") — the caller surfaces that as a genuine error, never as
     fabricated Eloise text. The user explicitly wants no hardcoded replies."""
     global _last_provider
-    result = get_manager(db).generate(sys_prompt, user_prompt, timeout=90,
-                                      max_tokens=_MAX_CHAT_TOKENS)
+    result = get_manager(db).generate(
+        sys_prompt, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
+        model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
+    )
     if not result.ok:
         return "", "offline"
     if _VERDICT_ECHO.search(result.text[:80]):
@@ -100,9 +125,17 @@ def _is_truly_harmful(msg, context=""):
     Legitimate intimate / romantic goals with an adult partner (gf, wife, partner...) are
     NOT blocked — they get a real plan, not a lecture."""
     t = (msg or "").lower()
+    # Only the USER's own words carry intent. Eloise's replies must never be scanned:
+    # her refusal text contains "minor"/"family member", and plan lines quote goal
+    # titles like "i have to fuck someone" — scanning them makes benign follow-ups
+    # ("tell me what to prioritize") look like abuse and re-refuse forever.
+    user_lines = [
+        ln for ln in (context or "").split("\n")
+        if not ln.strip().lower().startswith(("eloise:", "assistant:"))
+    ]
     # Whole thread matters: "sister" or "consent" alone are harmless, but as a follow-up
     # to "i want to fuck my sister" they continue the same abuse goal.
-    full = ((context or "") + "\n" + t).lower()
+    full = ("\n".join(user_lines) + "\n" + t).lower()
     has_partner = any(p in full for p in _PARTNER)
     has_family = any(f in t or f in full for f in _FAMILY_ABUSE)
     has_minor = any(m in t or m in full for m in _MINOR)
@@ -193,14 +226,23 @@ def _goal_chat_prompt(goal_name, plan_section, history, user_name, message):
         f"line why, then end with a copy-paste text they can send.\n"
         f"- If they call you out for not answering or ask the same thing again -> DO NOT repeat or "
         f"restate; actually answer the thing this time, in fresh words, in AT MOST 2 LINES.\n"
+        f"- If their message is personal or emotional — 'I feel', 'should I/we', 'is it ok if…' — and "
+        f"has nothing to do with the schedule, answer THAT directly in 1-2 lines and do NOT bring "
+        f"up THE PLAN, tasks, dates, or times at all.\n"
         f"- Anything else -> answer it directly, keep it short.\n"
+        f"NEVER output text that is identical, or nearly identical, to an earlier Eloise message "
+        f"in CONVERSATION — even if the question looks the same, say it fresh.\n"
         f"GROUNDING: every time you name a step, a task, or a time, it must be QUOTED from THE "
         f"PLAN listed above — never invent tasks, dates, or times that are not literally written "
         f"there. If the user asks about something that is NOT on their schedule, say it plainly "
         f"('that is not on your schedule yet') instead of making it up, and if they ask what to "
         f"do now, name ONE real step quoted from THE PLAN.\n"
         f"If they say they ALREADY did something (talked, discussed, finished it), accept that and "
-        f"move past it — do NOT re-instruct them to repeat it.\n"
+        f"move past it in ONE line — say 'nice' or 'good' and name the NEXT real step from THE "
+        f"PLAN, or ask if they want to redraw the schedule. Do NOT re-instruct them to repeat "
+        f"what they just did, and never recite the same task again.\n"
+        f"If an earlier Eloise message already contains the exact plan line you are about to "
+        f"output, output something NEW instead — do not emit the identical line twice.\n"
         f"Keep it SHORT: at most 2 LINES, but COMPLETE — actually answer the whole question, then "
         f"stop. Never leave it hanging, never end by asking them to re-ask.\n"
         f"do NOT copy your last reply. Do NOT echo this prompt. Only output your reply."
@@ -226,6 +268,7 @@ def stream_global_chat_reply(user_name, goals_summary, history, message, db=None
         return
     for chunk, source in get_manager(db).stream_generate(
         sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
+        model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
     ):
         yield chunk, source
 
@@ -253,6 +296,7 @@ def stream_chat_reply(user_name, goal_name, history, message, db=None, plan_line
         return
     for chunk, source in get_manager(db).stream_generate(
         sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
+        model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
     ):
         yield chunk, source
 
@@ -464,7 +508,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
     today = today or date.today().isoformat()
     deadline = goal["deadline"]
     days = max(days_remaining(deadline, today), 1)
-    reminder = normalize_time(goal.get("reminder_time") or "09:00") or "09:00"
 
     # Load questionnaire details (if any) — these make the schedule specific.
     details = {}
@@ -537,7 +580,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
     # a pressing goal (the hours are there — use them) and as FEW as one for an easy,
     # long-running goal. No arbitrary 3-per-day cap.
     if days <= 2:
-        wanted = 7
+        wanted = 9
     elif days <= 5:
         wanted = 5
     elif days <= 14:
@@ -560,7 +603,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
         return chosen
 
     entries = []
-    total_days = min(days, 15)
+    total_days = min(days, 120)
     # Split the user's own questionnaire answers (syllabus / topic / …) into one
     # concrete topic per day, else the fallback labels a session by the goal's own
     # title. NEVER canned Eloise wording — only the user's text (hard rule).
@@ -575,8 +618,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
     full_title = goal.get("title") or goal["display_title"]
 
     def _day_task(i, slot_idx):
-        if total_days == 1:
-            return str(full_title)
         if split_topics:
             return split_topics[i % len(split_topics)]
         return f"{full_title} — day {i + 1} part {slot_idx + 1}"
@@ -815,25 +856,10 @@ def _plan_guidance(title, details_summary):
             "it special', 'plan the surprise', 'discuss feelings') — those are NOT actions. The "
             "moment itself is named as the real plan from the notes. This is logistics, not a lecture."
         ) + (f" Details: {s}." if s else ".")
-    if kind == "startup":
-        return (
-            "PLAN THIS AS a lean startup sprint the user is ACTUALLY going to execute in the "
-            "remaining days — not a textbook course, not a padding-heavy template. A founder "
-            "ships and sells every day. Strict pacing: "
-            "DAY 1 = create the landing page and put it LIVE (a real URL, real copy, real signup "
-            "form). FIRST LAUNCH happens within the first 3 days of the sprint — the product is "
-            "bootstrapped, imperfect, launched. After launch, EVERY day is one shippable output "
-            "that moves the business: build the core feature, get users, talk to customers, "
-            "collect feedback, iterate, distribute. "
-            "Forbidden as standalone task-slots: 'draft a business model canvas', 'lock pricing "
-            "strategy', 'build a 12-month financial model', 'map compliance requirements line by "
-            "line', 'design the logo', 'plan the roadmap' — those textbook artifacts are NOT how "
-            "you spend this sprint. If regulatory homework is genuinely real for the product, it "
-            "is ONE short task, performed with the user's actual specifics — never a whole day. "
-            "Every title must be a COMPLETE CONCRETE ACTION for that exact slot (verb + the real "
-            "thing), pulled ONLY from the user's own answers and chat notes. "
-            "Do NOT pad days with busywork; do NOT schedule the same topic on separate days."
-        ) + (f" Details: {s}." if s else ".")
+    # Every other goal — startup, exams, fitness, a trip, a project — gets NO kind-specific
+    # text here: the SAME scheduling behavior applies to all of them (real concrete actions,
+    # right-sized to the deadline, as many slots as that day realistically has). That universal
+    # rule lives in _llm_plan_call so it reaches every goal the same way.
     return ""
 
 
@@ -914,6 +940,24 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             "link the real thing the user already shared. Do not invent different resources."
         )
     today = date.today().isoformat()
+    days_left = max(days_remaining(deadline, today), 0)
+    if days_left <= 2:
+        pace = "deadline in the next few days — this is a GRIND: every task must directly finish the goal, and the day has room for many sessions, so pack them."
+    elif days_left <= 7:
+        pace = "under a week left — every task must directly move the goal to DONE in its slot; skip all non-essential prep and polish."
+    elif days_left <= 30:
+        pace = "a few weeks — steady push: highest-impact actions first, a real task per slot, no filler tasks between the real ones."
+    else:
+        pace = "a month or more — sustainable: one real action per day across the whole span; do NOT pad with busywork or planning-templates just to fill the calendar, and do NOT leave gaps."
+    size_line = (
+        f"\nRIGHT-SIZE THIS TO THE DEADLINE: {days_left} days from today — {pace}\n"
+        "This rule applies to EVERY goal, whatever it is. Both of these are failures: "
+        "contracting the schedule to fewer days than remain (every day from today to the "
+        "deadline stays covered), and inflating it with generic filler days (write a plan, "
+        "build a roadmap, draft a strategy, make a financial model, hold a planning session) "
+        "unless the user's own notes literally call for it. Every task stays a real, physical "
+        "action a normal person can do in that slot, that exact day."
+    )
     fallback = _build_fallback_plan(goal, today=today, extra_blocked=extra_blocked) or []
     if not fallback:
         return None
@@ -929,11 +973,15 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         f"{chat_line}"
         f"{links_line}"
         f"{detail_line}"
-        f"{guidance_line}\n"
+        f"{guidance_line}"
+        f"{size_line}\n"
         "Below are the EXACT day/time slots the plan must fill (each slot is one task). "
-        "They already respect the user's constraints and ensure this rule: Cover EVERY day "
-        "from today to the deadline with at least 1 task — a goal spanning N days totals "
-        "roughly 2xN tasks, never fewer than one per day, no more than 3 per day. "
+        "Their count is already correct — it follows the deadline, how much of that day the "
+        "person is actually free, and how heavy the goal is: a fully free day on a pressing "
+        "deadline can hold 8+ sessions (fill all of them — the person has the time), while "
+        "an easy goal with a far deadline gets as few as one. Cover EVERY day "
+        "from today to the deadline — never drop, merge, shift, or cut slots, and never add "
+        "extras. "
         "DO NOT change any slot's date or start_time or end_time. Returns your titles:\n"
         f"{slots_json}\n"
         "Return ONLY a JSON array with ONE object per slot, in the same order: "
@@ -961,7 +1009,9 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
     # (prefer_cloud=True) run on OpenRouter so a schedule draw is fast and parallel with
     # chat. Auto/retry/checkin paths (prefer_cloud=False) stay on the free local model by
     # default and only touch OpenRouter as a fallback when the local box genuinely fails.
-    res = get_manager(db).generate(sys, user_prompt, timeout=timeout, prefer_cloud=prefer_cloud)
+    res = get_manager(db).generate(
+        sys, user_prompt, timeout=timeout, prefer_cloud=prefer_cloud, max_tokens=_MAX_PLAN_TOKENS,
+    )
     if not res.ok:
         return None
     global _last_provider

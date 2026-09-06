@@ -47,6 +47,7 @@ def spa(full_path: str):
 
 @app.on_event("startup")
 def _start():
+    goal_routes.heal_stale_plans()
     eloise_scheduler.start()
 
 

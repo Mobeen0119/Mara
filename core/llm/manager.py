@@ -17,7 +17,10 @@ _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 # Ollama (the local model) is a SINGLE CPU-bound process: it can only run one
 # generation at a time. Every chat request and every plan draw shares this one lock,
 # so a busy box becomes a clean queue instead of a stampede of competing calls that
-# slow each other down and then time out.
+# slow each other down and then time out. Callers wait on the lock with a cap
+# (lock_wait): a plan draw knows its own job is background work and can queue longer,
+# but an interactive CHAT must never stare at a spinner for a minute+ behind a plan —
+# past its wait cap it falls back to OpenRouter and answers now.
 OLLAMA_LOCK = threading.Lock()
 
 
@@ -104,7 +107,7 @@ class LLMManager:
         return [p for p in (l, o) if p is not None]
 
     def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None,
-                 prefer_cloud=False) -> GenerationResult:
+                 prefer_cloud=False, model_override=None, lock_wait=60) -> GenerationResult:
         import logging
         logger = logging.getLogger("eloise.llm")
         ordered = self._ordered(prefer_cloud=prefer_cloud)
@@ -120,11 +123,21 @@ class LLMManager:
             if p.name == "ollama":
                 # The local box runs one generation at a time. Wait HERE (before the
                 # timeout starts counting) so a queued call still gets its FULL timeout
-                # instead of burning its budget sitting behind a busy predecessor.
-                with OLLAMA_LOCK:
-                    result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens)
+                # instead of burning its budget sitting behind a busy predecessor —
+                # but only for up to lock_wait seconds. A long plan draw holding the
+                # lock must not freeze a chat beyond that; then we move on to the
+                # next provider.
+                if not OLLAMA_LOCK.acquire(timeout=lock_wait):
+                    logger.warning("ollama busy >%.0fs (lock); skipping to next provider", lock_wait)
+                    continue
+                try:
+                    result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens,
+                                           model_override)
+                finally:
+                    OLLAMA_LOCK.release()
             else:
-                result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens)
+                result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens,
+                                       model_override)
             logger.info("provider %s: ok=%s error=%s latency=%s", p.name, result.ok, result.error, result.latency_ms)
             if result.ok:
                 return result
@@ -133,17 +146,26 @@ class LLMManager:
             error="no usable provider (start local model or add an API key)",
         )
 
-    def _attempt(self, p, system_prompt, user_prompt, timeout, max_tokens):
-        future = self._executor.submit(p.generate, system_prompt, user_prompt, timeout, max_tokens)
+    def _attempt(self, p, system_prompt, user_prompt, timeout, max_tokens, model_override=None):
+        if model_override is None:
+            future = self._executor.submit(
+                p.generate, system_prompt, user_prompt, timeout, max_tokens
+            )
+        else:
+            future = self._executor.submit(
+                p.generate, system_prompt, user_prompt, timeout, max_tokens, model_override
+            )
         try:
             return future.result(timeout=timeout + 5)
         except Exception as exc:
             return GenerationResult(ok=False, provider=p.name, model=p.model, error=str(exc))
 
     def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=90,
-                               max_tokens=None, prefer_cloud=False):
+                               max_tokens=None, prefer_cloud=False, model_override=None,
+                               lock_wait=60):
         result = self.generate(system_prompt, user_prompt, timeout=timeout,
-                               max_tokens=max_tokens, prefer_cloud=prefer_cloud)
+                               max_tokens=max_tokens, prefer_cloud=prefer_cloud,
+                               model_override=model_override, lock_wait=lock_wait)
         if result.ok and not _VERDICT_ECHO.search(result.text[:80]):
             # Strip any prompt template the model echoed back
             cleaned = _strip_prompt_echo(result.text)
@@ -155,10 +177,12 @@ class LLMManager:
         return fallback_text, "fallback"
 
     def stream_generate(self, system_prompt, user_prompt, timeout=90, max_tokens=None,
-                        prefer_cloud=False):
+                        prefer_cloud=False, model_override=None, lock_wait=12):
         """Yield (chunk_text, provider_name) as the first usable provider streams.
         After the last chunk, yields ('', provider_name) to signal clean completion.
-        Raises RuntimeError if no provider can stream."""
+        Raises RuntimeError if no provider can stream. Interactive chat caps the
+        lock wait hard (lock_wait=12s): a background plan draw holding the local box
+        must not freeze a conversation, so past the cap we stream from OpenRouter."""
         ordered = self._ordered(prefer_cloud=prefer_cloud)
         logger = logging.getLogger("eloise.llm")
         for p in ordered:
@@ -171,11 +195,14 @@ class LLMManager:
             try:
                 if p.name == "ollama":
                     # The CPU box is busy until this stream is DONE, so the app-wide
-                    # lock is held for the whole stream; later callers queue behind it.
-                    OLLAMA_LOCK.acquire()
+                    # lock is held for the whole stream; later callers queue behind it,
+                    # but only up to their own lock_wait cap.
+                    if not OLLAMA_LOCK.acquire(timeout=lock_wait):
+                        logger.warning("ollama busy >%.0fs (chat lock); streaming from next provider", lock_wait)
+                        continue
                     try:
                         chunk = ""
-                        for chunk in stream(system_prompt, user_prompt, timeout, max_tokens):
+                        for chunk in stream(system_prompt, user_prompt, timeout, max_tokens, model_override):
                             if chunk is None:
                                 yield "", p.name
                                 return
@@ -185,7 +212,7 @@ class LLMManager:
                     finally:
                         OLLAMA_LOCK.release()
                 chunk = ""
-                for chunk in stream(system_prompt, user_prompt, timeout, max_tokens):
+                for chunk in stream(system_prompt, user_prompt, timeout, max_tokens, model_override):
                     if chunk is None:
                         yield "", p.name
                         return

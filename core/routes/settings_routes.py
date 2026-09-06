@@ -8,6 +8,7 @@ from core.database import get_connection
 from core.deps import require_user
 from core import generation
 from core.llm import LLMManager
+from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
 from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest
 from core.routes.goal_routes import regenerate_plan_bg
 
@@ -56,7 +57,7 @@ def get_llm(user: dict = Depends(require_user)):
     import os
     return {
         "ollama_url": _clean_ollama_url(cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434")),
-        "ollama_model": cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", "huihui_ai/dolphin3-abliterated:latest"),
+        "ollama_model": cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
         "openrouter_model": cfg.get("openrouter_model") or os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
         "openrouter_key_set": bool(cfg.get("openrouter_key") or os.environ.get("OPENROUTER_API_KEY")),
     }

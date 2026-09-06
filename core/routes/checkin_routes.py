@@ -12,16 +12,30 @@ from core.models import CheckinRespondRequest
 router = APIRouter(prefix="/api", tags=["checkin"])
 
 
+# A "not done" checkin used to kick a regeneration thread for EVERY active goal — with
+# several goals that is N × (up to 180s) of serialized model calls stacked in one
+# burst, all fighting the single CPU box. Now only the 2 most urgent goals are
+# regenerated per checkin, and only one bulk run per app at a time.
+_MAX_REGEN_GOALS = 2
+_regen_guard = threading.Lock()
+
+
 def _regenerate_active_goals(user):
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)
-    ).fetchall()
-    for r in rows:
-        try:
-            regenerate_plan_bg(user, r["id"])
-        except Exception:
-            pass
+    if not _regen_guard.acquire(blocking=False):
+        return
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT id FROM goals WHERE user_id=? AND status='active' ORDER BY deadline ASC",
+            (user["id"],),
+        ).fetchall()
+        for r in rows[:_MAX_REGEN_GOALS]:
+            try:
+                regenerate_plan_bg(user, r["id"])
+            except Exception:
+                pass
+    finally:
+        _regen_guard.release()
 
 
 @router.get("/checkin")

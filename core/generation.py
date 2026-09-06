@@ -161,8 +161,12 @@ def _global_chat_prompt(summary, history, user_name, message):
         f"=== CONVERSATION ===\n{history}\n\n"
         f"=== {user_name} says ===\n{message}\n\n"
         f"Reply as Eloise in a normal conversation. Answer exactly what was just asked, not what "
-        f"you answered last time. Use the board state only when it's genuinely relevant — name "
-        f"real goals and dates when you do. If the user lists options and asks which one to pick, "
+        f"you answered last time. GROUNDING: your ONLY sources of truth are the active goals, "
+        f"their dates, and today's tasks listed above — never invent a goal, date, task, or fact "
+        f"that is not written there. When you do reference something, quote the real one from the "
+        f"list. If the user asks about something that is NOT on their board, say plainly it isn't "
+        f"scheduled yet instead of making one up. Use the board only when it's genuinely "
+        f"relevant. If the user lists options and asks which one to pick, "
         f"PICK ONE immediately and say why in one line — do not bounce the choice back and do not "
         f"say 'it's up to you'. If they repeat a question, do NOT copy your last "
         f"reply; say it fresh or push back. "
@@ -190,6 +194,11 @@ def _goal_chat_prompt(goal_name, plan_section, history, user_name, message):
         f"- If they call you out for not answering or ask the same thing again -> DO NOT repeat or "
         f"restate; actually answer the thing this time, in fresh words, in AT MOST 2 LINES.\n"
         f"- Anything else -> answer it directly, keep it short.\n"
+        f"GROUNDING: every time you name a step, a task, or a time, it must be QUOTED from THE "
+        f"PLAN listed above — never invent tasks, dates, or times that are not literally written "
+        f"there. If the user asks about something that is NOT on their schedule, say it plainly "
+        f"('that is not on your schedule yet') instead of making it up, and if they ask what to "
+        f"do now, name ONE real step quoted from THE PLAN.\n"
         f"If they say they ALREADY did something (talked, discussed, finished it), accept that and "
         f"move past it — do NOT re-instruct them to repeat it.\n"
         f"Keep it SHORT: at most 2 LINES, but COMPLETE — actually answer the whole question, then "
@@ -456,7 +465,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
     deadline = goal["deadline"]
     days = max(days_remaining(deadline, today), 1)
     reminder = normalize_time(goal.get("reminder_time") or "09:00") or "09:00"
-    reminder_hh, reminder_mm = map(int, reminder.split(":"))
 
     # Load questionnaire details (if any) — these make the schedule specific.
     details = {}
@@ -487,16 +495,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
     if _goal_kind(goal.get("title") or goal["display_title"]) == "hookup":
         return _hookup_arc(today, deadline, blocked, details,
                            goal.get("title") or goal["display_title"])
-
-    # Preferred work windows: three shifts — a morning start, an afternoon push, and
-    # an evening close. Each anchor slides forward until it lands on a free 90-min block.
-    morning = reminder_hh * 60 + reminder_mm
-    if morning < 8 * 60:
-        morning = 9 * 60
-    if morning > 11 * 60:
-        morning = 9 * 60
-    afternoon = 16 * 60  # 16:00
-    evening = 19 * 60    # 19:00 — final push before the lights dim
 
     def _day_bounds():
         # convert blocked windows into a busy silhouette over one day (minutes 0-1439),
@@ -534,22 +532,32 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
             return None
         return (cur, cur + 90)
 
-    # Human-scale effort: how many sessions a day gets depends on how urgent the
-    # goal is. A paper due in 1-2 days is a full-day grind (go all in — the gym can
-    # wait), while a month-long goal gets lighter, spread-out sessions. This keeps a
-    # day humanly possible instead of a wall of impossible blocks stacked there.
-    load = 3 if days <= 2 else 2
+    # How many sessions a day gets is NOT a fixed '2-3'. It follows the deadline and
+    # the time that day actually has, so it can be MORE than 8 on a fully free day for
+    # a pressing goal (the hours are there — use them) and as FEW as one for an easy,
+    # long-running goal. No arbitrary 3-per-day cap.
+    if days <= 2:
+        wanted = 7
+    elif days <= 5:
+        wanted = 5
+    elif days <= 14:
+        wanted = 3
+    elif days <= 30:
+        wanted = 2
+    else:
+        wanted = 1
 
     def slots_in_day():
         busy = _day_bounds()
         chosen = []
-        for anchor in (morning, afternoon, evening):
-            if len(chosen) >= load:
+        cur = 8 * 60  # the usable part of a day opens at 8:00
+        while cur + 90 <= 22 * 60 and len(chosen) < wanted:
+            cand = _free_from(busy, cur, chosen)
+            if not cand:
                 break
-            cand = _free_from(busy, anchor, chosen)
-            if cand:
-                chosen.append(cand)
-        return chosen[:3]
+            chosen.append(cand)
+            cur = cand[1]
+        return chosen
 
     entries = []
     total_days = min(days, 15)
@@ -729,19 +737,15 @@ def _overlaps(s, e, blocked):
     return False
 
 
-def generate_plan(goal, user, db=None, extra_blocked=None):
+def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False):
     """Generate a real (or fallback) schedule for a goal. Returns list of action dicts."""
+    # No liveness pre-probe here. A busy local CPU reads as "down" to a fast probe and
+    # that misreport used to spawn MORE competing calls instead of backing off. We just
+    # attempt the real call — it serializes on the app-wide ollama lock and gets its
+    # real timeout; a genuine failure falls through to the deterministic plan.
     entries = _build_fallback_plan(goal, extra_blocked=extra_blocked)
-    # If no provider is immediately usable, skip the (slow, starve-prone) LLM attempt
-    # and return the deterministic constraint-aware plan right away.
     try:
-        if not get_manager(db).any_usable():
-            return entries
-    except Exception:
-        return entries
-    # Try the LLM for a richer plan; on any failure fall back to the deterministic one.
-    try:
-        res = _llm_plan_call(goal, db, extra_blocked=extra_blocked)
+        res = _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud)
         if res:
             return res
     except Exception:
@@ -749,24 +753,19 @@ def generate_plan(goal, user, db=None, extra_blocked=None):
     return entries
 
 
-def generate_plan_or_none(goal, user, db=None, extra_blocked=None):
+def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=False):
     """Like generate_plan but returns None (not the fallback) when no LLM can serve a
     plan, so callers can keep a previously-drawn plan instead of overwriting it with the
     same deterministic fallback. Used for background schedule upgrades."""
     try:
-        if not get_manager(db).any_usable():
-            return None
-    except Exception:
-        return None
-    try:
-        return _llm_plan_call(goal, db, extra_blocked=extra_blocked)
+        return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud)
     except Exception:
         return None
 
 
 def _goal_kind(title):
-    """Classify the goal into 'hookup', 'romance' or 'general' so the scheduler can
-    give each a real structure instead of the same generic grid."""
+    """Classify the goal into 'hookup', 'romance', 'startup' or 'general' so the
+    scheduler can give each a real structure instead of the same generic grid."""
     t = (title or "").lower()
     if any(w in t for w in (
             "hookup", "hook up", "sex night", "night together", "sleep with",
@@ -777,6 +776,10 @@ def _goal_kind(title):
             "wife", "partner", "husband", "boyfriend", "bf", "proposal", "memorable",
             "date night", "surprise", "gift")):
         return "romance"
+    # Everything else — startup, exams, fitness, a trip, a project, whatever the user
+    # names — gets the SAME scheduling behavior: real concrete actions, right-sized to
+    # the deadline, one to two humanly-possible tasks per day. No per-title special
+    # cases, no startup-specific templates.
     return "general"
 
 
@@ -812,6 +815,25 @@ def _plan_guidance(title, details_summary):
             "it special', 'plan the surprise', 'discuss feelings') — those are NOT actions. The "
             "moment itself is named as the real plan from the notes. This is logistics, not a lecture."
         ) + (f" Details: {s}." if s else ".")
+    if kind == "startup":
+        return (
+            "PLAN THIS AS a lean startup sprint the user is ACTUALLY going to execute in the "
+            "remaining days — not a textbook course, not a padding-heavy template. A founder "
+            "ships and sells every day. Strict pacing: "
+            "DAY 1 = create the landing page and put it LIVE (a real URL, real copy, real signup "
+            "form). FIRST LAUNCH happens within the first 3 days of the sprint — the product is "
+            "bootstrapped, imperfect, launched. After launch, EVERY day is one shippable output "
+            "that moves the business: build the core feature, get users, talk to customers, "
+            "collect feedback, iterate, distribute. "
+            "Forbidden as standalone task-slots: 'draft a business model canvas', 'lock pricing "
+            "strategy', 'build a 12-month financial model', 'map compliance requirements line by "
+            "line', 'design the logo', 'plan the roadmap' — those textbook artifacts are NOT how "
+            "you spend this sprint. If regulatory homework is genuinely real for the product, it "
+            "is ONE short task, performed with the user's actual specifics — never a whole day. "
+            "Every title must be a COMPLETE CONCRETE ACTION for that exact slot (verb + the real "
+            "thing), pulled ONLY from the user's own answers and chat notes. "
+            "Do NOT pad days with busywork; do NOT schedule the same topic on separate days."
+        ) + (f" Details: {s}." if s else ".")
     return ""
 
 
@@ -834,7 +856,20 @@ def _goal_chat_log(db, goal):
         return ""
 
 
-def _llm_plan_call(goal, db, timeout=180, extra_blocked=None):
+def _extract_links(text):
+    """Pull any http(s) URLs the user shared in chat notes so the schedule can
+    reference the user's own resources instead of making new ones up."""
+    if not text:
+        return []
+    out = []
+    for m in re.finditer(r"https?://[^\s)\]]+", text):
+        url = m.group(0).rstrip(".,;:")
+        if url not in out:
+            out.append(url)
+    return out[:8]
+
+
+def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False):
     sys = BASE_SYSTEM_PROMPT
     deadline = goal["deadline"]
     title = (goal.get("title") or goal["display_title"]).strip()
@@ -866,6 +901,18 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None):
             "Plan forward from what is still outstanding. Match real dates/times the user "
             "mentioned. Do not invent new topics unrelated to the goal."
         )
+    # Links the user shared in chat notes belong on their schedule: extract them so
+    # the plan can reference the user's actual resources instead of assuming new ones.
+    links = _extract_links(chat_log)
+    links_line = ""
+    if links:
+        links_line = (
+            "\n=== LINKS FROM THE USER'S CHAT NOTES ===\n"
+            f"{', '.join(links)}\n"
+            "=== END LINKS ===\n"
+            "Use these exact links where the plan needs a resource, tool, form, or page: "
+            "link the real thing the user already shared. Do not invent different resources."
+        )
     today = date.today().isoformat()
     fallback = _build_fallback_plan(goal, today=today, extra_blocked=extra_blocked) or []
     if not fallback:
@@ -880,6 +927,7 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None):
         f"Constraints: {cons}"
         f"{blocked_line}"
         f"{chat_line}"
+        f"{links_line}"
         f"{detail_line}"
         f"{guidance_line}\n"
         "Below are the EXACT day/time slots the plan must fill (each slot is one task). "
@@ -909,7 +957,11 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None):
         "chosen items, agreed times). Every title is a physical, concrete action the user does "
         "in that slot, not a lecture and not a vibe."
     )
-    res = get_manager(db).generate(sys, user_prompt, timeout=timeout)
+    # prefer_cloud controls WHICH box does the heavy lifting. Explicit user redraws
+    # (prefer_cloud=True) run on OpenRouter so a schedule draw is fast and parallel with
+    # chat. Auto/retry/checkin paths (prefer_cloud=False) stay on the free local model by
+    # default and only touch OpenRouter as a fallback when the local box genuinely fails.
+    res = get_manager(db).generate(sys, user_prompt, timeout=timeout, prefer_cloud=prefer_cloud)
     if not res.ok:
         return None
     global _last_provider

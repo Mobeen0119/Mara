@@ -269,7 +269,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
         )
         _add_message(conn, user["id"], goal_id, "eloise", reply)
         return StreamingResponse(
-            [send({"delta": reply}), send({"done": True, "goal_status": "succeeded", "source": "completion"})],
+            iter([send({"delta": reply}), send({"done": True, "goal_status": "succeeded", "source": "completion"})]),
             media_type="text/event-stream",
         )
 
@@ -280,21 +280,15 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
         refusal = generation.GUARDRAIL_REFUSAL
         _add_message(conn, user["id"], goal_id, "eloise", refusal)
         return StreamingResponse(
-            [send({"delta": refusal}), send({"done": True, "source": "guardrail"})],
+            iter([send({"delta": refusal}), send({"done": True, "source": "guardrail"})]),
             media_type="text/event-stream",
         )
 
     # No canned replies: if the model can't be reached right now, say so with a real
     # error instead of fabricating an Eloise answer. A streaming response can't change
-    # status mid-frame, so check reachability BEFORE starting the stream and wait for
-    # the genuine response — never substitute hardcoded text.
-    if not generation.get_manager(conn).any_usable():
-        conn.commit()
-        raise HTTPException(
-            status_code=503,
-            detail="The model isn't reachable right now, and I won't fake a reply. Start Ollama (or check the LLM settings), then send that again.",
-        )
-
+    # status mid-frame, so if the model is genuinely unreachable the stream itself
+    # fails with an honest error frame — and if it's merely BUSY, the call queues on
+    # the shared model lock instead of being read as "down" by a fast probe.
     def generate():
         collected = []
         gconn = get_connection()
@@ -330,7 +324,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
             yield _json.dumps({"done": True, "source": source or "offline"})
         except Exception:
             yield _json.dumps({"error": True, "done": True, "source": "offline",
-                               "detail": "The model connection dropped mid-reply."})
+                               "detail": "The model isn't reachable right now — start Ollama or check the LLM settings, then send that again."})
 
     return StreamingResponse(
         (f"data: {frame}\n\n" for frame in generate()),

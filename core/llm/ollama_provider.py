@@ -101,9 +101,11 @@ class OllamaProvider(LLMProvider):
         resp.raise_for_status()
         return [m.get("name", "") for m in resp.json().get("models", [])]
 
-    def probe_fast(self, timeout=1.5) -> bool:
+    def probe_fast(self, timeout=8.0) -> bool:
         """Quick readiness check: try primary URL, then WSL host IPs. Returns True
-        only when reachable AND the model is installed. Capped so it can't hang."""
+        only when reachable AND the model is installed. The default timeout is
+        deliberately generous: this box is a single CPU that may be legitimately busy
+        generating, and a 1.5s probe read a busy box as 'down'. Capped so it can't hang."""
         import socket
         deadline = time.monotonic() + timeout
         connected_url = None
@@ -116,7 +118,7 @@ class OllamaProvider(LLMProvider):
                     port = int(p) if p.isdigit() else 11434
                 else:
                     h, port = host, 11434
-                with socket.create_connection((h, port), timeout=min(timeout, 1)):
+                with socket.create_connection((h, port), timeout=min(timeout, 2)):
                     connected_url = url
                     break
             except Exception:

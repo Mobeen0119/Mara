@@ -14,6 +14,12 @@ DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"
 # OpenRouter free-tier can echo a moderation verdict instead of a reply. Never treat that as a win.
 _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 
+# Ollama (the local model) is a SINGLE CPU-bound process: it can only run one
+# generation at a time. Every chat request and every plan draw shares this one lock,
+# so a busy box becomes a clean queue instead of a stampede of competing calls that
+# slow each other down and then time out.
+OLLAMA_LOCK = threading.Lock()
+
 
 def _strip_prompt_echo(text):
     """Post-process LLM output: strip any prompt template the model echoed back."""
@@ -84,32 +90,24 @@ class LLMManager:
             self._by_name = by_name
             return by_name
 
-    def any_usable(self):
-        """Fast check: is any provider immediately usable? Avoids slow probes when none is up."""
-        for p in self._providers().values():
-            try:
-                if p.name == "ollama":
-                    if p.probe_fast():
-                        return True
-                elif p.status().usable:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _ordered(self):
-        """Provider attempt order. The LOCAL model is always tried FIRST — the user
-        explicitly wants local generation to win when it's up, so plans and chat are
-        drawn on his own machine. OpenRouter is the fallback only when a key is set
-        and the local model can't answer (down / no model / timeout)."""
+    def _ordered(self, prefer_cloud=False):
+        """Provider attempt order, per use case:
+        - Plans (prefer_cloud=True): OpenRouter FIRST — cloud runs in parallel with the
+          local chat model, so a schedule draw never blocks (or is blocked by) chat.
+          Falls back to the local model when no key is set or the cloud fails.
+        - Chat (default/prefer_cloud=False): the LOCAL model FIRST (the user explicitly
+          wants local output for his conversations); OpenRouter only as a fallback."""
         providers = self._providers()
         o, l = providers.get("openrouter"), providers.get("ollama")
+        if prefer_cloud:
+            return [p for p in (o, l) if p is not None]
         return [p for p in (l, o) if p is not None]
 
-    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None) -> GenerationResult:
+    def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None,
+                 prefer_cloud=False) -> GenerationResult:
         import logging
         logger = logging.getLogger("eloise.llm")
-        ordered = self._ordered()
+        ordered = self._ordered(prefer_cloud=prefer_cloud)
         # Try every provider — even if status says non-usable, attempt generation anyway.
         # Status can be wrong (slow probe, transient failure), and a generate call is the
         # real test. Only skip providers that are plainly missing (e.g. no API key at all).
@@ -119,11 +117,14 @@ class LLMManager:
                 logger.debug("skipping openrouter: no API key")
                 continue
             logger.info("trying provider: %s (model: %s)", p.name, p.model)
-            future = self._executor.submit(p.generate, system_prompt, user_prompt, timeout, max_tokens)
-            try:
-                result = future.result(timeout=timeout + 5)
-            except Exception as exc:
-                result = GenerationResult(ok=False, provider=p.name, model=p.model, error=str(exc))
+            if p.name == "ollama":
+                # The local box runs one generation at a time. Wait HERE (before the
+                # timeout starts counting) so a queued call still gets its FULL timeout
+                # instead of burning its budget sitting behind a busy predecessor.
+                with OLLAMA_LOCK:
+                    result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens)
+            else:
+                result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens)
             logger.info("provider %s: ok=%s error=%s latency=%s", p.name, result.ok, result.error, result.latency_ms)
             if result.ok:
                 return result
@@ -132,8 +133,17 @@ class LLMManager:
             error="no usable provider (start local model or add an API key)",
         )
 
-    def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=90, max_tokens=None):
-        result = self.generate(system_prompt, user_prompt, timeout=timeout, max_tokens=max_tokens)
+    def _attempt(self, p, system_prompt, user_prompt, timeout, max_tokens):
+        future = self._executor.submit(p.generate, system_prompt, user_prompt, timeout, max_tokens)
+        try:
+            return future.result(timeout=timeout + 5)
+        except Exception as exc:
+            return GenerationResult(ok=False, provider=p.name, model=p.model, error=str(exc))
+
+    def generate_with_fallback(self, system_prompt, user_prompt, fallback_fn, timeout=90,
+                               max_tokens=None, prefer_cloud=False):
+        result = self.generate(system_prompt, user_prompt, timeout=timeout,
+                               max_tokens=max_tokens, prefer_cloud=prefer_cloud)
         if result.ok and not _VERDICT_ECHO.search(result.text[:80]):
             # Strip any prompt template the model echoed back
             cleaned = _strip_prompt_echo(result.text)
@@ -144,20 +154,36 @@ class LLMManager:
         fallback_text = fallback_fn()
         return fallback_text, "fallback"
 
-    def stream_generate(self, system_prompt, user_prompt, timeout=90, max_tokens=None):
+    def stream_generate(self, system_prompt, user_prompt, timeout=90, max_tokens=None,
+                        prefer_cloud=False):
         """Yield (chunk_text, provider_name) as the first usable provider streams.
         After the last chunk, yields ('', provider_name) to signal clean completion.
         Raises RuntimeError if no provider can stream."""
-        ordered = self._ordered()
+        ordered = self._ordered(prefer_cloud=prefer_cloud)
+        logger = logging.getLogger("eloise.llm")
         for p in ordered:
             if p.name == "openrouter" and not getattr(p, "api_key", ""):
                 continue
             stream = getattr(p, "generate_stream", None)
             if stream is None:
                 continue
-            logger = logging.getLogger("eloise.llm")
             logger.info("streaming from provider: %s (model: %s)", p.name, p.model)
             try:
+                if p.name == "ollama":
+                    # The CPU box is busy until this stream is DONE, so the app-wide
+                    # lock is held for the whole stream; later callers queue behind it.
+                    OLLAMA_LOCK.acquire()
+                    try:
+                        chunk = ""
+                        for chunk in stream(system_prompt, user_prompt, timeout, max_tokens):
+                            if chunk is None:
+                                yield "", p.name
+                                return
+                            yield chunk, p.name
+                        yield "", p.name
+                        return
+                    finally:
+                        OLLAMA_LOCK.release()
                 chunk = ""
                 for chunk in stream(system_prompt, user_prompt, timeout, max_tokens):
                     if chunk is None:

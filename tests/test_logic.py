@@ -266,7 +266,7 @@ def test_plan_prompt_covers_every_day():
     def fake_gen(db):
         class M:
             def any_usable(self_): return True
-            def generate(self_, sys, user_prompt, timeout=30):
+            def generate(self_, sys, user_prompt, timeout=30, max_tokens=None, prefer_cloud=False):
                 calls["prompt"] = user_prompt
                 return _Fake()
         return M()
@@ -278,6 +278,68 @@ def test_plan_prompt_covers_every_day():
     p = calls.get("prompt", "")
     assert "Cover EVERY day" in p
     assert "chat notes say is already done" in p.replace("\n", " ")
+
+
+def test_startup_plan_is_ship_day1_sprint_and_chat_links_feed_the_plan():
+    # The user's "startup" goal must get a lean-sprint guidance (landing page live day 1,
+    # launch within first 3 days, no textbook padding), and any URL the user shared in
+    # chat notes must be handed to the plan so it references the user's real resources.
+    import sqlite3
+    from core import generation
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "user_id INTEGER, goal_id INTEGER, role TEXT, content TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO chat_messages (user_id, goal_id, role, content) VALUES "
+        "(1, 7, 'user', 'check my idea at https://yoursite.app/idea and https://tools.dev/board')"
+    )
+    calls = {}
+
+    class _Fake:
+        ok = True
+        text = '[]'
+        provider = "fake"
+        latency_ms = 1
+        model = "x"
+        error = None
+
+    orig = generation.get_manager
+    def fake_gen(db):
+        class M:
+            def any_usable(self_): return True
+            def generate(self_, sys, user_prompt, timeout=30, max_tokens=None, prefer_cloud=False):
+                calls["prompt"] = user_prompt
+                return _Fake()
+        return M()
+
+    generation.get_manager = fake_gen
+    try:
+        goal = {"id": 7, "user_id": 1, "deadline": "2027-06-01",
+                "title": "i have to start my startup complete",
+                "display_title": "i have to start my startup complete",
+                "reminder_time": "09:00", "constraints": "[]", "details": "{}"}
+        generation._llm_plan_call(goal, conn, timeout=10)
+    finally:
+        generation.get_manager = orig
+    p = calls.get("prompt", "")
+    assert "lean startup sprint" in p
+    assert "landing page" in p and "FIRST LAUNCH happens within the first 3 days" in p
+    assert "business model canvas" in p  # explicitly forbidden as padding
+    assert "https://yoursite.app/idea" in p and "https://tools.dev/board" in p
+    conn.close()
+
+
+def test_chat_prompts_forbid_inventing_tasks():
+    # Chat must ground itself in the schedule: never invent tasks, quote only listed ones.
+    from core import generation as g
+    global_p = g._global_chat_prompt("digest of goals, today tasks", "hist", "Mobeen", "what do i do")
+    goal_p = g._goal_chat_prompt("my goal", "=== THE PLAN ===\n11:00 buy milk\n", "hist", "Mobeen", "now?")
+    assert "never invent" in global_p and "sources of truth" in global_p
+    assert "never invent tasks, dates, or times" in goal_p
+    assert "QUOTED from THE PLAN" in goal_p
 
 
 def test_history_drops_last_reply_on_repeat():
@@ -499,3 +561,213 @@ def test_title_picker_rejects_filler():
     m = generation._parse_title_map(text)
     assert m[("2026-09-09", "18:00")] == "The night with Sarah: slow it down, stay over"
     assert generation._parse_title_map("garbage no json") == {}
+
+
+def test_ollama_calls_serialize_globally():
+    # The user's diagnosis: one CPU model hit by chat + N retry threads at once. Ollama
+    # can serve ONE generation at a time, so the app-wide lock must force concurrent
+    # calls into a queue (2x wall time) instead of racing.
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    import core.llm.manager as mmod
+    from core.llm.manager import LLMManager
+
+    class SlowProvider:
+        name = "ollama"
+        model = "m"
+        api_key = ""
+        def generate(self, sp, up, timeout=30, max_tokens=None):
+            _time.sleep(1.0)
+            return mmod.GenerationResult(ok=True, provider=self.name, model=self.model,
+                                         text="ok", latency_ms=1000)
+
+    orig_build = mmod.build_providers
+    orig_config = mmod.provider_config
+    mmod.build_providers = lambda db=None, config=None: [SlowProvider()]
+    mmod.provider_config = lambda db: {}
+    try:
+        mm = LLMManager()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            t0 = _time.monotonic()
+            futs = [ex.submit(lambda: mm.generate("s", "u", timeout=30)), ex.submit(lambda: mm.generate("s", "u", timeout=30))]
+            results = [f.result() for f in futs]
+            wall = _time.monotonic() - t0
+        assert all(r.ok for r in results)
+        assert wall >= 1.8, wall  # 2 x 1s back-to-back, NOT concurrent
+    finally:
+        mmod.build_providers = orig_build
+        mmod.provider_config = orig_config
+
+
+def test_openrouter_calls_not_serialized():
+    # Cloud provider must NOT take the local model lock — parallel calls stay parallel.
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    import core.llm.manager as mmod
+    from core.llm.manager import LLMManager
+
+    class FastCloud:
+        name = "openrouter"
+        model = "m"
+        api_key = "sk-test"
+        def generate(self, sp, up, timeout=30, max_tokens=None):
+            _time.sleep(1.0)
+            return mmod.GenerationResult(ok=True, provider=self.name, model=self.model,
+                                         text="ok", latency_ms=1000)
+
+    orig_build = mmod.build_providers
+    orig_config = mmod.provider_config
+    mmod.build_providers = lambda db=None, config=None: [FastCloud()]
+    mmod.provider_config = lambda db: {}
+    try:
+        mm = LLMManager()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            t0 = _time.monotonic()
+            futs = [ex.submit(lambda: mm.generate("s", "u", timeout=30)), ex.submit(lambda: mm.generate("s", "u", timeout=30))]
+            results = [f.result() for f in futs]
+            wall = _time.monotonic() - t0
+        assert all(r.ok for r in results)
+        assert wall < 1.7, wall  # concurrent, not serialized
+    finally:
+        mmod.build_providers = orig_build
+        mmod.provider_config = orig_config
+
+
+def test_plan_retry_is_bounded_and_deduplicated():
+    import core.routes.goal_routes as gr
+
+    updates = []
+    class FakeConn:
+        def execute(self, sql, *a):
+            if sql.startswith("UPDATE goals"):
+                updates.append(a)
+            return self
+        def commit(self):
+            return None
+    orig_bg = gr._regenerate_plan_bg
+    orig_conn = gr.get_connection
+    gr._regenerate_plan_bg = lambda user, gid: None
+    gr.get_connection = lambda: FakeConn()
+    try:
+        gr._plan_retry_state.clear()
+        user = {"id": 1}
+        gid = 7
+        gr._schedule_plan_retry(user, gid)
+        st = gr._plan_retry_state[gid]
+        assert st["scheduled"] is True and st["attempts"] == 1
+        # a second failure while one retry is pending must NOT stack another thread
+        gr._schedule_plan_retry(user, gid)
+        assert st["attempts"] == 1 and st["scheduled"] is True
+        # the pending retry resolves (fails again) -> backoff increments
+        st["scheduled"] = False
+        gr._schedule_plan_retry(user, gid)
+        assert st["attempts"] == 2
+        # a successful plan write resets the retry budget
+        gr._reset_plan_retries(gid)
+        assert gid not in gr._plan_retry_state
+        # exhausting the budget stops scheduling entirely (no more threads)
+        for _ in range(gr._PLAN_RETRY_MAX + 3):
+            if gr._plan_retry_state.get(gid, {}).get("scheduled"):
+                gr._plan_retry_state[gid]["scheduled"] = False
+            gr._schedule_plan_retry(user, gid)
+        last = gr._plan_retry_state[gid]
+        assert last["attempts"] == gr._PLAN_RETRY_MAX, last
+        assert last["scheduled"] is False
+        assert any(7 in u[0] for u in updates)  # honest "giving up" note recorded
+    finally:
+        gr._plan_retry_state.clear()
+        gr._regenerate_plan_bg = orig_bg
+        gr.get_connection = orig_conn
+
+
+def test_plan_attempts_llm_even_when_probe_says_down():
+    # A probe misreading a busy box as "down" must no longer gate plan generation:
+    # the real call always gets its chance (it queues on the shared lock instead).
+    from core import generation as g
+    calls = {"n": 0}
+    class R:
+        ok = True
+        provider = "ollama"
+        model = "x"
+        error = None
+        latency_ms = 1
+        text = '[]'
+    orig = g.get_manager
+    def fake(db):
+        class M:
+            def any_usable(self_):
+                return False
+            def generate(self_, sys, user_prompt, timeout=30, max_tokens=None, prefer_cloud=False):
+                calls["n"] += 1
+                return R()
+        return M()
+    g.get_manager = fake
+    try:
+        goal = {"deadline": "2099-01-01", "title": "some goal", "display_title": "some goal",
+                "reminder_time": "09:00", "constraints": "[]", "details": "{}", "user_id": 1}
+        g.generate_plan(goal, {"id": 1}, db=None)
+    finally:
+        g.get_manager = orig
+    assert calls["n"] == 1
+
+
+def test_probe_fast_default_timeout_is_8s():
+    import inspect
+    from core.llm.ollama_provider import OllamaProvider
+    params = inspect.signature(OllamaProvider.probe_fast).parameters
+    assert params["timeout"].default == 8.0
+
+
+def test_plan_prefers_cloud_and_chat_prefers_local():
+    # Explicit Redraw uses OpenRouter-first (prefer_cloud=True) so a schedule draw runs
+    # in parallel with chat. Auto/retry paths and chat default to local-first
+    # (prefer_cloud=False) to avoid burning paid OpenRouter calls unnecessarily.
+    from core import generation as g
+    seen = {}
+
+    class CloudFirst:
+        name = "openrouter"
+        api_key = "sk-x"
+        model = "m"
+
+    class LocalFirst:
+        name = "ollama"
+        api_key = ""
+        model = "m"
+
+    geom = {"plan_calls": []}
+    orig = g.get_manager
+    def fake(db):
+        class M:
+            def generate(self_, sys, user_prompt, timeout=30, max_tokens=None, prefer_cloud=False):
+                geom["plan_calls"].append(prefer_cloud)
+                seen["plan"] = True
+                return R
+            def generate_with_fallback(self_, sys, user_prompt, fallback_fn, timeout=90,
+                                       max_tokens=None, prefer_cloud=False):
+                geom["chat"] = prefer_cloud
+                seen["chat"] = True
+                return "hi", "ollama"
+        return M()
+
+    class R:
+        ok = True
+        provider = "openrouter"
+        model = "m"
+        error = None
+        latency_ms = 1
+        text = '[]'
+
+    g.get_manager = fake
+    try:
+        goal = {"id": 1, "deadline": "2099-01-01", "title": "some goal",
+                "display_title": "some goal", "reminder_time": "09:00",
+                "constraints": "[]", "details": "{}", "user_id": 1}
+        g._llm_plan_call(goal, None, timeout=30, prefer_cloud=True)      # explicit Redraw
+        g._llm_plan_call(goal, None, timeout=30, prefer_cloud=False)     # auto/retry path
+        g.generate_opening_message("mobeen", "a goal", db=None)          # chat
+    finally:
+        g.get_manager = orig
+    # explicit Redraw must be the only call that forces OpenRouter first
+    assert geom["plan_calls"] == [True, False]
+    assert geom["chat"] is False            # chat -> local first

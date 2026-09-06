@@ -28,6 +28,14 @@ router = APIRouter(prefix="/api", tags=["goals"])
 
 _plan_locks = {}
 
+# Retry bookkeeping per goal. A failed model call used to spawn "another thread in 60s"
+# forever — a single bad CPU spike could stack unbounded dueling threads. Now each goal
+# gets at most _PLAN_RETRY_MAX scheduled retries with exponential backoff, and only ONE
+# pending retry can exist for a goal at a time.
+_PLAN_RETRY_MAX = 3
+_plan_retry_state = {}  # goal_id -> {"attempts": int, "scheduled": bool}
+_retry_state_lock = threading.Lock()
+
 
 def _goal_or_404(user, goal_id):
     conn = get_connection()
@@ -86,7 +94,7 @@ def _insert_actions(conn, goal, entries):
         )
 
 
-def _regenerate_plan_bg(user, goal_id):
+def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
     logger.warning("plan bg: goal %s thread started", goal_id)
     try:
         goal = _goal_or_404(user, goal_id)
@@ -111,13 +119,16 @@ def _regenerate_plan_bg(user, goal_id):
         # model; if it is down or times out, we KEEP whatever plan already exists and
         # retry in a minute. A hardcoded fill-in is never shown to the user.
         try:
-            better = generation.generate_plan_or_none(goal, user, db=conn, extra_blocked=blocked)
+            better = generation.generate_plan_or_none(
+                goal, user, db=conn, extra_blocked=blocked, prefer_cloud=prefer_cloud,
+            )
         except Exception as exc:
             logger.warning("plan bg: goal %s LLM attempt failed: %r", goal_id, exc)
             better = None
         if better:
             _write_plan(conn, goal, better, blocked_min=blocked,
                         provider=generation.last_provider())
+            _reset_plan_retries(goal_id)
             logger.warning("plan bg: goal %s wrote %s LLM entries", goal_id, len(better))
         else:
             existing = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (goal_id,)).fetchone()[0]
@@ -144,15 +155,50 @@ def _regenerate_plan_bg(user, goal_id):
         lock.release()
 
 
-def _schedule_plan_retry(user, goal_id, delay=60):
-    """Try the plan again in ~a minute, as the user wants: 'if there is some issue
-    while creating a new one, try in a minute and keep the old one until then'."""
+def _reset_plan_retries(goal_id):
+    with _retry_state_lock:
+        _plan_retry_state.pop(goal_id, None)
+
+
+def _schedule_plan_retry(user, goal_id, delay=None):
+    """Try the plan again with backoff, as the user wants: 'if there is some issue
+    while creating a new one, try in a minute and keep the old one until then'.
+    Bounded and deduplicated: never more than ONE pending retry per goal, at most
+    _PLAN_RETRY_MAX retries total (60s, 2m, 4m), then we honestly stop
+    instead of stacking threads forever."""
+    with _retry_state_lock:
+        st = _plan_retry_state.setdefault(goal_id, {"attempts": 0, "scheduled": False})
+        if st["scheduled"]:
+            return
+        if st["attempts"] >= _PLAN_RETRY_MAX:
+            try:
+                conn = get_connection()
+                conn.execute(
+                    "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
+                    ("model unavailable — keeping previous schedule", goal_id),
+                )
+                conn.commit()
+            except Exception:
+                pass
+            return
+        st["attempts"] += 1
+        st["scheduled"] = True
+        attempt = st["attempts"]
+    wait = delay if delay is not None else min(60 * (2 ** (attempt - 1)), 900)
+
     def _retry():
-        time.sleep(delay)
         try:
-            _regenerate_plan_bg(user, goal_id)
-        except Exception:
-            pass
+            time.sleep(wait)
+            try:
+                _regenerate_plan_bg(user, goal_id)
+            except Exception:
+                pass
+        finally:
+            with _retry_state_lock:
+                st = _plan_retry_state.get(goal_id)
+                if st:
+                    st["scheduled"] = False
+
     threading.Thread(target=_retry, daemon=True).start()
 
 
@@ -414,7 +460,13 @@ def regen_plan(goal_id: int, user: dict = Depends(require_user), body: RegenPlan
     ).fetchall()]
     conn.execute("UPDATE goals SET plan_status='generating' WHERE id=?", (goal_id,))
     conn.commit()
-    threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
+    # Explicit redraw = the one path that spends OpenRouter calls on purpose, so it
+    # runs on the cloud model (fast, parallel with chat). Everything automatic
+    # (create, retries, checkin, settings change) stays on the free local model.
+    threading.Thread(
+        target=_regenerate_plan_bg, args=(user, goal_id),
+        kwargs={"prefer_cloud": True}, daemon=True,
+    ).start()
     return {"ok": True, "plan": existing, "source": "redraw-bg"}
 
 

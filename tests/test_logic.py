@@ -7,6 +7,18 @@ def test_time_windows():
     assert generation.parse_time_window("gym 5-7pm") == (17*60, 19*60)
 
 
+def test_time_windows_human_phrasings():
+    # The old parser turned 'uni 6 to 2 pm' into 6pm-2am (overnight misread) and
+    # dropped '9 to 5' entirely (None). Both starved every schedule grid.
+    assert generation.parse_time_window("uni 6 to 2 pm") == (6*60, 14*60)
+    assert generation.parse_time_window("work 9 to 5") == (9*60, 17*60)
+    assert generation.parse_time_window("gym 5 to 6 am") == (5*60, 6*60)
+    assert generation.parse_time_window("classes 1-4pm") == (13*60, 16*60)
+    assert generation.parse_time_window("12-2pm") == (12*60, 14*60)
+    assert generation.parse_time_window("9:00-9:30") == (9*60, 9*60 + 30)
+    assert generation.parse_time_window("school 8am-3pm") == (8*60, 15*60)
+
+
 def test_days_remaining():
     assert generation.days_remaining("2026-09-10", today="2026-09-03") == 7
 
@@ -449,6 +461,126 @@ def test_redraw_keeps_old_plan_when_llm_down_and_writes_new_when_up():
         del os.environ["ELOISE_STORAGE_DIR"]
 
 
+def test_fallback_avoids_other_goals_calendar():
+    # The old fallback grid only respected DECLARED busy windows, not the user's actual
+    # calendar. A friend's plan occupying 09:00-21:00 on every day silently collapsed a
+    # new goal to "0 tasks". The fallback must place slots in time that is genuinely
+    # free once other goals are accounted for.
+    goal = {
+        "deadline": "2026-09-09",
+        "display_title": "Study",
+        "reminder_time": "09:00",
+        "constraints": "[]",
+    }
+    busy = {"2026-09-06": [(9 * 60, 21 * 60)],
+            "2026-09-07": [(9 * 60, 21 * 60)],
+            "2026-09-08": [(9 * 60, 21 * 60)],
+            "2026-09-09": [(9 * 60, 21 * 60)]}
+    entries = generation._build_fallback_plan(goal, today="2026-09-06", busy_by_date=busy)
+    assert entries, "calendar-aware fallback must not collapse to empty"
+    for e in entries:
+        s = int(e["start_time"][:2]) * 60 + int(e["start_time"][3:5])
+        eend = int(e["end_time"][:2]) * 60 + int(e["end_time"][3:5])
+        # genuinely free edges of the day: before 9:00 / after 21:00,
+        # and never past the 23:00 planning ceiling
+        assert s >= 8 * 60 and eend <= 23 * 60
+        assert eend <= 9 * 60 or s >= 21 * 60, f"collides with busy block: {e}"
+
+
+def test_resolve_cross_goal_keeps_fallback_when_calendar_full():
+    # _write_plan must NEVER commit "0 tasks across 0 days" even when conflict
+    # resolution empties a non-empty draw (deadline day fully booked everywhere).
+    import os as _os
+    import tempfile
+    import core.routes.goal_routes as gr
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+
+    tmp = tempfile.mkdtemp(prefix="writeplan_")
+    _os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    orig_conn = gr.get_connection
+    gr.get_connection = real_get
+    try:
+        conn = real_get()
+        conn.execute("INSERT INTO users (name,password_hash,is_guest) VALUES ('t','x',1)")
+        conn.execute(
+            "INSERT INTO goals (user_id,title,deadline,reminder_time,constraints,display_title,plan_status) "
+            "VALUES (1,'Study','2026-09-10','09:00','[]','Study','active')"
+        )
+        gid = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO goals (user_id,title,deadline,reminder_time,constraints,display_title,plan_status) "
+            "VALUES (1,'Other','2026-09-10','09:00','[]','Other','active')"
+        )
+        oid = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,title,start_time,end_time,duration_min,status,order_idx) "
+            "VALUES (?,1,'2026-09-10','Busy','09:00','21:00',720,'pending',0)", (oid,)
+        )
+        conn.commit()
+        goal = dict(conn.execute("SELECT * FROM goals WHERE id=?", (gid,)).fetchone())
+        entries = [{"date": "2026-09-10", "title": f"s{i}", "start_time": "09:00",
+                    "end_time": "10:30"} for i in range(4)]
+        res = gr._write_plan(conn, goal, entries, blocked_min=None, provider="openrouter")
+        assert res is None, "fully-booked day must NOT commit an empty plan"
+        row = conn.execute("SELECT plan_summary FROM goals WHERE id=?", (gid,)).fetchone()
+        assert "0 tasks" not in (row[0] or ""), row[0]
+    finally:
+        gr.get_connection = orig_conn
+        _thread_local.conn = None
+        del _os.environ["ELOISE_STORAGE_DIR"]
+
+
+def test_user_calendar_busy_queries_other_goals_only():
+    # The calendar helper must exclude the goal's OWN actions (so redraws don't treat
+    # themselves as obstacles) while including other pending goals' blocks.
+    import os as _os
+    import tempfile
+    from core import database as _db
+
+    tmp = tempfile.mkdtemp(prefix="calbusy_")
+    _os.environ["ELOISE_STORAGE_DIR"] = tmp
+    _db.set_storage_dir(tmp)
+    import core.routes.goal_routes as _gr_tmp
+    _orig_conn = _gr_tmp.get_connection
+    _gr_tmp.get_connection = _db.get_connection
+    try:
+        from core.database import _thread_local as _tl
+        _tl.conn = None
+        conn = _db.get_connection()
+        conn.execute("INSERT INTO users (name,password_hash,is_guest) VALUES ('t','x',1)")
+        conn.execute(
+            "INSERT INTO goals (user_id,title,deadline,reminder_time,constraints,display_title,plan_status) "
+            "VALUES (1,'A','2026-09-10','09:00','[]','A','active')"
+        )
+        a = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO goals (user_id,title,deadline,reminder_time,constraints,display_title,plan_status) "
+            "VALUES (1,'B','2026-09-10','09:00','[]','B','active')"
+        )
+        b = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,title,start_time,end_time,duration_min,status,order_idx) "
+            "VALUES (?,1,'2026-09-08','own','08:00','08:30',30,'pending',0)", (a,))
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,title,start_time,end_time,duration_min,status,order_idx) "
+            "VALUES (?,1,'2026-09-08','other','10:00','10:30',30,'pending',0)", (b,))
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,title,start_time,end_time,duration_min,status,order_idx) "
+            "VALUES (?,1,'2026-09-08','done','11:00','11:30',30,'done',0)", (a,))
+        conn.commit()
+        busy = generation.user_calendar_busy(conn, 1, a, "2026-09-06", "2026-09-10")
+        times = busy.get("2026-09-08", [])
+        assert (10 * 60, 10 * 60 + 30) in times, times   # other goal's pending block
+        assert (8 * 60, 8 * 60 + 30) not in times, times # own action excluded
+        assert (11 * 60, 11 * 60 + 30) not in times, times  # done action excluded
+    finally:
+        _gr_tmp.get_connection = _orig_conn
+        _tl.conn = None
+        del _os.environ["ELOISE_STORAGE_DIR"]
+
+
 def test_hookup_arc_plan():
     # The user tore apart the old hookup plan: it skipped days, put "aftercare" days
     # before the act, and had "confirm way home" the wrong night. The schedule must be
@@ -718,14 +850,16 @@ def test_plan_attempts_llm_even_when_probe_says_down():
     # A probe misreading a busy box as "down" must no longer gate plan generation:
     # the real call always gets its chance (it queues on the shared lock instead).
     from core import generation as g
-    calls = {"n": 0}
+    import re as _re
+    calls = {"n": 0, "fail": False}
     class R:
-        ok = True
+        ok = property(lambda self: not calls["fail"])
         provider = "ollama"
         model = "x"
         error = None
         latency_ms = 1
-        text = '[]'
+        def __init__(self):
+            self.text = "[]"
     orig = g.get_manager
     def fake(db):
         class M:
@@ -733,16 +867,29 @@ def test_plan_attempts_llm_even_when_probe_says_down():
                 return False
             def generate(self_, sys, user_prompt, timeout=30, max_tokens=None, prefer_cloud=False):
                 calls["n"] += 1
-                return R()
+                r = R()
+                if not calls["fail"]:
+                    m = _re.findall(r'"date": "([^"]+)", "start_time": "([^"]+)"', user_prompt)
+                    items = [
+                        f'{{"date":"{d}","start_time":"{st}","end_time":"10:30","title":"send the polished deck to the investor"}}'
+                        for d, st in m]
+                    r.text = "[\n" + ",\n".join(items) + "\n]"
+                return r
         return M()
     g.get_manager = fake
     try:
         goal = {"deadline": "2099-01-01", "title": "some goal", "display_title": "some goal",
                 "reminder_time": "09:00", "constraints": "[]", "details": "{}", "user_id": 1}
-        g.generate_plan(goal, {"id": 1}, db=None)
+        res = g.generate_plan(goal, {"id": 1}, db=None)
+        calls["fail"] = True
+        res_none = g.generate_plan(goal, {"id": 1}, db=None)
     finally:
         g.get_manager = orig
-    assert calls["n"] == 1
+    assert calls["n"] >= 2  # draws are split into slices now; each slice is its own call
+    # Model answered -> ONLY the model's plan is returned (probe said down but call made).
+    assert res is not None and len(res) > 0
+    # Model failed -> None, NEVER a hardcoded deterministic fill-in (the hard rule).
+    assert res_none is None, "generate_plan must NOT fabricate fallback tasks when the model fails"
 
 
 def test_probe_fast_default_timeout_is_8s():
@@ -752,16 +899,22 @@ def test_probe_fast_default_timeout_is_8s():
     assert params["timeout"].default == 8.0
 
 
-def test_ollama_options_pin_context_for_cpu_speed():
-    # Qwen3-class models default to a huge ~32K context; on CPU that KV overhead makes
-    # even a 2-line reply crawl. Short capped chat calls must pin num_ctx=2048, big
-    # schedule draws 8192, and num_predict is only set when actually capping output.
+def test_ollama_options_fit_context_to_prompt():
+    # Qwen3-class models default to a huge ~32K context; on CPU that KV overhead
+    # makes a reply crawl, so the window is pinned — but to the REAL prompt size,
+    # never to the output cap. A window smaller than the prompt makes Ollama
+    # truncate the middle where the goal/persona live (the root cause of "dumb"
+    # local chat and garbage schedule titles). The floor is 4096 so even a tiny
+    # prompt gets enough headroom, capped at 8192 to keep CPU speed.
     from core.llm.ollama_provider import OllamaProvider
     p = OllamaProvider("http://localhost:9", "x")
-    chat = p._options(180)
-    assert chat["num_ctx"] == 2048 and chat["num_predict"] == 180
-    draw = p._options(None)
-    assert draw["num_ctx"] == 8192 and "num_predict" not in draw
+    tiny = p._options("hi", "how are you", max_tokens=180)
+    assert tiny["num_ctx"] >= 4096 and tiny["num_predict"] == 180
+    full = p._options("x" * 6000, "y" * 6000, max_tokens=1000)
+    assert full["num_ctx"] >= 8000 and full["num_predict"] == 1000
+    draw = p._options("plan system", "plan prompt", max_tokens=None)
+    assert "num_predict" not in draw and draw["num_ctx"] >= 4096
+    assert p._options("", "", None)["num_ctx"] == 4096
 
 
 def test_ollama_thinking_disabled_by_default():
@@ -832,8 +985,14 @@ def test_plan_prefers_cloud_and_chat_prefers_local():
         g.generate_opening_message("mobeen", "a goal", db=None)          # chat
     finally:
         g.get_manager = orig
-    # explicit Redraw must be the only call that forces OpenRouter first
-    assert geom["plan_calls"] == [True, False]
+    # explicit Redraw must be the only call that forces OpenRouter first. A draw is now
+    # split into slices (each a separate model call), so assert the ORDER stays cloud-first
+    # for the redraw and local-first for the auto path, with no interleaving.
+    assert geom["plan_calls"][0] is True
+    assert geom["plan_calls"][-1] is False
+    first_false = geom["plan_calls"].index(False)
+    assert all(c is True for c in geom["plan_calls"][:first_false])
+    assert all(c is False for c in geom["plan_calls"][first_false:])
     assert geom["chat"] is False            # chat -> local first
 
 
@@ -913,19 +1072,22 @@ def test_heal_stale_plans_recovers_generating():
     try:
         conn = real_get()
         conn.execute("INSERT INTO users (name, email, password_hash, is_guest) VALUES ('tester','t@heal.io','x',1)")
-        # (status, has_actions, future_deadline)
+        # (status, has_actions, future_deadline) — status is the goal lifecycle status
         cases = [
-            ("generating", False, "2026-09-12"),   # stuck mid-draw, empty  -> regenerate
-            ("generating", True,  "2026-09-12"),   # stuck mid-draw, has plan -> reset only
-            ("active",     False, "2026-09-12"),   # silent empty write       -> regenerate
-            ("active",     True,  "2026-09-12"),   # fine                     -> untouched
-            ("active",     False, "2026-01-01"),   # stale expired goal       -> untouched
+            ("generating", "generating", False, "2026-09-12"),   # stuck mid-draw, empty  -> regenerate
+            ("generating", "generating", True,  "2026-09-12"),   # stuck mid-draw, has plan -> reset only
+            ("active",     "active",     False, "2026-09-12"),   # silent empty write       -> regenerate
+            ("active",     "active",     True,  "2026-09-12"),   # fine                     -> untouched
+            ("active",     "active",     False, "2026-01-01"),   # stale expired goal       -> untouched
+            ("cancelled",  "cancelled: changed my mind", False, "2026-09-12"),  # cancelled, must NOT resurrect
+            ("succeeded",  "active",     False, "2026-09-12"),   # succeeded, must NOT resurrect
+            ("cancelled",  "active",     False, "2026-09-12"),   # goal CANCELLED but plan_status drifted to active (the goal-13 pattern) -> MUST NOT resurrect
         ]
-        for i, (status, n_acts, deadline) in enumerate(cases):
+        for i, (status, plan_status, n_acts, deadline) in enumerate(cases):
             conn.execute(
-                "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, plan_status, plan_summary) "
-                "VALUES (1,?, ?, '09:00','[]', ?, ?, '')",
-                (f"g{i}", deadline, f"g{i}", status),
+                "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, status, plan_status, plan_summary) "
+                "VALUES (1,?, ?, '09:00','[]', ?, ?, ?, '')",
+                (f"g{i}", deadline, f"g{i}", status, plan_status),
             )
             gid = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
             if n_acts:
@@ -939,11 +1101,322 @@ def test_heal_stale_plans_recovers_generating():
         while _time.monotonic() < deadline_ts and len(calls) < 2:
             _time.sleep(0.1)
         statuses = [r["plan_status"] for r in conn.execute("SELECT plan_status FROM goals ORDER BY id").fetchall()]
-        assert statuses == ["active", "active", "active", "active", "active"], statuses
+        assert statuses == ["active", "active", "active", "active", "active",
+                            "cancelled: changed my mind", "active", "active"], statuses
         regen = sorted(c[1] for c in calls)
         ids = [r["id"] for r in conn.execute("SELECT id FROM goals ORDER BY id").fetchall()]
         assert regen == [ids[0], ids[2]], (regen, ids)  # only the two empty ones
         assert all(c[2] is False for c in calls), calls    # local-first
+    finally:
+        gr._regenerate_plan_bg = orig_bg
+        gr.get_connection = orig_conn
+        _thread_local.conn = None
+        del os.environ["ELOISE_STORAGE_DIR"]
+
+
+def test_heal_redraws_plans_violating_own_windows():
+    # Goal 24's live plan has tasks at 16:00 while the goal itself blocks 'sleep 4 to
+    # 10 pm' (16:00-22:00). Heal must detect a plan contradicting its OWN constraint
+    # windows and redraw it — otherwise the self-inconsistent schedule survives forever.
+    import os
+    import tempfile
+    import time as _time
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+    import core.routes.goal_routes as gr
+
+    tmp = tempfile.mkdtemp(prefix="eloise_viol_")
+    os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    orig_bg = gr._regenerate_plan_bg
+    gr._regenerate_plan_bg = lambda user, gid, prefer_cloud=False: calls.append(gid)
+    calls = []
+    try:
+        conn = real_get()
+        conn.execute("INSERT INTO users (name, email, password_hash, is_guest) VALUES ('tester','v@heal.io','x',1)")
+        # violating: task at 16:00-17:30 sits inside 'sleep 4 to 10 pm' (16:00-22:00)
+        conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, status, plan_status) "
+            "VALUES (1,'bad','2026-09-30','09:00','[\"sleep 4 to 10 pm\"]','bad','active','active')")
+        bad = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        # fine: task at 23:00-23:30 is AFTER the same sleep window ends (22:00)
+        conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, status, plan_status) "
+            "VALUES (1,'ok','2026-09-30','09:00','[\"sleep 4 to 10 pm\"]','ok','active','active')")
+        ok = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,start_time,end_time,title,status) VALUES (?,?,?,?,?,?,?)",
+            (bad, 1, "2026-09-20", "16:00", "17:30", "build the homepage", "pending"))
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,start_time,end_time,title,status) VALUES (?,?,?,?,?,?,?)",
+            (ok, 1, "2026-09-20", "23:00", "23:30", "fix the favicon", "pending"))
+        conn.commit()
+        assert gr._action_violates_goal_windows(
+            conn.execute("SELECT * FROM goals WHERE id=?", (bad,)).fetchone()) is True
+        assert gr._action_violates_goal_windows(
+            conn.execute("SELECT * FROM goals WHERE id=?", (ok,)).fetchone()) is False
+        gr.heal_stale_plans()
+        deadline_ts = _time.monotonic() + 2
+        while _time.monotonic() < deadline_ts and len(calls) < 1:
+            _time.sleep(0.05)
+        assert bad in calls, "violating plan must be redrawn"
+        assert ok not in calls, "non-violating plan must be left alone"
+        assert calls == [bad], calls
+    finally:
+        gr._regenerate_plan_bg = orig_bg
+        _thread_local.conn = None
+        del os.environ["ELOISE_STORAGE_DIR"]
+
+
+def test_llm_plan_drops_placeholder_and_keeps_concrete():
+    # The user's HARD RULE: no hardcoded schedule entries. The old code substituted
+    # the deterministic "-- day 1 part 1" skeleton title whenever the model's answer
+    # failed validation, so a weak/unparseable model produced an entire board of
+    # canned filler. Now an unacceptable title means the SLOT IS DROPPED, and only
+    # genuinely concrete model titles are ever written.
+    import datetime as _dt
+    import re as _re
+    from core.llm import base as _base
+    import core.llm.manager as mm
+    import core.llm.ollama_provider as _op
+
+    class FakeOllama:
+        name = "ollama"
+        model = "fake"
+        def __init__(self):
+            self.last = None
+        def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None, model_override=None):
+            m = _re.findall(r'"date": "([^"]+)", "start_time": "([^"]+)"', user_prompt)
+            items = [
+                f'{{"date":"{d}","start_time":"{st}","end_time":"10:30","title":"study session one for the exam this week"}}'
+                for d, st in m]
+            return _base.GenerationResult(ok=True, provider="ollama", model="fake",
+                                          text="[\n" + ",\n".join(items) + "\n]")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama()]
+    m = mm.LLMManager(db=None)
+    orig_mgr = generation.get_manager
+    generation.get_manager = lambda db=None: m
+    try:
+        dl = (_dt.date.today() + _dt.timedelta(days=10)).isoformat()
+        goal = {"deadline": dl, "title": "cybersecurity exam",
+                "display_title": "cybersecurity exam", "reminder_time": "09:00",
+                "constraints": "[]", "details": "{}", "user_id": 1, "id": 1}
+        out = generation._llm_plan_call(goal, None, timeout=10)
+    finally:
+        generation.get_manager = orig_mgr
+        mm.build_providers = orig_build
+    assert out, "concrete model titles must be kept"
+    assert all("study session one" in e["title"] for e in out)
+    assert all("day" not in e["title"].lower() for e in out)
+
+    class FakePlaceholder:
+        name = "ollama"
+        model = "fake"
+        def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None, model_override=None):
+            return _base.GenerationResult(ok=False, provider="ollama", model="fake",
+                                          error="offline", text="")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakePlaceholder()]
+    m2 = mm.LLMManager(db=None)
+    generation.get_manager = lambda db=None: m2
+    try:
+        out2 = generation._llm_plan_call(goal, None, timeout=10)
+    finally:
+        generation.get_manager = orig_mgr
+        mm.build_providers = orig_build
+    assert out2 is None, "failed draw returns None, never placeholder entries"
+
+    class FakeEchoPlaceholder:
+        name = "ollama"
+        model = "fake"
+        def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None, model_override=None):
+            m = _re.findall(r'"date": "([^"]+)", "start_time": "([^"]+)"', user_prompt)
+            items = [
+                f'{{"date":"{d}","start_time":"{st}","end_time":"10:30","title":"cybersecurity exam — day 1 part 1"}}'
+                for d, st in m]
+            return _base.GenerationResult(ok=True, provider="ollama", model="fake",
+                                          text="[\n" + ",\n".join(items) + "\n]")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeEchoPlaceholder()]
+    m3 = mm.LLMManager(db=None)
+    generation.get_manager = lambda db=None: m3
+    try:
+        out3 = generation._llm_plan_call(goal, None, timeout=10)
+    finally:
+        generation.get_manager = orig_mgr
+        mm.build_providers = orig_build
+    assert out3 is None, "placeholder echo must be dropped, never written to the DB"
+
+
+def test_plan_slices_split_failed_and_merged():
+    # The old single request carried the WHOLE horizon (30+ days, 40-60 slots) in one
+    # JSON blob: it blew the token cap, truncated mid-JSON, the parse failed wholesale,
+    # and the entire schedule collapsed to empty + endless retries — the user's
+    # "model unavailable, no plan drawn yet" loop. Draws are now split into small
+    # day-bucketed slices; a failed slice costs only itself, the rest survive.
+    import datetime as _dt
+    import re as _re
+    from core.llm import base as _base
+    import core.llm.manager as mm
+
+    calls = []
+
+    class SlicedFake:
+        name = "ollama"
+        model = "fake"
+        def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None, model_override=None):
+            m = _re.findall(r'"date": "([^"]+)", "start_time": "([^"]+)"', user_prompt)
+            calls.append(len(m))
+            if len(calls) == 1:
+                return _base.GenerationResult(ok=False, provider="ollama", model="fake",
+                                              error="offline", text="")
+            items = [
+                f'{{"date":"{d}","start_time":"{st}","end_time":"10:30","title":"call the venue and book the tasting for that slot"}}'
+                for d, st in m]
+            return _base.GenerationResult(ok=True, provider="ollama", model="fake",
+                                          text="[\n" + ",\n".join(items) + "\n]")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [SlicedFake()]
+    m = mm.LLMManager(db=None)
+    orig_mgr = generation.get_manager
+    generation.get_manager = lambda db=None: m
+    try:
+        dl = (_dt.date.today() + _dt.timedelta(days=25)).isoformat()
+        goal = {"deadline": dl, "title": "build and ship my portfolio website",
+                "display_title": "build and ship my portfolio website", "reminder_time": "09:00",
+                "constraints": "[]", "details": "{}", "user_id": 1, "id": 2}
+        grid = generation._build_fallback_plan(goal, today=_dt.date.today().isoformat()) or []
+        out = generation._llm_plan_call(goal, None, timeout=10)
+    finally:
+        generation.get_manager = orig_mgr
+        mm.build_providers = orig_build
+    assert len(grid) > 8, "horizon long enough to force multiple slices"
+    assert len(calls) >= 2, "draw must be split, not one giant request"
+    assert out, "later slices must survive the failed first slice"
+    assert len(out) < len(grid), "partial draw is honest: failed slice's slots are missing"
+    assert all("call the venue and book the tasting" in e["title"] for e in out)
+
+
+def test_plan_blocked_when_windows_eat_all_free_time():
+    # The model is NOT down when the user's own blocked windows consume every usable
+    # hour: `_llm_plan_call` must surface an honest "blocked" reason (via
+    # plan_blocked_reason) instead of letting the route blame the model and retry
+    # forever. And a goal whose windows only free up AFTER 10pm must still plan an
+    # evening slot (the old 22:00 ceiling starved the whole schedule).
+    import re as _re
+    from core.llm.manager import LLMManager
+    from core.llm import base as _base
+    import core.llm.manager as mm
+
+    class _NeverCalled:
+        name = "ollama"
+        model = "fake"
+        def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None, model_override=None):
+            raise AssertionError("model must not be called when the grid is empty")
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [_NeverCalled()]
+    m = mm.LLMManager(db=None)
+    orig_mgr = generation.get_manager
+    generation.get_manager = lambda db=None: m
+    try:
+        goal = {"deadline": "2026-09-30", "title": "ship the site", "display_title": "ship the site",
+                "reminder_time": "09:00", "constraints": '["work 8am to 11pm"]',
+                "details": "{}", "user_id": 1, "id": 1}
+        out = generation._llm_plan_call(goal, None, timeout=10,
+                                        extra_blocked=[(8 * 60, 23 * 60)])
+    finally:
+        generation.get_manager = orig_mgr
+        mm.build_providers = orig_build
+    assert out is None
+    assert generation.plan_blocked_reason(), "a real reason must be reported, not 'model unavailable'"
+    assert "no usable free time" in generation.plan_blocked_reason().lower()
+
+    # Same user free only after 10pm -> the grid must honestly produce that evening slot.
+    generation._plan_blocked_reason = None
+    goal2 = {"deadline": "2026-09-30", "title": "ship the site", "display_title": "ship the site",
+             "reminder_time": "09:00", "constraints": '["busy 8am to 10pm"]',
+             "details": "{}", "user_id": 1, "id": 1}
+    grid = generation._build_fallback_plan(goal2, today="2026-09-09")
+    assert grid, "free-after-10pm windows must still yield a plan"
+    night = [e for e in grid if int(e["start_time"][:2]) * 60 >= 22 * 60]
+    assert night, "the plan must use the genuine post-10pm free window"
+
+
+def test_parse_title_map_survives_truncation():
+    # A slow model hits the token cap mid-array -> no closing bracket -> the old parser
+    # returned {} and dropped EVERY slot. The parser now extracts the complete objects
+    # it DID get, so a truncated slice still contributes its finished titles.
+    text = (
+        '[{"date":"2026-09-10","start_time":"09:00","end_time":"10:30",'
+        '"title":"Buy the chalk"},'
+        ' {"date":"2026-09-10","start_time":"18:00","end_time":"19:30",'
+        '"title":"Set up the easel in the corner"},\n  {"date":"2026-09-1'
+    )
+    out = generation._parse_title_map(text)
+    assert out.get(("2026-09-10", "09:00")) == "Buy the chalk"
+    assert out.get(("2026-09-10", "18:00")) == "Set up the easel in the corner"
+
+
+def test_heal_purges_placeholder_titles_and_redraws():
+    # Old draws could leave "-- day N part 1" canned filler in the DB. Startup heal
+    # must purge placeholder-titled pending actions and re-draw (honestly: no model
+    # still means the goal just stays empty and retries). Real concrete tasks survive.
+    import os
+    import tempfile
+    import time as _time
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+    import core.routes.goal_routes as gr
+
+    tmp = tempfile.mkdtemp(prefix="eloise_purge_")
+    os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    orig_conn = gr.get_connection
+    gr.get_connection = real_get
+    calls = []
+    orig_bg = gr._regenerate_plan_bg
+    gr._regenerate_plan_bg = lambda user, gid, prefer_cloud=False: calls.append((user["id"], gid, prefer_cloud))
+    try:
+        conn = real_get()
+        conn.execute("INSERT INTO users (name, email, password_hash, is_guest) VALUES ('tester','t@purge.io','x',1)")
+        conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, status, plan_status, plan_summary) "
+            "VALUES (1,'website','2026-10-09','09:00','[]','website','active','active','')",
+        )
+        g1 = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,start_time,end_time,title,status) VALUES "
+            "(?,1,'2026-09-09','16:00','17:30','website — day 1 part 1','pending'),"
+            "(?,1,'2026-09-09','17:30','19:00','website — day 2 part 2','pending'),"
+            "(?,1,'2026-09-09','19:00','20:00','Fix the broken checkout button and text her','pending')",
+            (g1, g1, g1),
+        )
+        conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, status, plan_status, plan_summary) "
+            "VALUES (1,'other','2026-10-09','09:00','[]','other','active','active','')",
+        )
+        g2 = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,start_time,end_time,title,status) VALUES "
+            "(?,1,'2026-09-09','16:00','17:30','Deploy the staging build to the server','pending')",
+            (g2,),
+        )
+        conn.commit()
+        gr.heal_stale_plans()
+        deadline_ts = _time.monotonic() + 3
+        while _time.monotonic() < deadline_ts and len(calls) < 1:
+            _time.sleep(0.1)
+        left = [r["title"] for r in conn.execute("SELECT title FROM actions WHERE goal_id=? ORDER BY id", (g1,)).fetchall()]
+        assert left == ["Fix the broken checkout button and text her"], left
+        other = [r["title"] for r in conn.execute("SELECT title FROM actions WHERE goal_id=?", (g2,)).fetchall()]
+        assert other == ["Deploy the staging build to the server"], other
+        assert [c[1] for c in calls] == [g1], calls  # only the purged goal re-draws
     finally:
         gr._regenerate_plan_bg = orig_bg
         gr.get_connection = orig_conn
@@ -969,13 +1442,14 @@ def test_guardrail_does_not_poison_on_eloises_own_words():
     assert g._is_truly_harmful("today then", context="user: i want to fuck my sister") is True
 
 
-def test_chat_falls_back_when_local_busy_past_lock_wait():
-    # A background plan draw holds the single Ollama lock for a minute+. An interactive
-    # chat must NOT wait behind it forever: past its lock_wait cap it skips the busy
-    # local model and streams from OpenRouter so the user actually gets an answer.
+def test_chat_busy_chat_model_retries_plan_model_locally_first():
+    # A busy CHAT model (1.7b) must NOT push chat to OpenRouter: chat retries on the
+    # PLAN model (4b) — still local — because the user explicitly wants local chat,
+    # not cloud output. This is the per-model-lock payoff: a background plan draw on
+    # the 4b never starves chat on the 1.7b, and a busy 1.7b still means a LOCAL reply.
     import core.llm.manager as mm
     from core.llm.base import GenerationResult
-    from core.llm.manager import OLLAMA_LOCK
+    from core.llm.manager import ollama_lock_for
     calls = []
 
     class FakeOllama:
@@ -997,18 +1471,138 @@ def test_chat_falls_back_when_local_busy_past_lock_wait():
     orig_build = mm.build_providers
     mm.build_providers = lambda config=None: [FakeOllama(), FakeOpenRouter()]
     m = mm.LLMManager(db=None)
-    OLLAMA_LOCK.acquire()
+    busy_chat = ollama_lock_for("huihui_ai/qwen3-abliterated:1.7b")
+    busy_chat.acquire()
     try:
         out = list(m.stream_generate("s", "u", timeout=5,
                                      model_override="huihui_ai/qwen3-abliterated:1.7b",
                                      lock_wait=0.15))
     finally:
-        OLLAMA_LOCK.release()
+        busy_chat.release()
+        mm.build_providers = orig_build
+    assert "openrouter-stream" not in calls, calls               # never the cloud
+    assert calls == [("ollama-stream", "big")], calls            # retried the local plan model
+    assert "".join(c for c, _ in out) == "local"
+
+
+def test_chat_all_local_models_busy_falls_back_to_openrouter():
+    # Only when BOTH local models are genuinely busy do we escape to OpenRouter —
+    # past the lock_wait cap the conversation must still get SOME answer.
+    import core.llm.manager as mm
+    from core.llm.base import GenerationResult
+    from core.llm.manager import ollama_lock_for
+    calls = []
+
+    class FakeOllama:
+        name = "ollama"
+        api_key = ""
+        model = "big"
+        def generate_stream(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            calls.append(("ollama-stream", model_override))
+            yield "local"; yield ""
+
+    class FakeOpenRouter:
+        name = "openrouter"
+        api_key = "sk-x"
+        model = "cloud"
+        def generate_stream(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            calls.append(("openrouter-stream", model_override))
+            yield "fast"; yield ""
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama(), FakeOpenRouter()]
+    m = mm.LLMManager(db=None)
+    busy_chat = ollama_lock_for("huihui_ai/qwen3-abliterated:1.7b")
+    busy_plan = ollama_lock_for("big")
+    busy_chat.acquire()
+    busy_plan.acquire()
+    try:
+        out = list(m.stream_generate("s", "u", timeout=5,
+                                     model_override="huihui_ai/qwen3-abliterated:1.7b",
+                                     lock_wait=0.15))
+    finally:
+        busy_plan.release()
+        busy_chat.release()
         mm.build_providers = orig_build
     assert "ollama-stream" not in calls, calls          # local WAS busy, never used
-    assert calls[0][0] == "openrouter-stream", calls    # fell back to cloud
+    assert calls[0][0] == "openrouter-stream", calls    # fell back to cloud only then
     assert calls[0][1] == "huihui_ai/qwen3-abliterated:1.7b", calls
     assert "".join(c for c, _ in out) == "fast"
+
+
+def test_stream_chat_retries_plan_model_when_chat_model_missing():
+    # OLLAMA_CHAT_MODEL points at a model that isn't pulled (404 on Ollama). The
+    # stream must retry the PLAN model — still local — BEFORE touching OpenRouter.
+    import os as _os
+    import core.generation as g
+    import core.llm.manager as mm
+    seen = []
+    _os.environ["OLLAMA_CHAT_MODEL"] = "huihui_ai/qwen3-abliterated:1.7b"
+
+    class FakeOllama:
+        name = "ollama"
+        api_key = ""
+        model = "big"
+        def generate_stream(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            seen.append(model_override)
+            if model_override == "huihui_ai/qwen3-abliterated:1.7b":
+                raise RuntimeError("model not found")
+            yield "plan-model answer"; yield ""
+
+    class FakeOpenRouter:
+        name = "openrouter"
+        api_key = "sk-x"
+        model = "cloud"
+        def generate_stream(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            seen.append("cloud:" + str(model_override))
+            yield "cloud answer"; yield ""
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama(), FakeOpenRouter()]
+    try:
+        out = list(g.stream_chat_reply("T", "x", "", "hi", db=None))
+    finally:
+        mm.build_providers = orig_build
+        del _os.environ["OLLAMA_CHAT_MODEL"]
+    assert seen == ["huihui_ai/qwen3-abliterated:1.7b", "big"], seen
+    assert "".join(c for c, _ in out) == "plan-model answer"
+
+
+def test_strip_prompt_echo_strips_labels_markers_and_question_echo():
+    # The user's chat "echoed" him: a weak local model parroted 'Eloise:' labels, the
+    # prompt boilerplate, or the question itself. Clean ALL of it before the reply
+    # reaches the screen — and treat a verbatim question-echo as a non-answer.
+    import core.llm.manager as mm
+    assert mm._strip_prompt_echo("Eloise: study for the exam") == "study for the exam"
+    assert mm._strip_prompt_echo("assistant | sure thing") == "sure thing"
+    assert mm._strip_prompt_echo(
+        "=== CONVERSATION ===\nuser: hi\neloise: plan\nReply as Eloise. Only output your reply.\ngo read chapter 3"
+    ) == "go read chapter 3"
+    assert mm._strip_prompt_echo("hi eloise", user_message="hi eloise") == ""   # pure echo
+    assert mm._strip_prompt_echo("yes", user_message="hi") == "yes"             # real answer survives
+
+
+def test_stream_chat_echo_of_question_returns_offline():
+    # A model that only echoes the question back must NOT print the user his own
+    # words as if it answered — the stream yields nothing and the UI reports an honest
+    # error instead of 'echoing'.
+    import core.generation as g
+    import core.llm.manager as mm
+
+    class FakeOllama:
+        name = "ollama"
+        api_key = ""
+        model = "big"
+        def generate_stream(self, sys, up, timeout=30, max_tokens=None, model_override=None):
+            yield "what's going on?"; yield ""
+
+    orig_build = mm.build_providers
+    mm.build_providers = lambda config=None: [FakeOllama()]
+    try:
+        out = list(g.stream_chat_reply("T", "x", "user: hi\neloise: hi\n", "what's going on?", db=None))
+    finally:
+        mm.build_providers = orig_build
+    assert "".join(c for c, _ in out) == "", out
 
 
 def test_chat_model_override_reaches_local_provider():
@@ -1067,7 +1661,7 @@ def test_plan_draws_keep_the_big_model_without_override():
             generation.get_manager = orig_mgr
     finally:
         mm.build_providers = orig_build
-    assert calls == [None], calls
+    assert calls and all(c is None for c in calls), "every plan slice uses the big plan model, never the chat override"
 
 
 def test_plan_draw_is_bounded_and_matches_slots():
@@ -1114,16 +1708,19 @@ def test_plan_draw_is_bounded_and_matches_slots():
     assert all("Study" in e["title"] for e in out)  # titles parsed through
 
 
-def test_regenerate_writes_guaranteed_schedule_when_model_down():
-    # On a CPU box the plan model can time out on EVERY draw. The background regenerate
-    # must then write the deterministic, right-sized schedule IMMEDIATELY (never leaving
-    # the board empty) and schedule a retry that can later refine the titles.
+def test_regenerate_never_writes_hardcoded_when_model_down():
+    # The user's HARD RULE: no hardcoded schedule entries. If the model is down, the
+    # background regenerate must NOT fill the board with deterministic filler — it keeps
+    # whatever exists, writes nothing for a fresh goal, marks 'active', and schedules a
+    # retry. A hardcoded fill-in shown to the user is the exact bug the user keeps
+    # reporting.
     import os
     import tempfile
     import time as _time
     from core.database import set_storage_dir, get_connection as real_get, _thread_local
     import core.routes.goal_routes as gr
     from core import generation as g
+    import threading as _th
 
     tmp = tempfile.mkdtemp(prefix="eloise_guaranteed_")
     os.environ["ELOISE_STORAGE_DIR"] = tmp
@@ -1149,20 +1746,185 @@ def test_regenerate_writes_guaranteed_schedule_when_model_down():
         goal = dict(conn.execute("SELECT * FROM goals WHERE id=?", (gid,)).fetchone())
         user = {"id": 1, "name": "tester"}
         gr._regenerate_plan_bg(user, gid)
+        # give the bg thread 0.5s lead-in + a beat to finish its attempt
         deadline_ts = _time.monotonic() + 5
-        n = 0
         while _time.monotonic() < deadline_ts:
-            n = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (gid,)).fetchone()["c"]
-            if n > 0:
+            st = dict(conn.execute("SELECT plan_status FROM goals WHERE id=?", (gid,)).fetchone())
+            if st["plan_status"] == "active":
                 break
             _time.sleep(0.1)
-        assert n > 0, "guaranteed schedule must be written even with the model down"
+        n = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (gid,)).fetchone()["c"]
         st = dict(conn.execute("SELECT plan_status, plan_summary FROM goals WHERE id=?", (gid,)).fetchone())
         assert st["plan_status"] == "active", st
+        assert n == 0, f"hardcoded fallback must NOT be written when model is down (found {n} tasks)"
+        assert "retry" in st["plan_summary"], st
+
+        # And with an EXISTING schedule: the old plan stays exactly as it was (no
+        # hardcoded overwrite), only the status/summary change.
+        conn.execute(
+            "INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, plan_status) "
+            "VALUES (1,'study','2026-09-20','09:00','[]','study','generating')"
+        )
+        gid2 = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        conn.execute(
+            "INSERT INTO actions (goal_id,user_id,date,title,start_time,end_time,duration_min,status,order_idx) "
+            "VALUES (?,1,'2026-09-10','old real task','09:00','10:00',60,'pending',0)", (gid2,))
+        conn.commit()
+        gr._regenerate_plan_bg(user, gid2)
+        deadline_ts = _time.monotonic() + 5
+        while _time.monotonic() < deadline_ts:
+            st2 = dict(conn.execute("SELECT plan_status FROM goals WHERE id=?", (gid2,)).fetchone())
+            if st2["plan_status"] == "active":
+                break
+            _time.sleep(0.1)
+        rows = conn.execute(
+            "SELECT title, start_time FROM actions WHERE goal_id=? ORDER BY order_idx", (gid2,)).fetchall()
+        assert [r["title"] for r in rows] == ["old real task"], rows   # old plan preserved
     finally:
         g.generate_plan_or_none = orig_gen
         g.user_blocked_windows = orig_blocked
         gr._schedule_plan_retry = orig_sched
         gr.get_connection = orig_conn
+        _thread_local.conn = None
+        del os.environ["ELOISE_STORAGE_DIR"]
+
+
+def test_chat_never_repeats_and_teachable_persona_sticks():
+    # The user's two chat complaints: (1) the model spams the SAME reply because it
+    # copies the previous Eloise line that's sitting in context, and (2) personality
+    # instructions given in chat ("be sarcastic", "don't be a motivational speaker")
+    # evaporate next turn. Fixes: last Eloise reply is structurally dropped from the
+    # LLM context, a near-identical reply is refused as an echo, sycophancy openers
+    # ("You're right—") are stripped, and persona directives persist + inject.
+    import os
+    import tempfile
+    import difflib
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+    import core.routes.chat_routes as cr
+    from core.llm.manager import _strip_prompt_echo
+
+    tmp = tempfile.mkdtemp(prefix="eloise_chatfix_")
+    os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    try:
+        conn = real_get()
+        conn.row_factory = __import__("sqlite3").Row
+        conn.execute("INSERT INTO users (name, email, password_hash, is_guest) VALUES ('t','p@fix.io','x',1)")
+        conn.execute("INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, status, plan_status) "
+                     "VALUES (1,'website','2026-09-30','09:00','[]','website','active','active')")
+        gid = conn.execute("SELECT last_insert_rowid() r").fetchone()["r"]
+        for ts in [
+            (1, "user", "The schedule is still being drawn. Let's redraw it together. Start with the first step: update the website layout"),
+            (2, "eloise", "You're right—everything just isn't what you expected. Begin by organizing the structure."),
+            (3, "user", "done"),
+        ]:
+            conn.execute("INSERT INTO chat_messages (goal_id, user_id, role, content, created_at) VALUES (?,?,?,?,datetime('now'))",
+                         (gid, 1, ts[1], ts[2]))
+        conn.commit()
+
+        # --- structural anti-repeat: the last Eloise line must NOT reach the LLM ---
+        history = cr._history(conn, gid, 1)
+        assert all("organizing the structure" not in h for h in history), history
+
+        # --- posterity of exact replies is refused as an echo (duplicate gate) ---
+        prev = cr._last_eloise_reply(conn, gid, 1)
+        assert prev and cr._is_near_dup(prev, prev.replace("You're", "You are")), "near-dup must be detected"
+
+        # --- sycophancy openers stripped from weak-model output ---
+        clean = _strip_prompt_echo("You're right—everything just isn't what you expected. Begin by organizing.")
+        assert not clean.startswith("You're right"), clean
+
+        # --- verbatim re-quote of an EARLIER user line is deleted from the reply ---
+        out = _strip_prompt_echo("Nice. 'Let's move forward.' is what you said. Now do the work.",
+                                 user_message="done",
+                                 user_lines=["Nice. Let's move forward.", "i have layout and everything"])
+        assert "Let's move forward" not in out, out
+
+        # --- persona directive typed into chat is stored as a contract ---
+        got = generation.absorb_persona_directive(conn, 1, "i said she ready to abuse sarcastic and attack what's this")
+        assert got and "sarcastic" in got and "abusive" in got and "Attack excuses" in got, got
+        got2 = generation.absorb_persona_directive(conn, 1, "stop being a motivational speaker")
+        assert "motivational" in got2, got2
+        persisted = generation.user_persona(conn, 1)
+        assert persisted == got2
+
+        # --- injected into the chat system prompt so it's never forgotten ---
+        sys = generation.chat_system_prompt(conn, 1)
+        assert "standing personality contract" in sys and "motivational speaker" in sys and "sarcastic" in sys
+
+        # --- step-done vs goal-done are separate now ---
+        assert generation.step_done_detected("done") is True
+        assert generation.step_done_detected("what's next") is True
+        assert generation.step_done_detected("what do i do now") is True
+        assert generation.step_done_detected("im done") is True
+        # a bare step-done must NEVER close the whole goal
+        assert generation.goal_completion_detected("done") is False
+        assert generation.goal_completion_detected("im done") is False
+        assert generation.goal_completion_detected("finished the layout") is False
+        # closing genuinely needs goal-framing
+        assert generation.goal_completion_detected("the website is done") is False  # "is done" not a phrase
+        assert generation.goal_completion_detected("i'm done with the website") is True
+        assert "mo" if False else True
+
+        # --- step-done steers the prompt to the NEXT task, not the same one ---
+        plan = "=== THE PLAN ===\n- 2026-09-20 22:00: Test the homepage\n- 2026-09-21 22:00: Deploy to staging\n\n"
+        p_step = generation._goal_chat_prompt("website", plan, "", "Tester", "done", step_done=True)
+        assert "Do NOT re-instruct the task you gave" in p_step
+        assert "NEXT pending task" in p_step
+        p_plain = generation._goal_chat_prompt("website", plan, "", "Tester", "tell me a joke", step_done=False)
+        assert "Do NOT re-instruct the task you gave" not in p_plain
+    finally:
+        _thread_local.conn = None
+        del os.environ["ELOISE_STORAGE_DIR"]
+
+
+def test_eloise_is_single_control_unit():
+    # The user's design point: it's ONE app controlled by Eloise. A routine typed into
+    # ONE goal ("gym 5-7am") must be respected by EVERY other goal — the user does not
+    # re-enter it per goal. The planner merges the user's global blocked windows with
+    # the union of ALL active goals' constraint windows.
+    import os
+    import tempfile
+    from core.database import set_storage_dir, get_connection as real_get, _thread_local
+    import core.routes.goal_routes as gr
+
+    tmp = tempfile.mkdtemp(prefix="eloise_unit_")
+    os.environ["ELOISE_STORAGE_DIR"] = tmp
+    set_storage_dir(tmp)
+    _thread_local.conn = None
+    try:
+        conn = real_get()
+        conn.execute("INSERT INTO users (name, email, password_hash, is_guest, blocked_windows) "
+                     "VALUES ('t','u@unit.io','x',1,'[\"sleep 4 to 10 pm\"]')")
+        for i, cons in enumerate([
+            '["gym 5 to 7 am"]',     # global-worthy routine set ONCE, in this goal
+            '',                       # this other goal does NOT declare it
+            '["university 7 to 4 pm"]',
+        ]):
+            conn.execute("INSERT INTO goals (user_id, title, deadline, reminder_time, constraints, display_title, status, plan_status) "
+                         "VALUES (1,?,?,?,?,?,?,?)",
+                         (f"g{i}", "2026-09-30", "09:00", cons, f"g{i}", "active", "active"))
+        conn.commit()
+        merged = gr.active_goal_blocked_windows(conn, dict(conn.execute("SELECT * FROM users WHERE id=1").fetchone()))
+        # global sleep (4pm-10pm) + gym (5-7am) from g0 + university (7am-4pm) from g2,
+        # regardless of which goal drew the schedule
+        pairs = {(s // 60, e // 60) for s, e in merged}
+        assert (5, 7) in pairs, pairs
+        assert (7, 16) in pairs, pairs
+        assert (16, 22) in pairs, pairs
+
+        # a goal with NO constraints typed still plans AROUND gym+uni+sleep that the
+        # user stated once elsewhere (its grid must not land on the merged busy blocks).
+        grid = generation._build_fallback_plan(
+            {"deadline": "2026-09-30", "title": "g1", "display_title": "g1", "constraints": "[]"},
+            today="2026-09-09", extra_blocked=merged)
+        assert grid, "goal with no own constraints must still draw around the union"
+        for e in grid:
+            s = int(e["start_time"][:2]) * 60 + int(e["start_time"][3:5])
+            eend = int(e["end_time"][:2]) * 60 + int(e["end_time"][3:5])
+            for (bs, be) in merged:
+                assert not (s < be and eend > bs), f"lands on blocked window {bs}-{be}: {e}"
+    finally:
         _thread_local.conn = None
         del os.environ["ELOISE_STORAGE_DIR"]

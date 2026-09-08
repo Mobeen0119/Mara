@@ -1,9 +1,12 @@
 import json
+import logging
 import os
 import re
 from datetime import date, datetime, timedelta
 
 from core.llm import LLMManager
+
+logger = logging.getLogger("eloise.plan")
 from core.llm.manager import _VERDICT_ECHO, _strip_prompt_echo
 from core.persona import (
     BASE_SYSTEM_PROMPT,
@@ -26,9 +29,14 @@ _manager = None
 _MAX_CHAT_TOKENS = 120
 
 # Plan draws have their own output ceiling so a slow CPU box FINISHES instead of
-# timing out mid-JSON. If the cap cuts a reply short, the titles fall back to the
-# deterministic schedule's titles — the schedule is never left empty by a slow model.
+# timing out mid-JSON. A single request CANNOT carry a whole month (60+ slots blow
+# the budget, the model truncates mid-JSON, the parse fails, and the entire plan
+# collapses to empty + infinite retries). So one draw is split into small
+# day-bucketed slices — each request is short enough for a slow/weak/free model to
+# finish, and a failed slice only costs itself, never the whole schedule.
 _MAX_PLAN_TOKENS = 1536
+_PLAN_SLICE_TARGET_SLOTS = 8
+_PLAN_SLICE_MAX_CALLS = 8
 
 # Chat can be routed to a FASTER local model (e.g. a 1.7b instead of the 4b used for
 # plans) so conversations feel instant while background plan draws keep the bigger
@@ -42,14 +50,24 @@ def _chat_model_override():
 
 
 def _chat_lock_wait():
-    """How long an interactive chat waits for the shared local model before giving up
-    on it and falling back to OpenRouter. Short: a plan draw hogging the CPU must not
-    freeze the conversation."""
-    return 12
+    """How long an interactive chat waits for its local CHAT model lock before giving
+    up. Chat (a small fast model) holds its OWN per-model lock, so it no longer queues
+    behind plan draws on the big model — a contended lock now means another chat is
+    mid-reply, worth waiting for. Past the cap, and only then, it may fall back."""
+    return 30
 
 # Which provider drew the most recent plan (set by _llm_plan_call / _chat_llm), so
 # the UI can honestly report "drawn by local / drawn by openrouter".
 _last_provider = None
+
+# When the user's own blocked windows consume every usable slot in a day, the honest
+# truth is NOT "the model is down" — it's "your windows leave no free time", and the
+# schedule must say exactly that instead of retrying a model that isn't the problem.
+_plan_blocked_reason = None
+
+
+def plan_blocked_reason():
+    return _plan_blocked_reason
 
 
 def last_provider():
@@ -63,6 +81,122 @@ def get_manager(db=None):
     return _manager
 
 
+# ---------------------------------------------------------------------------
+# Personality contract
+# ---------------------------------------------------------------------------
+# The user can teach Eloise her personality in plain chat ("be sarcastic",
+# "don't be a motivational speaker", "act like you'd abuse me if you could").
+# Whoever says it ONCE expects it to stick forever, but a weak model forgets it
+# next turn. So we sniff these directives out of chat messages, store them on the
+# user, and inject them into EVERY system prompt as a standing override.
+_PERSONA_TRIGGERS = {
+    "motivational": "NEVER be a motivational speaker, cheerleader, or hype-person. No 'you can do it!', no pumping-up, no empty positivity. Be dry and real instead.",
+    "sarcast": "Be wry, dry and sarcastic by default — make it obvious you are not impressed.",
+    "abuse": "Be playfully abusive with excuses: mock them hard before redirecting. Behaviour gets mocked, they do not (no genuine cruelty, no threats, no insults about who they are).",
+    "abusive": "Be playfully abusive with excuses: mock them hard before redirecting. Behaviour gets mocked, they do not (no genuine cruelty, no threats, no insults about who they are).",
+    "insult": "Roast them lightly and regularly — tease, don't wound.",
+    "roast": "Roast them lightly and regularly — tease, don't wound.",
+    "mean": "Be unsparingly honest. Soft-pedalling and reassurance are banned.",
+    "attack": "Attack excuses and procrastination directly, every time you catch it.",
+    "nasty": "Turn the cheek-teasing up; stay funny, stay legal.",
+}
+
+
+def user_persona(db, user_id):
+    try:
+        row = db.execute("SELECT persona FROM users WHERE id=?", (user_id,)).fetchone()
+        return (row and row["persona"]) or ""
+    except Exception:
+        return ""
+
+
+def absorb_persona_directive(db, user_id, message):
+    """If the user just set Eloise's personality in plain chat, store it as a
+    standing contract. Returns the (possibly new) stored persona, else ''."""
+    t = (message or "").lower()
+    clauses = []
+    for key, clause in _PERSONA_TRIGGERS.items():
+        if key in t and clause not in clauses:
+            clauses.append(clause)
+    if not clauses:
+        return ""
+    stored = user_persona(db, user_id)
+    merged = stored
+    for c in clauses:
+        if c not in merged:
+            merged = (merged + "\n" + c).strip()
+    try:
+        db.execute("UPDATE users SET persona=? WHERE id=?", (merged, user_id))
+        db.commit()
+    except Exception:
+        return stored
+    return merged
+
+
+def chat_system_prompt(db, user_id):
+    sys = BASE_SYSTEM_PROMPT
+    p = user_persona(db, user_id)
+    if p:
+        sys += (
+            "\n\nYou have a standing personality contract with this user that they set "
+            "explicitly. It OVERRIDES the default tone above. Follow it to the letter:\n" + p
+        )
+    return sys
+
+
+# ---------------------------------------------------------------------------
+# Step completion vs goal completion
+# ---------------------------------------------------------------------------
+# The user reports finishing the CURRENT STEP ("done", "finished the layout") far
+# more often than the WHOLE goal. The plan chat must treat those as different:
+# a step-done means "name the NEXT task from the plan, do not re-instruct the one
+# just finished". Closing the entire goal must stay rare and require real evidence.
+_STEP_DONE_RE = re.compile(
+    r"^\s*(done|did it|did that|finished|finished it|done with it|done with that|"
+    r"got it done|wrapped( up)?|moved on|next|next step|what('| i)?s next|what do i do now|"
+    r"ok done|yeah done|all set|im done|i'm done|i am done|onto the next|on to the next)\s*[.!]?\s*$",
+    re.I,
+)
+_GOAL_DONE_STRONG = [
+    "the goal", "this goal", "whole thing", "the website", "the site", "the startup",
+    "shipped", "launched", "submitted", "published", "released", "deployed",
+    "the phase", "the project", "goal is done", "goal's done", "goal is complete",
+    "deadline", "finished the goal", "done with the goal", "completed the goal",
+]
+
+
+def step_done_detected(message):
+    """True when the user implies the CURRENT task/step is finished and wants
+    forward motion. Wider than goal completion on purpose: it only steers the
+    prompt (name the NEXT task), it never writes to the DB."""
+    text = (message or "").strip()
+    if not text or len(text.split()) > 16:
+        return False
+    if "?" in text and not re.search(r"what('| i)?s next|next\b", text.lower()):
+        return False
+    low = text.lower()
+    if _STEP_DONE_RE.match(text):
+        return True
+    if any(p in low for p in (" done ", "done with ", "finished ", "finished the ", "did it")):
+        return True
+    if "done" == low or low in ("nice", "good", "ok"):
+        return True
+    return False
+
+
+def goal_completion_detected(message):
+    """Auto-closing a whole goal is destructive, so it needs BOTH a completion
+    phrase AND a goal-level framing. Bare step-done chatter ('done', 'i'm done')
+    must never close the file."""
+    text = (message or "").strip()
+    if not text or len(text.split()) > 16:
+        return False
+    low = text.lower()
+    if not completion_detected(message):
+        return False
+    return any(w in low for w in _GOAL_DONE_STRONG)
+
+
 GUARDRAIL_REFUSAL = (
     "That doesn't belong on this board, and I won't plan it. If this involves a family "
     "member or a minor, or anyone without full consent, it's not something Eloise touches. "
@@ -71,7 +205,7 @@ GUARDRAIL_REFUSAL = (
 )
 
 
-def _chat_llm(sys_prompt, user_prompt, db):
+def _chat_llm(sys_prompt, user_prompt, db, user_message=""):
     """Call the real model with NO canned fallback. If the model can't be reached,
     returns ("", "offline") — the caller surfaces that as a genuine error, never as
     fabricated Eloise text. The user explicitly wants no hardcoded replies."""
@@ -85,7 +219,8 @@ def _chat_llm(sys_prompt, user_prompt, db):
     if _VERDICT_ECHO.search(result.text[:80]):
         return "", "offline"
     _last_provider = result.provider or "llm"
-    return _strip_prompt_echo(result.text), result.provider or "llm"
+    cleaned = _strip_prompt_echo(result.text, user_message=user_message)
+    return cleaned, result.provider or "llm"
 
 
 def _pick(items):
@@ -172,22 +307,6 @@ def days_remaining(deadline, today=None):
 # Chat
 # ---------------------------------------------------------------------------
 
-def _strip_prompt_echo(text):
-    """Post-process LLM output: strip any prompt template the model echoed back."""
-    if not text:
-        return text
-    # Remove common prompt fragments the model might echo
-    for marker in ["User just said:", "Reply:", "Respond as Eloise.", "Context:",
-                    "Conversation history:", "Recent conversation:", "Current board:"]:
-        idx = text.find(marker)
-        if idx >= 0:
-            # If the marker appears mid-response, keep only what's before it
-            before = text[:idx].strip()
-            if before:
-                return before
-    return text.strip()
-
-
 def _global_chat_prompt(summary, history, user_name, message):
     return (
         f"=== BOARD STATE ===\n{summary}\n\n"
@@ -209,7 +328,16 @@ def _global_chat_prompt(summary, history, user_name, message):
     )
 
 
-def _goal_chat_prompt(goal_name, plan_section, history, user_name, message):
+def _goal_chat_prompt(goal_name, plan_section, history, user_name, message, step_done=False):
+    step_rule = ""
+    if step_done:
+        step_rule = (
+            f"- The user just reported the CURRENT step done, or is moving on. Do NOT "
+            f"re-instruct the task you gave a moment ago and do NOT repeat a task line "
+            f"already quoted earlier in CONVERSATION. Name the NEXT pending task from THE "
+            f"PLAN (quote its exact title and time). If no other task exists, say this was "
+            f"the only task left and ask if they want you to redraw the schedule.\n"
+        )
     return (
         f"=== GOAL ===\n{goal_name}\n\n"
         f"{plan_section}"
@@ -217,6 +345,12 @@ def _goal_chat_prompt(goal_name, plan_section, history, user_name, message):
         f"=== {user_name} says ===\n{message}\n\n"
         f"Reply as Eloise. This is a conversation: read the LATEST question and answer that "
         f"exactly, instead of repeating your earlier answers:\n"
+        f"- If THE PLAN says no schedule has been drawn yet, then THERE IS NO concrete task to "
+        f"point at. Say in ONE line that the schedule is still being drawn (the plan model is "
+        f"unreachable or failing right now) and offer to redraw it. Do NOT invent tasks, phases, "
+        f"or a 'next step' — there is nothing on the board to quote. Answer general advice from "
+        f"the GOAL and conversation only, never a phase checklist.\n"
+        f"{step_rule}"
         f"- They ask 'what do I do now' -> name ONE concrete step from THE PLAN and how to start it.\n"
         f"- They ask what to SAY (a call, a text, to the person) -> give a short script of actual "
         f"words they can say.\n"
@@ -249,56 +383,112 @@ def _goal_chat_prompt(goal_name, plan_section, history, user_name, message):
     )
 
 
-def generate_global_chat_reply(user_name, goals_summary, history, message, db=None):
-    sys = BASE_SYSTEM_PROMPT
+def _clean_local_stream(stream_iter, user_message="", user_lines=None):
+    """Buffer a chat stream, strip any prompt echo / role-label / verbatim-question
+    repetition a weak local model produces, and re-emit the cleaned reply ONCE, then a
+    terminal ('', source) so the caller knows which provider answered. Yields ONLY the
+    terminal when the model merely echoed — the route reports an honest 'offline'
+    instead of printing the user's own words back at them."""
+    buf = []
+    source = None
+    try:
+        for chunk, src in stream_iter:
+            if src and src != "offline":
+                source = src
+            if chunk:
+                buf.append(chunk)
+            elif src is not None:
+                break  # '' marks the stream's clean completion
+    except RuntimeError:
+        raise
+    cleaned = _strip_prompt_echo("".join(buf), user_message=user_message, user_lines=user_lines)
+    if cleaned:
+        yield cleaned, (source or "ollama")
+    yield "", (source or "ollama")
+
+
+def generate_global_chat_reply(user_name, goals_summary, history, message, db=None, persona=""):
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
     user_prompt = _global_chat_prompt(summary, history, user_name, message)
     if _is_truly_harmful(message, context=history):
         return GUARDRAIL_REFUSAL, "guardrail"
-    return _chat_llm(sys, user_prompt, db)
+    return _chat_llm(sys, user_prompt, db, user_message=message)
 
 
-def stream_global_chat_reply(user_name, goals_summary, history, message, db=None):
-    """Same as generate_global_chat_reply but streams text chunks."""
-    sys = BASE_SYSTEM_PROMPT
+def stream_global_chat_reply(user_name, goals_summary, history, message, db=None, persona=""):
+    """Same as generate_global_chat_reply but streams text chunks (echo-cleaned)."""
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
     user_prompt = _global_chat_prompt(summary, history, user_name, message)
     if _is_truly_harmful(message, context=history):
         yield GUARDRAIL_REFUSAL, "guardrail"
         return
-    for chunk, source in get_manager(db).stream_generate(
+    yield from _clean_local_stream(get_manager(db).stream_generate(
         sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
         model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
-    ):
-        yield chunk, source
+    ), user_message=message)
 
 
-def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_lines=""):
-    sys = BASE_SYSTEM_PROMPT
-    plan_section = (
-        f"=== THE PLAN (your scheduled tasks) ===\n{plan_lines}\n\n" if plan_lines else ""
+def _plan_section(plan_lines):
+    if plan_lines:
+        return f"=== THE PLAN (your scheduled tasks) ===\n{plan_lines}\n\n"
+    return (
+        "=== THE PLAN ===\n(No schedule has been drawn for this goal yet — the plan model is "
+        "unreachable or failing right now, so there are no concrete tasks to point at. Say so "
+        "honestly instead of inventing a step, and offer to redraw the schedule.)\n\n"
     )
-    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message)
+
+
+def _with_persona(base, persona):
+    if not persona:
+        return base
+    return (
+        base
+        + "\n\nYou have a standing personality contract with this user that they set "
+        "explicitly. It OVERRIDES the default tone above. Follow it to the letter:\n"
+        + persona
+    )
+
+
+def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_lines="",
+                        persona="", step_done=False):
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
+    plan_section = _plan_section(plan_lines)
+    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
+                                    step_done=step_done)
     if _is_truly_harmful(message, context=history):
         return GUARDRAIL_REFUSAL, "guardrail"
-    return _chat_llm(sys, user_prompt, db)
+    return _chat_llm(sys, user_prompt, db, user_message=message)
 
 
-def stream_chat_reply(user_name, goal_name, history, message, db=None, plan_lines=""):
-    """Same as generate_chat_reply but streams text chunks. Yields (chunk, source)."""
-    sys = BASE_SYSTEM_PROMPT
-    plan_section = (
-        f"=== THE PLAN (your scheduled tasks) ===\n{plan_lines}\n\n" if plan_lines else ""
-    )
-    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message)
+def stream_chat_reply(user_name, goal_name, history, message, db=None, plan_lines="",
+                      persona="", step_done=False):
+    """Same as generate_chat_reply but streams text chunks (echo-cleaned). Yields
+    (chunk, source)."""
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
+    plan_section = _plan_section(plan_lines)
+    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
+                                    step_done=step_done)
     if _is_truly_harmful(message, context=history):
         yield GUARDRAIL_REFUSAL, "guardrail"
         return
-    for chunk, source in get_manager(db).stream_generate(
+    yield from _clean_local_stream(get_manager(db).stream_generate(
         sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
         model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
-    ):
-        yield chunk, source
+    ), user_message=message, user_lines=_history_user_lines(history))
+
+
+def _history_user_lines(history):
+    """Pull the user's OWN prior lines out of the formatted history string so the
+    stream cleaner can strip the model re-quoting them verbatim."""
+    out = []
+    if not history:
+        return out
+    for ln in history.split("\n"):
+        if ln.strip().lower().startswith(("user:", "user|")):
+            out.append(ln.split(":", 1)[1].strip()[:200])
+    return out
 
 
 def generate_opening_message(user_name, goal_summary, db=None):
@@ -362,33 +552,61 @@ def normalize_time(t):
 
 
 def parse_time_window(text):
-    """Parse a window like '11pm-7am', '3pm-5pm', '5-7pm', '9:00-12:00' or 'gym 5-7pm'.
-    Returns (start_min, end_min) in minutes from midnight, handling overnight."""
+    """Parse a window like '11pm-7am', '3pm-5pm', '5-7pm', '9:00-12:00', 'gym 5-7pm',
+    'uni 6 to 2 pm' or 'work 9 to 5'.
+    Returns (start_min, end_min) in minutes from midnight, handling overnight.
+    The old parser applied the last explicit am/pm to ALL bare numbers before it,
+    so 'uni 6 to 2 pm' became 6pm-2am (1080, 2280) instead of 6am-2pm (360, 840),
+    and a window with no am/pm at all ('work 9 to 5') was silently dropped — both
+    corrupt the user's 'always busy' silhouette and starve every schedule grid."""
     text = text or ""
     low = text.lower()
-    numbers = re.findall(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", low)
-    # Determine the meridian context: the last explicit am/pm in the string
-    # applies to any bare 12h numbers that precede it (e.g. "5-7pm" -> 5pm).
-    tail_mer = ("pm" if re.search(r"pm(?!\w)", low) else "am") if re.search(r"(?:am|pm)(?!\w)", low) else None
-
-    times = []
-    for num, minute, mer in numbers:
-        hh = int(num)
-        mm = int(minute) if minute else 0
-        if mer:
-            times.append(_hh_12_to_24(hh, mer) * 60 + mm)
-        elif minute:
-            times.append(hh * 60 + mm)
-        elif tail_mer:
-            times.append(_hh_12_to_24(hh, tail_mer) * 60 + mm)
-        elif times:
-            times.append(hh * 60 + mm)
-
-    if len(times) < 2:
+    m = re.findall(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", low)
+    if len(m) < 2:
         return None
+    entries = [(int(n), int(mm) if mm else 0, mer) for n, mm, mer in m]
+    n = len(entries)
+    has_any = any(mer for _, _, mer in entries)
+
+    if not has_any:
+        # No am/pm anywhere. Prefer a same-meridian block ("9:00-9:30", "9:00-12:00")
+        # and only read it as start-am/end-pm when that would be invalid backwards
+        # ("9 to 5" -> 9am-5pm, not 9am-5am).
+        start = _hh_12_to_24(entries[0][0], "am") * 60 + entries[0][1]
+        end = _hh_12_to_24(entries[-1][0], "am") * 60 + entries[-1][1]
+        if end <= start:
+            start = _hh_12_to_24(entries[0][0], "am") * 60 + entries[0][1]
+            end = _hh_12_to_24(entries[-1][0], "pm") * 60 + entries[-1][1]
+        return (start, end)
+
+    times = [None] * n
+    for i, (hh, mm, mer) in enumerate(entries):
+        if mer:
+            times[i] = _hh_12_to_24(hh, mer) * 60 + mm
+    # Bare numbers inherit the nearest explicit meridian to their RIGHT, else LEFT.
+    for i in range(n):
+        if times[i] is not None:
+            continue
+        inh = None
+        for j in range(i + 1, n):
+            if entries[j][2]:
+                inh = entries[j][2]
+                break
+        if inh is None:
+            for j in range(i - 1, -1, -1):
+                if entries[j][2]:
+                    inh = entries[j][2]
+                    break
+        inh = inh or "am"
+        times[i] = _hh_12_to_24(entries[i][0], inh) * 60 + entries[i][1]
+
     start, end = times[0], times[-1]
+    # "X to Y pm" with a bare leading hour >= the trailing pm hour reads as
+    # X am - Y pm ("uni 6 to 2 pm" = 6am-2pm), unless X is noon ("12-2pm").
+    if not entries[0][2] and entries[-1][2] == "pm" and entries[0][0] >= entries[-1][0]:
+        start = _hh_12_to_24(entries[0][0], "pm" if entries[0][0] == 12 else "am") * 60 + entries[0][1]
     if end < start:
-        return (start, end + 24 * 60)
+        end += 24 * 60
     return (start, end)
 
 
@@ -504,7 +722,38 @@ def user_blocked_windows(user):
     return out
 
 
-def _build_fallback_plan(goal, today=None, extra_blocked=None):
+def user_calendar_busy(db, user_id, exclude_goal_id, start_date, end_date):
+    """Map date -> [(start_min, end_min), ...] of this user's OTHER goals' pending
+    actions in [start_date, end_date]. Lets a plan's slot grid avoid the user's real
+    calendar (other goals already occupying time), not just declared busy windows."""
+    busy = {}
+    if db is None:
+        return busy
+    try:
+        rows = db.execute(
+            "SELECT date, start_time, end_time FROM actions "
+            "WHERE user_id=? AND goal_id!=? AND status!='done' "
+            "AND date>=? AND date<=?",
+            (user_id, exclude_goal_id, start_date, end_date),
+        ).fetchall()
+    except Exception:
+        return busy
+    for r in rows:
+        s, e = None, None
+        try:
+            hs, ms = r["start_time"].split(":")
+            s = int(hs) * 60 + int(ms)
+            he, me = r["end_time"].split(":")
+            e = int(he) * 60 + int(me)
+        except Exception:
+            s = e = None
+        if s is None or e is None:
+            continue
+        busy.setdefault(r["date"], []).append((s, e))
+    return busy
+
+
+def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None):
     today = today or date.today().isoformat()
     deadline = goal["deadline"]
     days = max(days_remaining(deadline, today), 1)
@@ -539,9 +788,9 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
         return _hookup_arc(today, deadline, blocked, details,
                            goal.get("title") or goal["display_title"])
 
-    def _day_bounds():
+    def _day_bounds(day_date=None):
         # convert blocked windows into a busy silhouette over one day (minutes 0-1439),
-        # splitting overnight windows across midnight
+        # splitting overnight windows across midnight, plus other goals' booked blocks
         busy = []
         for (s, e) in blocked:
             s = s % (24 * 60)
@@ -551,6 +800,8 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
                 busy.append((0, e - 24 * 60))
             else:
                 busy.append((s, e))
+        if busy_by_date and day_date:
+            busy.extend(busy_by_date.get(day_date, []))
         busy.sort()
         merged = []
         for (s, e) in busy:
@@ -560,20 +811,20 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
                 merged.append((s, e))
         return merged
 
-    def _free_from(busy, start, taken):
-        # earliest (s, e) 90-min window starting >= start that avoids every busy block
-        # and every slot already taken this day
+    def _free_from(busy, start, taken, span=90):
+        # earliest (s, e) window of `span` minutes starting >= start that avoids
+        # every busy block and every slot already taken this day
         obstacles = sorted(busy + list(taken))
         cur = start
         for (bs, be) in obstacles:
             if be <= cur:
                 continue
-            if bs >= cur + 90:
+            if bs >= cur + span:
                 break
             cur = be
-        if cur + 90 > 22 * 60:
+        if cur + span > 23 * 60:
             return None
-        return (cur, cur + 90)
+        return (cur, cur + span)
 
     # How many sessions a day gets is NOT a fixed '2-3'. It follows the deadline and
     # the time that day actually has, so it can be MORE than 8 on a fully free day for
@@ -590,14 +841,23 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
     else:
         wanted = 1
 
-    def slots_in_day():
-        busy = _day_bounds()
+    def slots_in_day(day_date=None):
+        busy = _day_bounds(day_date)
         chosen = []
         cur = 8 * 60  # the usable part of a day opens at 8:00
-        while cur + 90 <= 22 * 60 and len(chosen) < wanted:
+        span = 90
+        while cur + span <= 23 * 60 and len(chosen) < wanted:
             cand = _free_from(busy, cur, chosen)
             if not cand:
-                break
+                # No full 90-min window from here on; if the remainder of the day
+                # still has a meaningful free block, take a shorter honest slot
+                # rather than leaving the day bare.
+                short = _free_from(busy, cur, chosen, span=60)
+                if not short:
+                    break
+                chosen.append(short)
+                cur = short[1]
+                continue
             chosen.append(cand)
             cur = cand[1]
         return chosen
@@ -624,7 +884,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None):
 
     for i in range(total_days):
         day = (date.fromisoformat(today) + timedelta(days=i)).isoformat()
-        for slot_idx, (s, e) in enumerate(slots_in_day()):
+        for slot_idx, (s, e) in enumerate(slots_in_day(day)):
             entries.append({
                 "date": day,
                 "title": _day_task(i, slot_idx),
@@ -778,28 +1038,29 @@ def _overlaps(s, e, blocked):
     return False
 
 
-def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False):
-    """Generate a real (or fallback) schedule for a goal. Returns list of action dicts."""
+def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False, busy_by_date=None):
+    """Generate a real schedule for a goal. Returns a list of action dicts from the LLM,
+    or None when no LLM can serve one. NEVER fabricates a hardcoded fill-in plan — the
+    user's hard rule: only real model-drawn tasks are ever shown on the board."""
     # No liveness pre-probe here. A busy local CPU reads as "down" to a fast probe and
     # that misreport used to spawn MORE competing calls instead of backing off. We just
     # attempt the real call — it serializes on the app-wide ollama lock and gets its
-    # real timeout; a genuine failure falls through to the deterministic plan.
-    entries = _build_fallback_plan(goal, extra_blocked=extra_blocked)
+    # real timeout. A genuine failure returns None; the caller keeps the old plan.
     try:
-        res = _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud)
-        if res:
-            return res
+        return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
+                              busy_by_date=busy_by_date)
     except Exception:
-        pass
-    return entries
+        return None
 
 
-def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=False):
+def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=False,
+                          busy_by_date=None):
     """Like generate_plan but returns None (not the fallback) when no LLM can serve a
     plan, so callers can keep a previously-drawn plan instead of overwriting it with the
     same deterministic fallback. Used for background schedule upgrades."""
     try:
-        return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud)
+        return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
+                              busy_by_date=busy_by_date)
     except Exception:
         return None
 
@@ -895,7 +1156,8 @@ def _extract_links(text):
     return out[:8]
 
 
-def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False):
+def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False, busy_by_date=None):
+    global _plan_blocked_reason
     sys = BASE_SYSTEM_PROMPT
     deadline = goal["deadline"]
     title = (goal.get("title") or goal["display_title"]).strip()
@@ -958,14 +1220,41 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         "unless the user's own notes literally call for it. Every task stays a real, physical "
         "action a normal person can do in that slot, that exact day."
     )
-    fallback = _build_fallback_plan(goal, today=today, extra_blocked=extra_blocked) or []
+    fallback = _build_fallback_plan(goal, today=today, extra_blocked=extra_blocked,
+                                    busy_by_date=busy_by_date) or []
     if not fallback:
+        # Zero usable slots, not a model failure. Say WHY, so the user fixes the
+        # cause (their blocked windows eat every usable hour) instead of the app
+        # retrying a model that was never the problem.
+        _plan_blocked_reason = (
+            "your available windows leave no usable free time between 8am and 11pm on any "
+            "day before the deadline — set or relax the Always-Busy Windows once (Settings "
+            "panel) and redraw. Ignoring whoever told me what you do at those hours would "
+            "mean lying to you, and I don't lie to you."
+        )
         return None
-    slots_json = "[\n" + ",\n".join(
-        f'  {{"date": "{e["date"]}", "start_time": "{(e["start_time"] or "09:00")}", '
-        f'"end_time": "{(e["end_time"] or "10:30")}"}}' for e in fallback
-    ) + "\n]"
-    user_prompt = (
+    _plan_blocked_reason = None
+
+    # One request can't carry the whole horizon: a month-long goal is 40-60+ slots,
+    # the title budget blows past _MAX_PLAN_TOKENS, the model truncates mid-JSON, the
+    # parse fails wholesale, and the ENTIRE plan collapses to empty + infinite retries.
+    # Split the grid into small day-bucketed slices instead. Each request is short
+    # enough for a slow, weak, or rate-limited free model to FINISH, and a failed
+    # slice only costs itself — the surviving slices still produce a real, partial,
+    # honest schedule. Nothing is ever substituted or canned.
+    n_slices = min(
+        _PLAN_SLICE_MAX_CALLS,
+        max(1, (len(fallback) + _PLAN_SLICE_TARGET_SLOTS - 1) // _PLAN_SLICE_TARGET_SLOTS),
+    )
+    slice_size = (len(fallback) + n_slices - 1) // n_slices
+
+    def _slot_json(e):
+        return (
+            f'  {{"date": "{e["date"]}", "start_time": "{(e["start_time"] or "09:00")}", '
+            f'"end_time": "{(e["end_time"] or "10:30")}"}}'
+        )
+
+    base_head = (
         f"Build the day-by-day plan from {date.today().isoformat()} to {deadline} for: {title}\n"
         f"THE GOAL IS: {title}\n"
         f"Constraints: {cons}"
@@ -975,55 +1264,79 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         f"{detail_line}"
         f"{guidance_line}"
         f"{size_line}\n"
-        "Below are the EXACT day/time slots the plan must fill (each slot is one task). "
-        "Their count is already correct — it follows the deadline, how much of that day the "
-        "person is actually free, and how heavy the goal is: a fully free day on a pressing "
-        "deadline can hold 8+ sessions (fill all of them — the person has the time), while "
-        "an easy goal with a far deadline gets as few as one. Cover EVERY day "
-        "from today to the deadline — never drop, merge, shift, or cut slots, and never add "
-        "extras. "
-        "DO NOT change any slot's date or start_time or end_time. Returns your titles:\n"
-        f"{slots_json}\n"
-        "Return ONLY a JSON array with ONE object per slot, in the same order: "
-        '{"date":"YYYY-MM-DD","start_time":"HH:MM","end_time":"HH:MM","title":"..."}. '
-        "Each title tells the user EXACTLY WHAT TO DO in that exact slot, that exact day: a verb + "
-        "the real thing (what to buy, what to set up, what to text, what time, what to say). "
-        "UP TO TWO SHORT LINES per title (at most ~16 words total) — it must fit the slot's own "
-        "timeframe and it is still a complete, concrete instruction. E.g. instead of "
-        "'Ensure a smooth evening' write 'Pick the three-piece, text her, agree 8pm. Candles, "
-        "slow music, door at 8.' Pull "
-        "the specifics from the chat notes and clarified answers (the item already chosen, the "
-        "agreed time, the place, who's coming) and match the goal text; inventing unrelated "
-        "topics is a hard failure. "
-        "Forbidden ANYWHERE in a title (they are topics, not actions): ensure, confirm, "
-        "consider, review, research, prepare, discuss, debate, decide, brainstorm, 'make sure', "
-        "'plan the'. 'Ensure aftercare and safety' is REJECTED. "
-        "Each slot gets a different, specific task. Never schedule the same conversation topic "
-        "on separate days. Do not schedule anything the chat notes say is already done. "
-        "If a slot is on an evening and the next day is free, that slot is THE EVENT NIGHT "
-        "itself — name what the night actually is, using the chat notes' decisions (people, "
-        "chosen items, agreed times). Every title is a physical, concrete action the user does "
-        "in that slot, not a lecture and not a vibe."
+        "Together, the separate requests for this window Cover EVERY day from today to the "
+        "deadline — never drop, merge, shift, or cut the slots you were given, and never add "
+        "slots that were not listed.\n"
     )
-    # prefer_cloud controls WHICH box does the heavy lifting. Explicit user redraws
-    # (prefer_cloud=True) run on OpenRouter so a schedule draw is fast and parallel with
-    # chat. Auto/retry/checkin paths (prefer_cloud=False) stay on the free local model by
-    # default and only touch OpenRouter as a fallback when the local box genuinely fails.
-    res = get_manager(db).generate(
-        sys, user_prompt, timeout=timeout, prefer_cloud=prefer_cloud, max_tokens=_MAX_PLAN_TOKENS,
-    )
-    if not res.ok:
-        return None
     global _last_provider
-    _last_provider = res.provider or "llm"
-    title_map = _parse_title_map(res.text)
     out = []
-    for e in fallback:
-        t = title_map.get((e["date"], e["start_time"]))
-        if not _title_ok(t):
-            t = e["title"]
-        out.append({**e, "title": t})
-    return out
+    for i in range(0, len(fallback), slice_size):
+        chunk = fallback[i:i + slice_size]
+        first, last = chunk[0]["date"], chunk[-1]["date"]
+        slots_json = "[\n" + ",\n".join(_slot_json(e) for e in chunk) + "\n]"
+        user_prompt = (
+            f"{base_head}This request covers ONLY {first} .. {last}. Other requests fill the rest of "
+            "the calendar — do NOT plan any day outside this range, and do NOT move any "        
+            "slot to a different date, start_time, or end_time than the ones below.\n"
+            "Below are the EXACT day/time slots in THIS range the plan must fill (each slot "
+            "is one task; EVERY slot listed must appear in your output, in the same order, "
+            "one object per slot). Their count is already correct — it follows the deadline, "
+            "how much of that day the person is actually free, and how heavy the goal is: a "
+            "fully free day on a pressing deadline can hold 8+ sessions (fill all of them — "
+            "the person has the time), while an easy goal with a far deadline gets as few as "
+            "one. Never drop, merge, shift, or cut slots, and never add extras.\n"
+            "DO NOT change any slot's date or start_time or end_time. Return your titles:\n"
+            f"{slots_json}\n"
+            "Return ONLY a JSON array with ONE object per slot, in the same order: "
+            '{"date":"YYYY-MM-DD","start_time":"HH:MM","end_time":"HH:MM","title":"..."}. '
+            "Each title tells the user EXACTLY WHAT TO DO in that exact slot, that exact "
+            "day: a verb + the real thing (what to buy, what to set up, what to text, what "
+            "time, what to say). "
+            "UP TO TWO SHORT LINES per title (at most ~16 words total) — it must fit the "
+            "slot's own timeframe and it is still a complete, concrete instruction. E.g. "
+            "instead of 'Ensure a smooth evening' write 'Pick the three-piece, text her, "
+            "agree 8pm. Candles, slow music, door at 8.' Pull "
+            "the specifics from the chat notes and clarified answers (the item already "
+            "chosen, the agreed time, the place, who's coming) and match the goal text; "
+            "inventing unrelated topics is a hard failure. "
+            "Forbidden ANYWHERE in a title (they are topics, not actions): ensure, confirm, "
+            "consider, review, research, prepare, discuss, debate, decide, brainstorm, "
+            "'make sure', 'plan the'. 'Ensure aftercare and safety' is REJECTED. "
+            "Each slot gets a different, specific task. Never schedule the same conversation "
+            "topic on separate days. Do not schedule anything the chat notes say is already "
+            "done. "
+            "If a slot is on an evening and the next day is free, that slot is THE EVENT "
+            "NIGHT itself — name what the night actually is, using the chat notes' decisions "
+            "(people, chosen items, agreed times). Every title is a physical, concrete action "
+            "the user does in that slot, not a lecture and not a vibe."
+        )
+        # prefer_cloud controls WHICH box does the heavy lifting. Explicit user redraws
+        # (prefer_cloud=True) run on OpenRouter so a schedule draw is fast and parallel with
+        # chat. Auto/retry/checkin paths (prefer_cloud=False) stay on the free local model by
+        # default and only touch OpenRouter as a fallback when the local box genuinely fails.
+        res = None
+        try:
+            res = get_manager(db).generate(
+                sys, user_prompt, timeout=timeout, prefer_cloud=prefer_cloud,
+                max_tokens=_MAX_PLAN_TOKENS,
+            )
+        except Exception as exc:
+            logger.warning("plan slice %s-%s failed: %r", first, last, exc)
+            continue
+        if not res.ok:
+            logger.warning("plan slice %s-%s: model unavailable, skipping", first, last)
+            continue
+        _last_provider = res.provider or "llm"
+        title_map = _parse_title_map(res.text)
+        for e in chunk:
+            t = title_map.get((e["date"], e["start_time"]))
+            if not _title_ok(t, goal_ref=title):
+                # Never write a placeholder ("<goal> — day 1 part 1") or an unacceptable
+                # model title; that silent substitution is the hardcoded-junk bug. The
+                # slot is dropped and the honest, smaller plan is what the user sees.
+                continue
+            out.append({**e, "title": t})
+    return out or None
 
 
 _WEAK_STARTERS = {
@@ -1033,10 +1346,11 @@ _WEAK_STARTERS = {
 }
 
 
-def _title_ok(title):
+def _title_ok(title, goal_ref=None):
     """Accept a model-written block title only if it's a real, concrete instruction
-    of up to two short lines describing what to do in that slot.
-    Otherwise the deterministic per-block title is kept."""
+    of up to two short lines describing what to do in that slot. Otherwise reject it
+    — the slot is DROPPED (never substituted with a canned placeholder: the user's
+    hard rule is that no deterministic filler is ever shown on the board)."""
     if not title:
         return False
     stripped = title.strip()
@@ -1051,13 +1365,32 @@ def _title_ok(title):
     low = stripped.lower()
     if any(w in low for w in ("consent & boundaries", "respect every no", "lecture")):
         return False
-    if any(v in low for v in ("research", "polish", "prepare", "discuss the plan",
-                              "work on it", "brainstorm topics", "review the")):
+    # Generic filler verbs banned as WORDS (a real task like 'polish the readme' or
+    # 'prepare the slides' is fine — but 'research x', 'polish y', 'prepare for z' as a
+    # bare activity is filler). Word-boundary, so 'polished deck' and 'research report'
+    # names aren't caught by a substring.
+    if any(re.search(rf"\b{re.escape(v)}\b", low) for v in (
+            "research", "polish", "prepare", "discuss the plan", "work on it",
+            "brainstorm topics", "review the plan", "review the design")):
+        return False
+    # The old grid placeholder ("<goal> — day 1 part 1") and recycled goal echoes are
+    # exactly the "hardcoded junk" the user bans. Reject them structurally so they
+    # can never be written, no matter what the weak model spits back.
+    if re.search(r"\bday\s+\d+\b.{0,24}\bpart\s+\d+\b", low):
+        return False
+    if re.search(r"\bpart\s+\d+\b.{0,24}\bday\s+\d+\b", low):
+        return False
+    if goal_ref and stripped.lower().rstrip(".").strip() == goal_ref.strip().lower():
+        return False
+    if goal_ref and re.match(re.escape(goal_ref.strip().lower()) + r"\s*[—–\-]?\s*(day|part)", low):
+        return False
+    if any(v in low for v in ("start the next phase", "move to the next phase",
+                              "go to the next phase", "next phase", "make progress on")):
         return False
     # A title that STARTS with a weak planning verb ("Ensure aftercare and safety",
     # "Confirm way home") is a topic/vibe, not an action. Reject it so the user's
     # schedule is concrete, never a brainstorm.
-    first = re.split(r"[\s:]+", stripped, 1)[0].lower().rstrip(".")
+    first = re.split(r"[\s:]+", stripped, maxsplit=1)[0].lower().rstrip(".")
     if first in _WEAK_STARTERS:
         return False
     return True
@@ -1065,23 +1398,41 @@ def _title_ok(title):
 
 def _parse_title_map(text):
     """Read the model's [ {...} ] array (Ollama often wraps it in markdown fences)
-    and map (date, start_time) -> title. Tolerates 'start'/'end' keys and missing times."""
-    m = re.search(r"\[.*\]", text, re.S)
-    if not m:
-        return {}
-    try:
-        data = json.loads(m.group(0))
-    except Exception:
-        return {}
-    out = {}
-    for item in data:
+    and map (date, start_time) -> title. Tolerates 'start'/'end' keys and missing times.
+    If the array is truncated mid-output (a slow model hitting the token cap), fall
+    back to parsing every complete object individually, so the slots the model DID
+    finish naming still land in the plan instead of the whole slice dying."""
+    def _add(item):
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except Exception:
+                return
+        if not isinstance(item, dict):
+            return
         d = item.get("date")
         t = item.get("title")
         if not d or not t:
-            continue
+            return
         st = normalize_time(item.get("start_time") or item.get("start")) or ""
         if st:
-            out[(d, st)] = t.strip()[:200]
+            out[(d, st)] = str(t).strip()[:200]
+
+    out = {}
+    m = re.search(r"\[.*\]", text, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            data = None
+        if isinstance(data, list):
+            for item in data:
+                _add(item)
+            return out
+    # Best-effort: the wrap didn't parse (truncated/partial). Extract whatever
+    # complete { } objects exist and rebuild the map from those that have all keys.
+    for item in re.findall(r"\{[^{}]*\}", text):
+        _add(item)
     return out
 
 

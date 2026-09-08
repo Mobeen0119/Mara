@@ -1,5 +1,6 @@
 import json
 import logging
+import re as _re
 import threading
 import time
 from datetime import date, timedelta
@@ -94,6 +95,28 @@ def _insert_actions(conn, goal, entries):
         )
 
 
+def active_goal_blocked_windows(conn, user):
+    """Union of the user's global blocked windows and EVERY active goal's constraint
+    windows (gym 5-7am typed once in any goal guards every goal). Eloise is the
+    single control unit — the user states a routine once, not per goal."""
+    blocked = list(generation.user_blocked_windows(user))
+    try:
+        for g in conn.execute(
+            "SELECT constraints FROM goals WHERE user_id=? AND status='active'",
+            (user["id"],),
+        ).fetchall():
+            try:
+                for c in json.loads(g["constraints"] or "[]"):
+                    w = generation.parse_time_window(c)
+                    if w and w not in blocked:
+                        blocked.append(w)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return blocked
+
+
 def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
     logger.warning("plan bg: goal %s thread started", goal_id)
     try:
@@ -114,51 +137,66 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
     try:
         time.sleep(0.5)
         conn = get_connection()
-        blocked = generation.user_blocked_windows(user)
+        # ELOISE IS THE SINGLE CONTROL UNIT: the user does not declare a routine per
+        # goal. If they blocked gym 5-7am in ANY goal, every goal knows. So each draw
+        # respects the union of the user's global blocked windows AND every ACTIVE
+        # goal's own constraint windows (gym/uni/sleep/whatever), parsed once here.
+        blocked = active_goal_blocked_windows(conn, user)
+        # The slot grid must avoid the user's REAL calendar, not just declared busy
+        # windows: other goals already occupy specific time on specific days, and an
+        # LLM slot that lands on a booked block gets dropped wholesale by conflict
+        # resolution (the whole plan silently collapsing to "0 tasks").
+        today_iso = date.today().isoformat()
+        busy_by_date = generation.user_calendar_busy(
+            conn, user["id"], goal_id, today_iso, goal.get("deadline") or today_iso
+        )
         # NO hardcoded fallback schedule. Only a real LLM plan is written. We try the
         # model; if it is down or times out, we KEEP whatever plan already exists and
         # retry in a minute. A hardcoded fill-in is never shown to the user.
+        written = None
         try:
             better = generation.generate_plan_or_none(
                 goal, user, db=conn, extra_blocked=blocked, prefer_cloud=prefer_cloud,
+                busy_by_date=busy_by_date,
             )
         except Exception as exc:
             logger.warning("plan bg: goal %s LLM attempt failed: %r", goal_id, exc)
             better = None
         if better:
-            _write_plan(conn, goal, better, blocked_min=blocked,
-                        provider=generation.last_provider())
-            _reset_plan_retries(goal_id)
-            logger.warning("plan bg: goal %s wrote %s LLM entries", goal_id, len(better))
-        else:
-            existing = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (goal_id,)).fetchone()[0]
-            if existing:
-                logger.warning("plan bg: goal %s LLM down, keeping %s existing entries", goal_id, existing)
+            written = _write_plan(conn, goal, better, blocked_min=blocked,
+                                  provider=generation.last_provider())
+            if written:
+                _reset_plan_retries(goal_id)
+                logger.warning("plan bg: goal %s wrote %s LLM entries", goal_id, len(written))
+        if not written:
+            # LLM produced nothing usable, or the model never ran. Distinguish the two
+            # HONESTLY: if the failure was the user's own windows leaving zero usable
+            # slots (the fallback grid came back empty), report THAT instead of blaming
+            # the model — there is no point retrying when the real problem is the
+            # blocked windows. Every other failure keeps the previous plan and retries.
+            blocked_msg = generation.plan_blocked_reason()
+            if blocked_msg:
+                logger.warning(
+                    "plan bg: goal %s has no usable free windows, marking blocked", goal_id
+                )
                 conn.execute(
-                    "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
-                    ("kept previous schedule (model unavailable, retrying)", goal_id),
+                    "UPDATE goals SET plan_status='blocked', plan_summary=? WHERE id=?",
+                    (blocked_msg, goal_id),
                 )
                 conn.commit()
+                return
+            existing = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (goal_id,)).fetchone()[0]
+            summary = "kept previous schedule (model unavailable, retrying)"
+            if existing:
+                logger.warning("plan bg: goal %s LLM down, keeping %s existing entries", goal_id, existing)
             else:
-                # GUARANTEE: never leave the board empty. The deterministic fallback is a
-                # real, right-sized schedule (every day covered, blocked windows honored,
-                # concrete per-slot tasks) — the LLM only ever REFINED its titles, it never
-                # invented the dates/times. On a slow CPU the model can time out on the
-                # draw, so write the fallback NOW and refine titles in a background retry.
-                logger.warning("plan bg: goal %s LLM unavailable — writing guaranteed schedule", goal_id)
-                try:
-                    fallback = generation._build_fallback_plan(
-                        goal, today=date.today().isoformat(), extra_blocked=blocked
-                    ) or []
-                except Exception as exc:
-                    logger.warning("plan bg: goal %s fallback build failed: %r", goal_id, exc)
-                    fallback = []
-                if fallback:
-                    _write_plan(conn, goal, fallback, blocked_min=blocked)
-                    logger.warning("plan bg: goal %s wrote guaranteed schedule (%s slots)", goal_id, len(fallback))
-                else:
-                    conn.execute("UPDATE goals SET plan_status='active' WHERE id=?", (goal_id,))
-                    conn.commit()
+                logger.warning("plan bg: goal %s LLM down, no schedule yet — will retry", goal_id)
+                summary = "model unavailable — no plan drawn yet, retrying"
+            conn.execute(
+                "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
+                (summary, goal_id),
+            )
+            conn.commit()
             _schedule_plan_retry(user, goal_id)
     except Exception as exc:
         logger.warning("plan bg: goal %s failed: %r", goal_id, exc)
@@ -170,6 +208,36 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
             pass
     finally:
         lock.release()
+
+
+def _action_violates_goal_windows(goal):
+    """True if a pending task lands inside one of the goal's OWN blocked windows
+    (e.g. a plan drawn before the constraint existed, or by the old code that ignored
+    per-goal windows). Those plans are self-contradictory and must be redrawn."""
+    try:
+        goal = dict(goal)
+        cons = json.loads(goal.get("constraints") or "[]")
+    except Exception:
+        return False
+    windows = []
+    for c in cons:
+        w = generation.parse_time_window(c)
+        if w:
+            windows.append(w)
+    if not windows:
+        return False
+    c = get_connection()
+    for a in c.execute(
+        "SELECT start_time, end_time FROM actions WHERE goal_id=? AND status!='done'",
+        (goal["id"],),
+    ).fetchall():
+        a0, a1 = _to_min(a["start_time"]), _to_min(a["end_time"])
+        if a0 is None or a1 is None:
+            continue
+        for w0, w1 in windows:
+            if a0 < w1 and a1 > w0:
+                return True
+    return False
 
 
 def heal_stale_plans():
@@ -187,7 +255,10 @@ def heal_stale_plans():
             """
             SELECT g.id, g.user_id, g.plan_status
             FROM goals g
-            WHERE g.plan_status NOT IN ('cancelled', 'succeeded')
+            WHERE g.plan_status NOT IN ('cancelled', 'succeeded', 'blocked')
+              AND g.plan_status NOT LIKE 'cancelled:%'
+              AND g.plan_status NOT LIKE 'succeeded:%'
+              AND g.status NOT IN ('cancelled', 'succeeded')
               AND g.deadline >= ?
               AND (g.plan_status = 'generating'
                    OR NOT EXISTS (SELECT 1 FROM actions a WHERE a.goal_id = g.id))
@@ -219,6 +290,76 @@ def heal_stale_plans():
                     ).start()
         except Exception as exc:
             logger.warning("plan bg: heal goal %s failed: %r", gid, exc)
+    # Hardcoded-title purge: the grid placeholder '— day N part 1' used to leak into
+    # the DB via the old substitution path. Those goals contain only canned filler
+    # titles that violate the user's hard rule. Delete ONLY the junk rows (concrete
+    # tasks survive) and let the no-hardcoded regen path try once (keeps the goal
+    # honest and empty-if-unfilled and retries if the model still fails).
+    try:
+        act_rows = conn.execute(
+            """
+            SELECT a.id, a.goal_id, a.title FROM actions a
+            JOIN goals g ON g.id = a.goal_id
+            WHERE a.status = 'pending'
+              AND g.status NOT IN ('cancelled', 'succeeded')
+              AND g.plan_status NOT LIKE 'cancelled:%'
+              AND g.plan_status NOT LIKE 'succeeded:%'
+            """,
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("plan bg: purge scan failed: %r", exc)
+        act_rows = []
+    junk_by_goal = {}
+    for r in act_rows:
+        if _re.search(r"\bday\s+\d+\s+part\s+\d+", r["title"] or "", _re.I):
+            junk_by_goal.setdefault(int(r["goal_id"]), []).append(int(r["id"]))
+    for gid, ids in junk_by_goal.items():
+        try:
+            conn.execute(
+                f"DELETE FROM actions WHERE id IN ({','.join('?' * len(ids))})", ids
+            )
+            conn.commit()
+            user = conn.execute("SELECT * FROM users WHERE id=(SELECT user_id FROM goals WHERE id=?)", (gid,)).fetchone()
+            if user:
+                logger.warning("plan bg: goal %s purged placeholder titles — regenerating", gid)
+                threading.Thread(
+                    target=_regenerate_plan_bg, args=(dict(user), gid), daemon=True,
+                ).start()
+        except Exception as exc:
+            logger.warning("plan bg: purge placeholders goal %s failed: %r", gid, exc)
+    # Self-contradictory plans: a goal whose pending tasks sit INSIDE its own blocked
+    # windows (drawn before the constraint existed, or by code that ignored per-goal
+    # windows). Redraw so the schedule honors the goal's stated constraints.
+    try:
+        goal_rows = conn.execute(
+            """
+            SELECT g.id, g.user_id, g.constraints
+            FROM goals g
+            WHERE g.plan_status NOT IN ('cancelled', 'succeeded', 'blocked')
+              AND g.plan_status NOT LIKE 'cancelled:%'
+              AND g.plan_status NOT LIKE 'succeeded:%'
+              AND g.status NOT IN ('cancelled', 'succeeded')
+              AND g.deadline >= ?
+            """,
+            (date.today().isoformat(),),
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("plan bg: constraint scan failed: %r", exc)
+        goal_rows = []
+    for g in goal_rows:
+        try:
+            if _action_violates_goal_windows(g):
+                uid = g["user_id"]
+                user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+                if user:
+                    logger.warning(
+                        "plan bg: goal %s tasks violate its own blocked windows — redrawing", g["id"]
+                    )
+                    threading.Thread(
+                        target=_regenerate_plan_bg, args=(dict(user), g["id"]), daemon=True,
+                    ).start()
+        except Exception as exc:
+            logger.warning("plan bg: constraint check goal %s failed: %r", g["id"], exc)
 
 
 def _reset_plan_retries(goal_id):
@@ -289,6 +430,13 @@ def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
     # Cross-goal conflict resolution: pull this user's OTHER goals' blocks and this
     # user's global blocked windows, shift any overlapping entry to the next free slot.
     final = _resolve_cross_goal_slots(conn, goal, final, blocked_min=blocked_min)
+    if not final:
+        # Even a non-empty draw can resolve to NOTHING once real cross-goal conflicts
+        # are applied (every candidate slot was already booked by another goal). An
+        # empty write must NEVER succeed: it would DELETE the goal's existing tasks and
+        # badge it "active" with a confidently wrong "0 tasks" summary. Keep whatever
+        # plan exists and let the retry path re-run the draw against the real calendar.
+        return None
     conn.execute("DELETE FROM actions WHERE goal_id=?", (goal["id"],))
     _insert_actions(conn, goal, final)
     summary = f"{len(final)} tasks across {len(set(e['date'] for e in final))} days"
@@ -512,7 +660,14 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
         return _goal_payload(goal, conn=conn)
     vals.append(goal_id)
     conn.execute(f"UPDATE goals SET {', '.join(fields)} WHERE id=?", vals)
+    # Changing the inputs that made a goal 'blocked' (no usable free time) un-blocks it:
+    # kick a redraw so a relaxed window draws an honest schedule right away.
+    was_blocked = str(goal.get("plan_status") or "").startswith("blocked")
+    if was_blocked:
+        conn.execute("UPDATE goals SET plan_status='active', plan_summary='' WHERE id=?", (goal_id,))
     conn.commit()
+    if was_blocked:
+        threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
     return _goal_payload(_goal_or_404(user, goal_id), conn=conn)
 
 
@@ -733,9 +888,21 @@ def add_constraint(goal_id: int, body: ConstraintAddRequest, user: dict = Depend
     goal = _goal_or_404(user, goal_id)
     conn = get_connection()
     cons = json.loads(goal["constraints"] or "[]")
-    cons.append(body.text.strip())
+    if getattr(body, "removeIndex", None) is not None:
+        idx = body.removeIndex
+        if 0 <= idx < len(cons):
+            cons.pop(idx)
+    else:
+        txt = (getattr(body, "text", "") or "").strip()
+        if txt:
+            cons.append(txt)
     conn.execute("UPDATE goals SET constraints=? WHERE id=?", (json.dumps(cons), goal_id))
+    # Relaxing/removing constraints can un-block a goal whose windows ate all free time.
+    if str(goal.get("plan_status") or "").startswith("blocked"):
+        conn.execute("UPDATE goals SET plan_status='active', plan_summary='' WHERE id=?", (goal_id,))
     conn.commit()
+    if str(goal.get("plan_status") or "").startswith("blocked"):
+        threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
     return {"constraints": cons}
 
 

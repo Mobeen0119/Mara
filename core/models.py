@@ -80,11 +80,16 @@ class CheckinTimeRequest(BaseModel):
 
 
 class ConstraintAddRequest(BaseModel):
-    text: str = Field(min_length=1)
+    text: str = ""
+    removeIndex: int | None = None
 
 
 class BlockedWindowsRequest(BaseModel):
     blocked_windows: List[str] = Field(default_factory=list)
+
+
+class PersonaRequest(BaseModel):
+    persona: str = Field(default="", max_length=2000)
 
 
 class ReminderSetRequest(BaseModel):

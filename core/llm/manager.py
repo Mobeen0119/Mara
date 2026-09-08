@@ -15,27 +15,116 @@ DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"
 _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 
 # Ollama (the local model) is a SINGLE CPU-bound process: it can only run one
-# generation at a time. Every chat request and every plan draw shares this one lock,
-# so a busy box becomes a clean queue instead of a stampede of competing calls that
-# slow each other down and then time out. Callers wait on the lock with a cap
-# (lock_wait): a plan draw knows its own job is background work and can queue longer,
+# generation per loaded model at a time. Every chat request and every plan draw shares
+# ONE lock per MODEL so a busy box becomes a clean queue instead of a stampede of
+# competing calls that slow each other down and then time out. Crucially, chat and plans
+# can run on DIFFERENT local models (OLLAMA_CHAT_MODEL=1.7b vs the 4b used for plans),
+# and Ollama serves them concurrently — so a slow plan draw on the big model must NOT
+# starve an interactive chat into OpenRouter. Callers wait on their model's lock with a
+# cap (lock_wait): a plan draw knows its own job is background work and can queue longer,
 # but an interactive CHAT must never stare at a spinner for a minute+ behind a plan —
 # past its wait cap it falls back to OpenRouter and answers now.
 OLLAMA_LOCK = threading.Lock()
+_ollama_model_locks = {}
+_ollama_locks_guard = threading.Lock()
 
 
-def _strip_prompt_echo(text):
-    """Post-process LLM output: strip any prompt template the model echoed back."""
+def ollama_lock_for(effective_model=None):
+    """The app-wide lock for the given local model name. Models key on their own lock, so
+    a chat on the small fast model is served in parallel with a plan draw on the big
+    model (Ollama keeps one runner per loaded model). Falls back to the legacy shared
+    lock when the model is unknown."""
+    if not effective_model:
+        return OLLAMA_LOCK
+    with _ollama_locks_guard:
+        return _ollama_model_locks.setdefault(effective_model, threading.Lock())
+
+
+def _strip_prompt_echo(text, user_message=None, user_lines=None):
+    """Post-process LLM output: remove any prompt boilerplate the model echoed back,
+    drop a leading role label it parroted from history ('Eloise: ...'), refuse a
+    verbatim echo of the user's own question, delete verbatim re-quotes of the
+    user's earlier lines, and strip sycophancy openers ('You're right—', 'I
+    understand...') that weak models sprinkle in pretending to agree. Weak local
+    models do all of these; without this the UI shows the user their own words
+    played back at them with a smiley agree-first wrapper ('echoing')."""
     if not text:
-        return text
-    for marker in ["User just said:", "Reply:", "Respond as Eloise.", "Context:",
-                    "Conversation history:", "Recent conversation:", "Current board:"]:
-        idx = text.find(marker)
+        return ""
+    t = text
+    # Cut everything up to the LAST prompt/echo marker and keep only the tail — that's
+    # where the actual reply lives after the model re-prints the instructions/history.
+    markers = [
+        "Reply as Eloise.", "Respond as Eloise.", "Only output your reply.",
+        "do NOT echo this prompt", "Do NOT echo this prompt",
+        "=== GOAL ===", "=== CONVERSATION ===", "=== BOARD STATE ===",
+        "=== THE PLAN", "=== ", "User just said:", "Context:",
+        "Conversation history:", "Recent conversation:", "Current board:",
+    ]
+    cut = 0
+    for marker in markers:
+        idx = t.rfind(marker)
         if idx >= 0:
-            before = text[:idx].strip()
-            if before:
-                return before
-    return text.strip()
+            cut = max(cut, idx + len(marker))
+    if cut:
+        t = t[cut:]
+    lines = t.splitlines()
+    for i in range(len(lines)):
+        m = re.match(r"^(eloise|assistant|user)\s*[:|]\s*(.*)$", lines[i].strip(), re.I)
+        if m and (m.group(2) or "").strip():
+            lines[i] = m.group(2).strip()
+        else:
+            break
+    lines = [ln for ln in lines if ln.strip() != ""]
+    t = "\n".join(lines).strip()
+    if not t:
+        return ""
+    # Strip verbatim re-quotes of the user's EARLIER lines ("'Nice. Let's move
+    # forward.'" played back in the reply). The excerpt can be wrapped in quotes or
+    # markdown bold/italic, and a weak model often quotes just the closing TAIL of
+    # the line, so try every suffix too (e.g. the imperative "Let's move forward.").
+    for ul in (user_lines or []):
+        ul = (ul or "").strip()
+        if not ul:
+            continue
+        tokens = ul.split()
+        variants = []
+        for i in range(len(tokens)):
+            variants.append(" ".join(tokens[i:]))
+        variants.append(ul)
+        for variant in variants:
+            if len(variant) < 6:
+                continue
+            padded = " " + variant.strip("?!. ") + " "
+            for wrapped in (variant, f'"{variant}"', f"'{variant}'", f"**{variant}**", f"*{variant}*"):
+                if wrapped in t:
+                    t = t.replace(wrapped, " ").strip()
+                    break
+            if not t:
+                return ""
+    # Refuse a verbatim/near-verbatim copy of the question the user just asked.
+    if user_message:
+        def norm(s):
+            return re.sub(r"\s+", " ", (s or "").strip().lower()).strip(".:?! \"'")
+
+        body = re.sub(r"^(eloise|assistant|user)\s*[:|]\s*", " ", t, flags=re.I)
+        if norm(body) == norm(user_message) or norm(body).startswith(norm(user_message)):
+            return ""
+    # Strip sycophancy openers: the weak-model answer to "i don't like X" is not a
+    # real reply — it's "You're right—..." + a rephrase of the user's own words.
+    _SYC_OPENER = re.compile(
+        r"^\s*(?:you['’]?re\s+right|you\s+are\s+right|i\s+understand|"
+        r"great\s+(?:point|question|stuff)|that['’]?s\s+(?:a\s+)?great|"
+        r"what\s+a\s+great|thanks\s+for\s+(?:saying|asking|sharing|the)|"
+        r"i\s+hear\s+you|you\s+make\s+(?:a\s+)?(?:good|great)|"
+        r"you\s+said\s+it|that['’]?s\s+(?:a\s+)?fair)\s*[^\w]*\s*",
+        re.I,
+    )
+    t2 = _SYC_OPENER.sub("", t, count=1).strip(" .,:;-—*_\"'\n\t").strip()
+    if t2:
+        t = t2
+    if not t:
+        return ""
+    return t
 
 
 def _ollama_base_url(raw=None):
@@ -121,20 +210,33 @@ class LLMManager:
                 continue
             logger.info("trying provider: %s (model: %s)", p.name, p.model)
             if p.name == "ollama":
-                # The local box runs one generation at a time. Wait HERE (before the
-                # timeout starts counting) so a queued call still gets its FULL timeout
-                # instead of burning its budget sitting behind a busy predecessor —
-                # but only for up to lock_wait seconds. A long plan draw holding the
-                # lock must not freeze a chat beyond that; then we move on to the
-                # next provider.
-                if not OLLAMA_LOCK.acquire(timeout=lock_wait):
-                    logger.warning("ollama busy >%.0fs (lock); skipping to next provider", lock_wait)
+                # The local box runs one generation per loaded model at a time. Wait
+                # HERE (before the timeout starts counting) so a queued call still gets
+                # its FULL timeout instead of burning its budget sitting behind a busy
+                # predecessor — but only for up to lock_wait seconds. Chat and plans
+                # each hold their OWN model's lock (e.g. 1.7b vs 4b), so they run
+                # concurrently. If the configured CHAT model is missing (404) or errors,
+                # retry on the PLAN model — still local — before ever opening the cloud.
+                if model_override is None:
+                    attempts = [None]
+                else:
+                    attempts = [model_override, p.model]
+                result = None
+                for attempt in attempts:
+                    eff = attempt or p.model
+                    lock = ollama_lock_for(eff)
+                    if not lock.acquire(timeout=lock_wait):
+                        logger.warning("ollama busy >%.0fs (lock) for %s", lock_wait, eff)
+                        continue
+                    try:
+                        result = self._attempt(p, system_prompt, user_prompt, timeout,
+                                               max_tokens, attempt)
+                    finally:
+                        lock.release()
+                    if result.ok:
+                        break
+                if result is None or not result.ok:
                     continue
-                try:
-                    result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens,
-                                           model_override)
-                finally:
-                    OLLAMA_LOCK.release()
             else:
                 result = self._attempt(p, system_prompt, user_prompt, timeout, max_tokens,
                                        model_override)
@@ -194,23 +296,40 @@ class LLMManager:
             logger.info("streaming from provider: %s (model: %s)", p.name, p.model)
             try:
                 if p.name == "ollama":
-                    # The CPU box is busy until this stream is DONE, so the app-wide
-                    # lock is held for the whole stream; later callers queue behind it,
-                    # but only up to their own lock_wait cap.
-                    if not OLLAMA_LOCK.acquire(timeout=lock_wait):
-                        logger.warning("ollama busy >%.0fs (chat lock); streaming from next provider", lock_wait)
+                    # The CPU box runs one generation per loaded model; hold THIS
+                    # model's lock for the whole stream so later callers queue behind
+                    # it, but only up to lock_wait. Chat (1.7b) and plans (4b) hold
+                    # different per-model locks so they run concurrently. If the
+                    # configured CHAT model is missing or a stream dies, retry on the
+                    # PLAN model (still local) before ever falling back to the cloud —
+                    # the user wants local chat, not OpenRouter output.
+                    if model_override is None:
+                        attempts = [None]
+                    else:
+                        attempts = [model_override, p.model]
+                    last = None
+                    for attempt in attempts:
+                        eff = attempt or p.model
+                        lock = ollama_lock_for(eff)
+                        if not lock.acquire(timeout=lock_wait):
+                            logger.warning("ollama busy >%.0fs (chat lock) for %s", lock_wait, eff)
+                            last = RuntimeError(f"ollama busy ({eff})")
+                            continue
+                        try:
+                            for chunk in stream(system_prompt, user_prompt, timeout, max_tokens, attempt):
+                                if chunk is None:
+                                    yield "", p.name
+                                    return
+                                yield chunk, p.name
+                            yield "", p.name
+                            return
+                        except Exception as exc:
+                            logger.warning("ollama stream failed on %s: %s", eff, exc)
+                            last = exc
+                        finally:
+                            lock.release()
+                    if last is not None:
                         continue
-                    try:
-                        chunk = ""
-                        for chunk in stream(system_prompt, user_prompt, timeout, max_tokens, model_override):
-                            if chunk is None:
-                                yield "", p.name
-                                return
-                            yield chunk, p.name
-                        yield "", p.name
-                        return
-                    finally:
-                        OLLAMA_LOCK.release()
                 chunk = ""
                 for chunk in stream(system_prompt, user_prompt, timeout, max_tokens, model_override):
                     if chunk is None:

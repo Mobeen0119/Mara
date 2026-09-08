@@ -167,12 +167,16 @@ class OllamaProvider(LLMProvider):
             detail=last_err or "no Ollama endpoint reachable", model=self.model,
         )
 
-    def _options(self, max_tokens):
+    def _options(self, system_prompt="", user_prompt="", max_tokens=None):
         # Qwen3-class models default to a huge ~32K context window. On a single CPU
-        # that 32K of KV-cache overhead makes even a 2-line chat reply crawl. Pin the
-        # context to something the actual prompts fit in: short capped chat calls get
-        # 2048, big uncapped schedule draws get 8192.
-        options = {"num_ctx": 2048 if max_tokens else 8192}
+        # that 32K of KV-cache overhead makes even a 2-line chat reply crawl. But the
+        # window must fit the REAL prompt: if num_ctx is smaller than the prompt,
+        # Ollama truncates the MIDDLE of it — where the goal, constraints and persona
+        # live — and the chat/schedule silently goes "dumb" (or produces garbage
+        # titles). Base the window on the prompt length with a 4096-token floor; the
+        # output cap never decides the context size.
+        budget = len(system_prompt or "") + len(user_prompt or "")
+        options = {"num_ctx": int(min(8192, 4096 + budget // 3))}
         if max_tokens:
             options["num_predict"] = int(max_tokens)
         return options
@@ -182,7 +186,7 @@ class OllamaProvider(LLMProvider):
         payload = {
             "model": model_override or self.model, "system": system_prompt, "prompt": user_prompt,
             "stream": False, "keep_alive": self.keep_alive,
-            "think": self.think, "options": self._options(max_tokens),
+            "think": self.think, "options": self._options(system_prompt, user_prompt, max_tokens),
         }
         last_err = None
         # Ollama can take 30-60s to load a large model from disk on first call.
@@ -236,7 +240,7 @@ class OllamaProvider(LLMProvider):
         payload = {
             "model": model_override or self.model, "system": system_prompt, "prompt": user_prompt,
             "stream": True, "keep_alive": self.keep_alive,
-            "think": self.think, "options": self._options(max_tokens),
+            "think": self.think, "options": self._options(system_prompt, user_prompt, max_tokens),
         }
         last_err = None
         per_try = max(int(timeout), 60)

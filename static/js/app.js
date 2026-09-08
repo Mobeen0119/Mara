@@ -573,7 +573,11 @@ async function renderGoalDetail(el, id) {
     (g.plan || []).forEach(a => { if (a.date) (byDate[a.date] = byDate[a.date] || []).push(a); });
     const dates = Object.keys(byDate).sort();
     if (dates.length === 0) {
-      html += `<div class="empty-state"><h3>No schedule drawn yet</h3></div>`;
+      if (String(g.plan_status).startsWith('blocked') && g.plan_summary) {
+        html += `<div class="empty-state"><h3>No free time to schedule</h3><p style="max-width:420px;font-size:14px;line-height:1.7;color:var(--bone-dim);">${escHtml(g.plan_summary)}</p><p style="font-size:13px;color:var(--copper);">Eloise plans every goal around the same windows — relax one in Settings &rarr; Always-Busy Windows, then Redraw schedule.</p></div>`;
+      } else {
+        html += `<div class="empty-state"><h3>No schedule drawn yet</h3></div>`;
+      }
     } else {
       dates.forEach(d => {
         html += `<div class="schedule-day"><div class="schedule-day-head"><span>${escHtml(d)}</span><span class="chip hot">${byDate[d].length}</span></div>`;
@@ -609,7 +613,7 @@ async function renderGoalDetail(el, id) {
     if (cons.length === 0) {
       html += `<div class="empty-state"><h3>No constraints</h3><p>Tell Eloise what's off-limits.</p></div>`;
     } else {
-      cons.forEach(c => html += `<div class="note-card"><span class="who">blocked</span><div>${escHtml(c)}</div></div>`);
+      cons.forEach((c, ci) => html += `<div class="note-card"><span class="who">blocked</span><div style="flex:1">${escHtml(c)}</div><button class="btn btn-sm btn-ghost" onclick="removeGoalConstraint(${g.id}, ${ci})">&times;</button></div>`);
     }
     html += `<div class="field" style="margin-top:16px;"><label>Add a constraint</label>
       <div style="display:flex;gap:10px;"><input type="text" id="new-cons-input" placeholder="e.g. Gym 5-7pm"><button class="btn btn-sm btn-ghost" onclick="addGoalConstraint(${g.id})">+</button></div>
@@ -638,6 +642,10 @@ async function addGoalConstraint(id) {
   const txt = document.getElementById('new-cons-input').value;
   if (!txt) return;
   try { await api(`/goals/${id}/constraints`, { method: 'POST', body: JSON.stringify({ text: txt }) }); } catch (e) {}
+  navigate('goal', id);
+}
+async function removeGoalConstraint(id, idx) {
+  try { await api(`/goals/${id}/constraints`, { method: 'POST', body: JSON.stringify({ removeIndex: idx }) }); } catch (e) {}
   navigate('goal', id);
 }
 async function completeGoal(id) {
@@ -699,7 +707,9 @@ async function regenPlan(id) {
   if (posted) settled = await waitPlanSettles(id);
   const nx = document.getElementById('plan-generating-note');
   if (nx) nx.remove();
-  if (posted && settled && String(settled.plan_summary).startsWith('kept previous')) {
+  if (posted && settled && String(settled.plan_status).startsWith('blocked')) {
+    showToast('No free time to schedule \u2014 adjust your Always-Busy Windows once and redraw: ' + (settled.plan_summary || ''), 'error');
+  } else if (posted && settled && String(settled.plan_summary).startsWith('kept previous')) {
     showToast('Couldn\u2019t reach the model \u2014 kept your current schedule. Retrying in a minute.', 'error');
   } else if (posted && settled) {
     showToast('New schedule drawn' + (settled.plan_summary ? ' \u2014 ' + settled.plan_summary : '') + '.', 'success');
@@ -1107,7 +1117,7 @@ async function streamChatReply(goalId, message, onDelta) {
     }
   }
   if (!full && (!source || source === 'offline')) {
-    throw new Error("The model didn't answer, and I won't fake one. Start Ollama (or check the LLM settings), then send that again.");
+    throw new Error("The model didn't answer, and I won't fake one. It may be off, or it echoed my prompt back (pull the chat model first). Check Ollama / LLM settings, then send that again.");
   }
   return { text: full, source: source || 'llm' };
 }
@@ -1212,6 +1222,15 @@ async function renderSettings(el) {
         <button class="btn btn-danger" style="width:auto;color:#fff;" onclick="logout()">Sign Out</button>
       </div>
     </div>`;
+    let persona = '';
+    try { const ps = await api('/settings/persona'); persona = ps.persona || ''; } catch (e) {}
+    html += `<div class="settings-section"><h3>Persona</h3>
+      <div class="card">
+        <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">How Eloise talks to you. Set it here or in any chat ("be sarcastic", "never a motivational speaker") — it sticks and overrides the default tone.</p>
+        <div class="field"><textarea id="set-persona" rows="4" style="width:100%;min-height:88px;">${escHtml(persona)}</textarea></div>
+        <button class="btn" style="width:auto;" onclick="savePersona()">Save Persona</button>
+      </div>
+    </div>`;
     try {
       const me = await api('/me');
       const inp = document.getElementById('set-checkin-time');
@@ -1262,6 +1281,10 @@ async function saveCheckinTime() {
   const t = document.getElementById('set-checkin-time').value;
   if (!t) { showToast('Pick a time', 'error'); return; }
   try { await api('/settings/checkin-time', { method: 'PUT', body: JSON.stringify({ checkin_time: t }) }); showToast('Check-in time saved', 'success'); } catch (e) { showToast(e.message, 'error'); }
+}
+async function savePersona() {
+  const p = (document.getElementById('set-persona') || {}).value || '';
+  try { await api('/settings/persona', { method: 'PUT', body: JSON.stringify({ persona: p }) }); showToast('Persona saved — Eloise obeys it from now on', 'success'); } catch (e) { showToast(e.message, 'error'); }
 }
 function renderBusyWindows() {
   const wrap = document.getElementById('busy-list');

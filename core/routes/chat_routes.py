@@ -148,14 +148,16 @@ def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
         lines.append(f"{r['role']}: {content}")
     while sum(len(l) for l in lines) > _MAX_TOTAL_CHARS and len(lines) > 1:
         lines.pop(0)
-    # Structural anti-repeat: when the user re-asks the same question, drop the last
-    # Eloise answer from context so a weak model can't just copy it verbatim.
-    if drop_reply_to and len(lines) >= 2:
-        last = lines[-1].strip()
-        prev = lines[-2].strip()
-        if last.startswith("eloise:") and prev.startswith("user:"):
-            if prev[len("user:"):].strip() == (drop_reply_to or "").strip():
-                lines.pop()
+    # Structural anti-repeat: ALWAYS drop the most recent Eloise reply from the LLM's
+    # context. Weak models parrot the immediately-previous Eloise line verbatim when it
+    # is in context — that is exactly the "spamming the same answer" the user hit.
+    # Without it in front of them, they cannot copy it. The latest user message stays
+    # in so the model answers the question actually asked. (drop_reply_to kept for
+    # backwards compatibility.)
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip().startswith("eloise:"):
+            lines.pop(i)
+            break
     return lines
 
 
@@ -183,7 +185,11 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         ).fetchall()
     ]
 
-    if goal_id and goal and generation.completion_detected(message):
+    # A personality directive ("be sarcastic", "don't be a motivational speaker")
+    # typed into chat is stored as a standing contract and applied to every reply.
+    generation.absorb_persona_directive(conn, user["id"], message)
+
+    if goal_id and goal and generation.goal_completion_detected(message):
         conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=?", (goal_id,))
         conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (goal_id,))
         conn.commit()
@@ -204,6 +210,8 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         _add_message(conn, user["id"], goal_id, "eloise", refusal)
         return {"reply": refusal, "source": "guardrail"}
 
+    persona = generation.user_persona(conn, user["id"])
+    step_done = generation.step_done_detected(message)
     if goal_id:
         # goal-scoped chat: pull that goal's actual scheduled tasks so the model can
         # point at real concrete next steps instead of hand-waving.
@@ -215,21 +223,58 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
             f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows
         )
         text, source = generation.generate_chat_reply(
-            user["name"], goal_name, history, message, db=conn, plan_lines=plan_lines
+            user["name"], goal_name, history, message, db=conn, plan_lines=plan_lines,
+            persona=persona, step_done=step_done,
         )
     else:
         board = _active_board_snapshot(conn, user["id"])
         text, source = generation.generate_global_chat_reply(
-            user["name"], [board], history, message, db=conn
+            user["name"], [board], history, message, db=conn, persona=persona,
         )
     if source == "offline" or not text:
         conn.commit()
         raise HTTPException(
             status_code=503,
-            detail="The model didn't answer, and I won't fake one. Ollama is off or unreachable — start it (or check the LLM settings), then send that again.",
+            detail="The model didn't give a usable reply — it may be off, unreachable, or it only echoed back the question (sometimes the fast local chat model needs pulling first: `ollama pull<OLLAMA_CHAT_MODEL>`). Start/check Ollama or the LLM settings, then send that again.",
+        )
+    # Duplicate gate: a weak model that just said the same thing will say it again.
+    # Spamming the exact previous line is not a reply, so refuse it as an echo
+    # instead of doubling the nonsense on the screen.
+    prev = _last_eloise_reply(conn, goal_id, user["id"])
+    if prev and _is_near_dup(text, prev):
+        conn.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="The model repeated its previous reply verbatim instead of answering. That's on the model, not you — send it again and it should give a fresh answer, or switch the chat model in LLM settings.",
         )
     _add_message(conn, user["id"], goal_id, "eloise", text)
     return {"reply": text, "source": source}
+
+
+def _last_eloise_reply(conn, goal_id, user_id):
+    try:
+        if goal_id:
+            row = conn.execute(
+                "SELECT content FROM chat_messages WHERE goal_id=? AND user_id=? AND role='eloise' ORDER BY id DESC LIMIT 1",
+                (goal_id, user_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT content FROM general_chat WHERE user_id=? AND role='eloise' ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return row["content"] if row else ""
+    except Exception:
+        return ""
+
+
+def _is_near_dup(a, b):
+    import difflib
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b or len(a) < 20 or len(b) < 20:
+        return a == b and len(a) > 0
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() > 0.82
 
 
 class _SSEBodySerializer:
@@ -259,7 +304,11 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
 
     _add_message(conn, user["id"], goal_id, "user", message)
 
-    if goal_id and goal and generation.completion_detected(message):
+    # Personality directives ("be sarcastic", "don't be a motivational speaker")
+    # are stored as a standing contract applied to every future reply.
+    generation.absorb_persona_directive(conn, user["id"], message)
+
+    if goal_id and goal and generation.goal_completion_detected(message):
         conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=?", (goal_id,))
         conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (goal_id,))
         conn.commit()
@@ -292,6 +341,8 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
     def generate():
         collected = []
         gconn = get_connection()
+        persona = generation.user_persona(gconn, user["id"])
+        step_done = generation.step_done_detected(message)
         if goal_id:
             plan_rows = gconn.execute(
                 "SELECT date, title, start_time FROM actions WHERE goal_id=? AND status!='done' ORDER BY date, start_time LIMIT 12",
@@ -301,12 +352,13 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
                 f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows
             )
             stream = generation.stream_chat_reply(
-                user["name"], goal_name, history, message, db=gconn, plan_lines=plan_lines
+                user["name"], goal_name, history, message, db=gconn, plan_lines=plan_lines,
+                persona=persona, step_done=step_done,
             )
         else:
             board = _active_board_snapshot(gconn, user["id"])
             stream = generation.stream_global_chat_reply(
-                user["name"], [board], history, message, db=gconn
+                user["name"], [board], history, message, db=gconn, persona=persona,
             )
         source = None
         try:
@@ -317,14 +369,20 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
                 collected.append(chunk)
                 yield _json.dumps({"delta": chunk})
             if collected:
+                joined = "".join(collected)
+                prev = _last_eloise_reply(gconn, goal_id, user["id"])
+                if prev and _is_near_dup(joined, prev):
+                    yield _json.dumps({"error": True, "done": True, "source": source or "offline",
+                                       "detail": "The model repeated its previous reply verbatim instead of answering. That's on the model — send it again and it should give a fresh answer."})
+                    return
                 try:
-                    _add_message(gconn, user["id"], goal_id, "eloise", "".join(collected))
+                    _add_message(gconn, user["id"], goal_id, "eloise", joined)
                 except Exception:
                     pass
             yield _json.dumps({"done": True, "source": source or "offline"})
         except Exception:
             yield _json.dumps({"error": True, "done": True, "source": "offline",
-                               "detail": "The model isn't reachable right now — start Ollama or check the LLM settings, then send that again."})
+                               "detail": "The model didn't give a usable reply — it may be off, unreachable, or it only echoed back the question. Start Ollama or check the LLM settings, then send that again."})
 
     return StreamingResponse(
         (f"data: {frame}\n\n" for frame in generate()),

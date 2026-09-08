@@ -9,7 +9,7 @@ from core.deps import require_user
 from core import generation
 from core.llm import LLMManager
 from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
-from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest
+from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest, PersonaRequest
 from core.routes.goal_routes import regenerate_plan_bg
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -131,6 +131,22 @@ def put_blocked_windows(body: BlockedWindowsRequest, user: dict = Depends(requir
     return {"ok": True, "blocked_windows": cleaned}
 
 
+@router.get("/settings/persona")
+def get_persona(user: dict = Depends(require_user)):
+    from core.generation import user_persona
+    return {"persona": user_persona(get_connection(), user["id"])}
+
+
+@router.put("/settings/persona")
+def put_persona(body: PersonaRequest, user: dict = Depends(require_user)):
+    from core.generation import user_persona
+    conn = get_connection()
+    p = (getattr(body, "persona", None) or "").strip()
+    conn.execute("UPDATE users SET persona=? WHERE id=?", (p, user["id"]))
+    conn.commit()
+    return {"ok": True, "persona": user_persona(conn, user["id"])}
+
+
 @router.get("/settings")
 def get_settings(user: dict = Depends(require_user)):
     conn = get_connection()
@@ -141,7 +157,11 @@ def get_settings(user: dict = Depends(require_user)):
             cfg = json.loads(row[0])
         except Exception:
             cfg = {}
-    return {"checkin_time": user["checkin_time"] or "08:00", "llm": get_llm(user=user)}
+    return {
+        "checkin_time": user["checkin_time"] or "08:00",
+        "llm": get_llm(user=user),
+        "persona": user.get("persona") or "",
+    }
 
 
 @router.post("/email/digest")

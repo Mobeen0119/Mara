@@ -65,11 +65,12 @@ class OllamaProvider(LLMProvider):
             self.keep_alive = int(os.environ.get("OLLAMA_KEEP_ALIVE", "1800"))
         except ValueError:
             self.keep_alive = 1800
-        # Qwen3-class thinking models waste their entire output budget on a long
-        # reasoning trace before saying anything — on CPU that's most of the latency
-        # and it can eat the whole num_predict cap, leaving an empty reply. Disable
-        # it by default (top-level `think`, the only place Ollama honors it);
-        # set OLLAMA_THINKING=1 to turn reasoning back on for the local model.
+        # Qwen3-class thinking models waste their entire output budget on a
+        # long reasoning trace before saying anything — on CPU that's most of
+        # the latency and it can eat the whole num_predict cap, leaving an
+        # empty reply. Disable it by default (top-level `think`, the only
+        # place Ollama honors it); set OLLAMA_THINKING=1 to turn reasoning
+        # back on for the local model.
         self.think = os.environ.get("OLLAMA_THINKING", "0") == "1"
 
     def _candidates(self):
@@ -84,17 +85,19 @@ class OllamaProvider(LLMProvider):
             pass
         alt_port = 11434 if port != 11434 else 11435
         wsl_ips = _wsl_host_ip()
-        # Order matters: localhost variants first (fail fast, and the common case),
-        # host-IP variants last (they can hang for seconds when unroutable).
+        # Order matters: localhost variants first (fail fast, and the common
+        # case), host-IP variants last (they can hang for seconds when
+        # unroutable).
         hosts = [base]
         if base != f"http://localhost:{port}":
             hosts.append(f"http://localhost:{port}")
         if base != f"http://localhost:{alt_port}":
             hosts.append(f"http://localhost:{alt_port}")
         hosts += [f"http://{ip}:{port}" for ip in wsl_ips]
-        # If the configured port is wrong (e.g. .env says 11435 but Ollama listens on
-        # the default 11434), probing only the configured port makes everything 503.
-        # Also try the other common Ollama port on the WSL host IPs.
+        # If the configured port is wrong (e.g. .env says 11435 but Ollama
+        # listens on the default 11434), probing only the configured port
+        # makes everything 503. Also try the other common Ollama port on the
+        # WSL host IPs.
         hosts += [f"http://{ip}:{alt_port}" for ip in wsl_ips]
         out = []
         for h in hosts:
@@ -168,13 +171,14 @@ class OllamaProvider(LLMProvider):
         )
 
     def _options(self, system_prompt="", user_prompt="", max_tokens=None):
-        # Qwen3-class models default to a huge ~32K context window. On a single CPU
-        # that 32K of KV-cache overhead makes even a 2-line chat reply crawl. But the
-        # window must fit the REAL prompt: if num_ctx is smaller than the prompt,
-        # Ollama truncates the MIDDLE of it — where the goal, constraints and persona
-        # live — and the chat/schedule silently goes "dumb" (or produces garbage
-        # titles). Base the window on the prompt length with a 4096-token floor; the
-        # output cap never decides the context size.
+        # Qwen3-class models default to a huge ~32K context window. On a
+        # single CPU that 32K of KV-cache overhead makes even a 2-line chat
+        # reply crawl. But the window must fit the REAL prompt: if num_ctx is
+        # smaller than the prompt, Ollama truncates the MIDDLE of it — where
+        # the goal, constraints and persona live — and the chat/schedule
+        # silently goes "dumb" (or produces garbage titles). Base the window
+        # on the prompt length with a 4096-token floor; the output cap never
+        # decides the context size.
         budget = len(system_prompt or "") + len(user_prompt or "")
         options = {"num_ctx": int(min(8192, 4096 + budget // 3))}
         if max_tokens:
@@ -189,8 +193,8 @@ class OllamaProvider(LLMProvider):
             "think": self.think, "options": self._options(system_prompt, user_prompt, max_tokens),
         }
         last_err = None
-        # Ollama can take 30-60s to load a large model from disk on first call.
-        # Use the full timeout per candidate instead of capping at 8s.
+        # Ollama can take 30-60s to load a large model from disk on first
+        # call. Use the full timeout per candidate instead of capping at 8s.
         per_try = max(int(timeout), 60)
         for url in self._candidates():
             started = time.monotonic()

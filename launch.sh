@@ -24,8 +24,8 @@ kill_stale() {
   if command -v fuser >/dev/null 2>&1; then
     fuser -k "${PORT}/tcp" >/dev/null 2>&1
   fi
-  # Python fallback: find and kill whatever holds the port (works on Windows too,
-  # where fuser may be absent).
+  # Python fallback: find and kill whatever holds the port (works on Windows
+  # too, where fuser may be absent).
   python3 - "$PORT" <<'PY' 2>/dev/null || true
 import sys, socket
 port = int(sys.argv[1])

@@ -5,9 +5,10 @@ import requests
 
 from core.llm.base import GenerationResult, LLMProvider, ProviderState, ProviderStatus
 
-# Any model that speaks the OpenAI chat-completions wire format works through this
-# one provider: OpenAI, Groq, OpenRouter, Together, DeepSeek, Mistral, xAI, a local
-# vLLM, LM Studio, etc. The operator just supplies a key, an endpoint and a model.
+# Any model that speaks the OpenAI chat-completions wire format works through
+# this one provider: OpenAI, Groq, OpenRouter, Together, DeepSeek, Mistral,
+# xAI, a local vLLM, LM Studio, etc. The operator just supplies a key, an
+# endpoint and a model.
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_CLOUD_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
 

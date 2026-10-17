@@ -135,9 +135,10 @@ def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
             "SELECT * FROM general_chat WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
-    # Speed: a bloated context makes the (CPU) model slower. Cap each message's size and
-    # drop the OLDEST turns once the whole history exceeds a token budget. The model only
-    # ever needs the recent tail + the current question to answer.
+    # Speed: a bloated context makes the (CPU) model slower. Cap each
+    # message's size and drop the OLDEST turns once the whole history exceeds
+    # a token budget. The model only ever needs the recent tail + the current
+    # question to answer.
     _MAX_TOTAL_CHARS = 2200
     _MAX_MSG_CHARS = 400
     lines = []
@@ -148,12 +149,12 @@ def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
         lines.append(f"{r['role']}: {content}")
     while sum(len(l) for l in lines) > _MAX_TOTAL_CHARS and len(lines) > 1:
         lines.pop(0)
-    # Structural anti-repeat: ALWAYS drop the most recent Eloise reply from the LLM's
-    # context. Weak models parrot the immediately-previous Eloise line verbatim when it
-    # is in context — that is exactly the "spamming the same answer" the user hit.
-    # Without it in front of them, they cannot copy it. The latest user message stays
-    # in so the model answers the question actually asked. (drop_reply_to kept for
-    # backwards compatibility.)
+    # Structural anti-repeat: ALWAYS drop the most recent Eloise reply from
+    # the LLM's context. Weak models parrot the immediately-previous Eloise
+    # line verbatim when it is in context — that is exactly the "spamming the
+    # same answer" the user hit. Without it in front of them, they cannot copy
+    # it. The latest user message stays in so the model answers the question
+    # actually asked. (drop_reply_to kept for backwards compatibility.)
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip().startswith("eloise:"):
             lines.pop(i)
@@ -185,8 +186,9 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         ).fetchall()
     ]
 
-    # A personality directive ("be sarcastic", "don't be a motivational speaker")
-    # typed into chat is stored as a standing contract and applied to every reply.
+    # A personality directive ("be sarcastic", "don't be a motivational
+    # speaker") typed into chat is stored as a standing contract and applied
+    # to every reply.
     generation.absorb_persona_directive(conn, user["id"], message)
 
     if goal_id and goal and generation.goal_completion_detected(message):
@@ -203,8 +205,9 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
     history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
     goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
 
-    # Content safety: refuse harmful requests before they reach the LLM. Context-aware:
-    # "sister" alone is fine, but as a follow-up to an incest message it must refuse too.
+    # Content safety: refuse harmful requests before they reach the LLM.
+    # Context-aware: "sister" alone is fine, but as a follow-up to an incest
+    # message it must refuse too.
     if generation._is_truly_harmful(message, context=history):
         refusal = generation.GUARDRAIL_REFUSAL
         _add_message(conn, user["id"], goal_id, "eloise", refusal)
@@ -213,8 +216,8 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
     persona = generation.user_persona(conn, user["id"])
     step_done = generation.step_done_detected(message)
     if goal_id:
-        # goal-scoped chat: pull that goal's actual scheduled tasks so the model can
-        # point at real concrete next steps instead of hand-waving.
+        # goal-scoped chat: pull that goal's actual scheduled tasks so the
+        # model can point at real concrete next steps instead of hand-waving.
         plan_rows = conn.execute(
             "SELECT date, title, start_time FROM actions WHERE goal_id=? AND status!='done' ORDER BY date, start_time LIMIT 12",
             (goal_id,),
@@ -237,9 +240,9 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
             status_code=503,
             detail="The model didn't give a usable reply — it may be off, unreachable, or it only echoed back the question (sometimes the fast local chat model needs pulling first: `ollama pull<OLLAMA_CHAT_MODEL>`). Start/check Ollama or the LLM settings, then send that again.",
         )
-    # Duplicate gate: a weak model that just said the same thing will say it again.
-    # Spamming the exact previous line is not a reply, so refuse it as an echo
-    # instead of doubling the nonsense on the screen.
+    # Duplicate gate: a weak model that just said the same thing will say it
+    # again. Spamming the exact previous line is not a reply, so refuse it as
+    # an echo instead of doubling the nonsense on the screen.
     prev = _last_eloise_reply(conn, goal_id, user["id"])
     if prev and _is_near_dup(text, prev):
         conn.commit()
@@ -304,8 +307,9 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
 
     _add_message(conn, user["id"], goal_id, "user", message)
 
-    # Personality directives ("be sarcastic", "don't be a motivational speaker")
-    # are stored as a standing contract applied to every future reply.
+    # Personality directives ("be sarcastic", "don't be a motivational
+    # speaker") are stored as a standing contract applied to every future
+    # reply.
     generation.absorb_persona_directive(conn, user["id"], message)
 
     if goal_id and goal and generation.goal_completion_detected(message):
@@ -333,11 +337,12 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
             media_type="text/event-stream",
         )
 
-    # No canned replies: if the model can't be reached right now, say so with a real
-    # error instead of fabricating an Eloise answer. A streaming response can't change
-    # status mid-frame, so if the model is genuinely unreachable the stream itself
-    # fails with an honest error frame — and if it's merely BUSY, the call queues on
-    # the shared model lock instead of being read as "down" by a fast probe.
+    # No canned replies: if the model can't be reached right now, say so with
+    # a real error instead of fabricating an Eloise answer. A streaming
+    # response can't change status mid-frame, so if the model is genuinely
+    # unreachable the stream itself fails with an honest error frame — and if
+    # it's merely BUSY, the call queues on the shared model lock instead of
+    # being read as "down" by a fast probe.
     def generate():
         collected = []
         gconn = get_connection()

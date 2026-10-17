@@ -12,10 +12,11 @@ from core.models import CheckinRespondRequest
 router = APIRouter(prefix="/api", tags=["checkin"])
 
 
-# A "not done" checkin used to kick a regeneration thread for EVERY active goal — with
-# several goals that is N × (up to 180s) of serialized model calls stacked in one
-# burst, all fighting the single CPU box. Now only the 2 most urgent goals are
-# regenerated per checkin, and only one bulk run per app at a time.
+# A "not done" checkin used to kick a regeneration thread for EVERY active
+# goal — with several goals that is N × (up to 180s) of serialized model calls
+# stacked in one burst, all fighting the single CPU box. Now only the 2 most
+# urgent goals are regenerated per checkin, and only one bulk run per app at a
+# time.
 _MAX_REGEN_GOALS = 2
 _regen_guard = threading.Lock()
 

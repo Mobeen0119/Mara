@@ -31,7 +31,8 @@ class EloiseScheduler:
     def conn(self):
         return self.db or get_connection()
 
-    # ------------------------------------------------------------------ digest
+    # ------------------------------------------------------------------
+    # digest
     def send_daily_digests(self):
         conn = self.conn()
         rows = conn.execute("SELECT * FROM users").fetchall()
@@ -79,7 +80,8 @@ class EloiseScheduler:
         )
         conn.commit()
 
-    # ----------------------------------------------------------------- checkin
+    # -----------------------------------------------------------------
+    # checkin
     def _is_checkin_due(self, conn, user):
         checkin_t = user["checkin_time"] or "08:00"
         try:

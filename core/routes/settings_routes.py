@@ -149,7 +149,8 @@ def put_blocked_windows(body: BlockedWindowsRequest, user: dict = Depends(requir
     conn = get_connection()
     conn.execute("UPDATE users SET blocked_windows=? WHERE id=?", (json.dumps(cleaned), user["id"]))
     conn.commit()
-    # Redraw every active goal so the new "always busy" windows are respected immediately.
+    # Redraw every active goal so the new "always busy" windows are respected
+    # immediately.
     for g in conn.execute(
         "SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)
     ).fetchall():

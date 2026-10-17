@@ -96,7 +96,8 @@ def guest(body: GuestLoginRequest):
                 "token": user["token"], "name": user.get("name") or name, "is_guest": True,
                 "email": user["email"], "has_email": True,
             }
-    # If email provided, set verified=0 (needs confirmation); pure guest without email is auto-verified
+    # If email provided, set verified=0 (needs confirmation); pure guest
+    # without email is auto-verified
     needs_verify = 1 if email else 0
     user = _new_user(name, email, password_hash, is_guest=1, verified=0 if needs_verify else 1)
     _confirm_email(user)

@@ -168,10 +168,10 @@ def get_connection():
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        # Serialize concurrent writers/readers (plan bg threads, scheduler, HTTP
-        # workers all open their own thread-local connection). Without a busy
-        # timeout, a writer can get "database is locked" and readers can see
-        # transient stale/empty rows. 8s is plenty for local writes.
+        # Serialize concurrent writers/readers (plan bg threads, scheduler,
+        # HTTP workers all open their own thread-local connection). Without a
+        # busy timeout, a writer can get "database is locked" and readers can
+        # see transient stale/empty rows. 8s is plenty for local writes.
         conn.execute("PRAGMA busy_timeout=8000")
         conn.execute("PRAGMA synchronous=NORMAL")
         _thread_local.conn = conn

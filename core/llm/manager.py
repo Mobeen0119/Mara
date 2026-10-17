@@ -11,19 +11,22 @@ from core.llm.openai_provider import DEFAULT_BASE_URL, DEFAULT_CLOUD_MODEL, Open
 
 DEFAULT_OPENROUTER_MODEL = DEFAULT_CLOUD_MODEL
 
-# OpenRouter free-tier can echo a moderation verdict instead of a reply. Never treat that as a win.
+# OpenRouter free-tier can echo a moderation verdict instead of a reply. Never
+# treat that as a win.
 _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 
 # Ollama (the local model) is a SINGLE CPU-bound process: it can only run one
-# generation per loaded model at a time. Every chat request and every plan draw shares
-# ONE lock per MODEL so a busy box becomes a clean queue instead of a stampede of
-# competing calls that slow each other down and then time out. Crucially, chat and plans
-# can run on DIFFERENT local models (OLLAMA_CHAT_MODEL=1.7b vs the 4b used for plans),
-# and Ollama serves them concurrently — so a slow plan draw on the big model must NOT
-# starve an interactive chat into OpenRouter. Callers wait on their model's lock with a
-# cap (lock_wait): a plan draw knows its own job is background work and can queue longer,
-# but an interactive CHAT must never stare at a spinner for a minute+ behind a plan —
-# past its wait cap it falls back to OpenRouter and answers now.
+# generation per loaded model at a time. Every chat request and every plan
+# draw shares ONE lock per MODEL so a busy box becomes a clean queue instead
+# of a stampede of competing calls that slow each other down and then time
+# out. Crucially, chat and plans can run on DIFFERENT local models
+# (OLLAMA_CHAT_MODEL=1.7b vs the 4b used for plans), and Ollama serves them
+# concurrently — so a slow plan draw on the big model must NOT starve an
+# interactive chat into OpenRouter. Callers wait on their model's lock with a
+# cap (lock_wait): a plan draw knows its own job is background work and can
+# queue longer, but an interactive CHAT must never stare at a spinner for a
+# minute+ behind a plan — past its wait cap it falls back to OpenRouter and
+# answers now.
 OLLAMA_LOCK = threading.Lock()
 _ollama_model_locks = {}
 _ollama_locks_guard = threading.Lock()
@@ -51,8 +54,9 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
     if not text:
         return ""
     t = text
-    # Cut everything up to the LAST prompt/echo marker and keep only the tail — that's
-    # where the actual reply lives after the model re-prints the instructions/history.
+    # Cut everything up to the LAST prompt/echo marker and keep only the tail
+    # — that's where the actual reply lives after the model re-prints the
+    # instructions/history.
     markers = [
         "Reply as Eloise.", "Respond as Eloise.", "Only output your reply.",
         "do NOT echo this prompt", "Do NOT echo this prompt",
@@ -79,9 +83,10 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
     if not t:
         return ""
     # Strip verbatim re-quotes of the user's EARLIER lines ("'Nice. Let's move
-    # forward.'" played back in the reply). The excerpt can be wrapped in quotes or
-    # markdown bold/italic, and a weak model often quotes just the closing TAIL of
-    # the line, so try every suffix too (e.g. the imperative "Let's move forward.").
+    # forward.'" played back in the reply). The excerpt can be wrapped in
+    # quotes or markdown bold/italic, and a weak model often quotes just the
+    # closing TAIL of the line, so try every suffix too (e.g. the imperative
+    # "Let's move forward.").
     for ul in (user_lines or []):
         ul = (ul or "").strip()
         if not ul:
@@ -101,7 +106,8 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
                     break
             if not t:
                 return ""
-    # Refuse a verbatim/near-verbatim copy of the question the user just asked.
+    # Refuse a verbatim/near-verbatim copy of the question the user just
+    # asked.
     if user_message:
         def norm(s):
             return re.sub(r"\s+", " ", (s or "").strip().lower()).strip(".:?! \"'")
@@ -109,8 +115,9 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
         body = re.sub(r"^(eloise|assistant|user)\s*[:|]\s*", " ", t, flags=re.I)
         if norm(body) == norm(user_message) or norm(body).startswith(norm(user_message)):
             return ""
-    # Strip sycophancy openers: the weak-model answer to "i don't like X" is not a
-    # real reply — it's "You're right—..." + a rephrase of the user's own words.
+    # Strip sycophancy openers: the weak-model answer to "i don't like X" is
+    # not a real reply — it's "You're right—..." + a rephrase of the user's
+    # own words.
     _SYC_OPENER = re.compile(
         r"^\s*(?:you['’]?re\s+right|you\s+are\s+right|i\s+understand|"
         r"great\s+(?:point|question|stuff)|that['’]?s\s+(?:a\s+)?great|"
@@ -130,8 +137,9 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
 def _ollama_base_url(raw=None):
     raw = raw if raw is not None else os.environ.get("OLLAMA_URL", "http://localhost:11434")
     raw = (raw or "").strip() or "http://localhost:11434"
-    # If someone pastes a full endpoint like http://host:11435/api/generate, strip the path
-    # so our own /api/tags and /api/generate calls land correctly.
+    # If someone pastes a full endpoint like http://host:11435/api/generate,
+    # strip the path so our own /api/tags and /api/generate calls land
+    # correctly.
     from urllib.parse import urlparse
     p = urlparse(raw)
     if p.scheme and p.hostname:
@@ -249,24 +257,28 @@ class LLMManager:
         import logging
         logger = logging.getLogger("eloise.llm")
         ordered = self._ordered(prefer_cloud=prefer_cloud)
-        # Try every provider — even if status says non-usable, attempt generation anyway.
-        # Status can be wrong (slow probe, transient failure), and a generate call is the
-        # real test. Only skip providers that are plainly missing (e.g. no API key at all).
+        # Try every provider — even if status says non-usable, attempt
+        # generation anyway. Status can be wrong (slow probe, transient
+        # failure), and a generate call is the real test. Only skip providers
+        # that are plainly missing (e.g. no API key at all).
         for p in ordered:
-            # Skip cloud providers without a key; status can be wrong (slow probe) but
-            # an empty key can never succeed. Local Ollama never needs a key.
+            # Skip cloud providers without a key; status can be wrong (slow
+            # probe) but an empty key can never succeed. Local Ollama never
+            # needs a key.
             if getattr(p, "requires_key", False) and not getattr(p, "api_key", ""):
                 logger.debug("skipping %s: no API key", p.name)
                 continue
             logger.info("trying provider: %s (model: %s)", p.name, p.model)
             if p.name == "ollama":
-                # The local box runs one generation per loaded model at a time. Wait
-                # HERE (before the timeout starts counting) so a queued call still gets
-                # its FULL timeout instead of burning its budget sitting behind a busy
-                # predecessor — but only for up to lock_wait seconds. Chat and plans
-                # each hold their OWN model's lock (e.g. 1.7b vs 4b), so they run
-                # concurrently. If the configured CHAT model is missing (404) or errors,
-                # retry on the PLAN model — still local — before ever opening the cloud.
+                # The local box runs one generation per loaded model at a
+                # time. Wait HERE (before the timeout starts counting) so a
+                # queued call still gets its FULL timeout instead of burning
+                # its budget sitting behind a busy predecessor — but only for
+                # up to lock_wait seconds. Chat and plans each hold their OWN
+                # model's lock (e.g. 1.7b vs 4b), so they run concurrently. If
+                # the configured CHAT model is missing (404) or errors, retry
+                # on the PLAN model — still local — before ever opening the
+                # cloud.
                 if model_override is None:
                     attempts = [None]
                 else:
@@ -346,13 +358,14 @@ class LLMManager:
             logger.info("streaming from provider: %s (model: %s)", p.name, p.model)
             try:
                 if p.name == "ollama":
-                    # The CPU box runs one generation per loaded model; hold THIS
-                    # model's lock for the whole stream so later callers queue behind
-                    # it, but only up to lock_wait. Chat (1.7b) and plans (4b) hold
-                    # different per-model locks so they run concurrently. If the
-                    # configured CHAT model is missing or a stream dies, retry on the
-                    # PLAN model (still local) before ever falling back to the cloud —
-                    # the user wants local chat, not OpenRouter output.
+                    # The CPU box runs one generation per loaded model; hold
+                    # THIS model's lock for the whole stream so later callers
+                    # queue behind it, but only up to lock_wait. Chat (1.7b)
+                    # and plans (4b) hold different per-model locks so they
+                    # run concurrently. If the configured CHAT model is
+                    # missing or a stream dies, retry on the PLAN model (still
+                    # local) before ever falling back to the cloud — the user
+                    # wants local chat, not OpenRouter output.
                     if model_override is None:
                         attempts = [None]
                     else:

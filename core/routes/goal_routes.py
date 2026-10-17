@@ -440,7 +440,7 @@ def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
     conn.execute("DELETE FROM actions WHERE goal_id=?", (goal["id"],))
     _insert_actions(conn, goal, final)
     summary = f"{len(final)} tasks across {len(set(e['date'] for e in final))} days"
-    if provider in ("ollama", "openrouter"):
+    if provider and provider != "fallback" and provider != "none":
         summary += f" · via {provider}"
     conn.execute(
         "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",

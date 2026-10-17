@@ -78,6 +78,9 @@ def get_manager(db=None):
     global _manager
     if _manager is None:
         _manager = LLMManager(db=db)
+    elif db is not None:
+        # Refresh the connection so provider_config reads the live app_settings.
+        _manager._db = db
     return _manager
 
 

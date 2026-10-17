@@ -69,6 +69,14 @@ class CheckinRespondRequest(BaseModel):
 
 
 class LLMSettingsRequest(BaseModel):
+    """Any OpenAI-compatible endpoint: paste a key + pick a model. Provider and
+    base URL optional (a sensible default endpoint is used when blank)."""
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    enable_local: Optional[bool] = None
+    # Legacy fields, still accepted for older clients.
     ollama_url: Optional[str] = None
     ollama_model: Optional[str] = None
     openrouter_model: Optional[str] = None

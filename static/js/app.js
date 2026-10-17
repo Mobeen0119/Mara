@@ -375,12 +375,13 @@ async function renderToday(el) {
     } catch (e) {}
 
     // model status footer
-    html += `<div style="margin-top:auto;padding-top:40px;display:flex;align-items:center;gap:10px;color:var(--bone-mute);font-size:12px;">
+    html += `<div style="margin-top:auto;padding-top:40px;display:flex;align-items:center;gap:10px;color:var(--bone-mute);font-size:12px;flex-wrap:wrap;">
       <span class="ember-dot"></span>
-      ${status.local_model_available
-        ? '<span class="chip hot">Local engine live</span>'
-        : '<span class="chip off">&#x25CB; Local engine off — checks fall back to scripted Eloise</span>'}
-      <span>${status.ollama_error ? escHtml(status.ollama_error) : ''}</span>
+      ${status.cloud_configured
+        ? `<span class="chip hot">${escHtml(status.provider || 'cloud')} armed — ${escHtml(status.cloud_model || '')}</span>`
+        : '<span class="chip off">&#x25CB; No API key — add one in Settings</span>'}
+      <span>${status.cloud_error && !status.cloud_configured ? escHtml(status.cloud_error) : ''}</span>
+      ${status.local_model_available ? '<span class="chip hot">local live</span>' : ''}
     </div>
     </div>`;  // close .screen-fill
 
@@ -1117,7 +1118,7 @@ async function streamChatReply(goalId, message, onDelta) {
     }
   }
   if (!full && (!source || source === 'offline')) {
-    throw new Error("The model didn't answer, and I won't fake one. It may be off, or it echoed my prompt back (pull the chat model first). Check Ollama / LLM settings, then send that again.");
+    throw new Error("The model didn't answer, and I won't fake one. It may be off, the key may be wrong, or it echoed my prompt back. Check the LLM settings and key, then send that again.");
   }
   return { text: full, source: source || 'llm' };
 }
@@ -1182,19 +1183,31 @@ async function renderSettings(el) {
   let html = `<div class="page-header"><div class="kicker">Settings</div><h1>Tuning the rig.</h1><div class="header-rule"></div></div>`;
   try {
     const [llm, status] = await Promise.all([api('/settings/llm'), api('/status')]);
-    html += `<div class="settings-section"><h3>LLM Providers</h3>
+    window._lastLlm = llm;
+    window._lastStatus = status;
+    html += `<div class="settings-section"><h3>LLM Provider</h3>
       <div class="card">
         <div style="margin-bottom:18px;">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
-            ${status.local_model_available ? '<span class="chip hot"><span class="ember-dot"></span> Local engine live</span>' : '<span class="chip off">&#x25CB; Local engine off</span>'}
-            ${status.cloud_configured ? '<span class="chip hot">OpenRouter armed</span>' : '<span class="chip off">&#x25CB; OpenRouter off</span>'}
+            ${status.cloud_configured ? '<span class="chip hot"><span class="ember-dot"></span> Cloud engine armed (' + escHtml(status.provider || 'cloud') + ')</span>' : '<span class="chip off">&#x25CB; No API key — paste one below</span>'}
+            ${status.local_model_available ? '<span class="chip hot">Local engine live</span>' : ''}
           </div>
-          <p style="font-size:13px;color:var(--bone-dim);">Primary: ${escHtml(status.ollama_model || 'not set')} · Fallback: ${escHtml(llm.openrouter_model || 'not set')}</p>
+          <p style="font-size:13px;color:var(--bone-dim);">Model: ${escHtml(status.cloud_model || 'not set')}${status.cloud_error ? ' · ' + escHtml(status.cloud_error) : ''}</p>
         </div>
-        <div class="field"><label>Ollama URL</label><input type="text" id="set-ollama-url" value="${escHtml(status.ollama_url || llm.ollama_url || '')}"></div>
-        <div class="field"><label>Ollama Model</label><input type="text" id="set-ollama-model" value="${escHtml(status.ollama_model || llm.ollama_model || '')}"></div>
-        <div class="field"><label>OpenRouter Model</label><input type="text" id="set-or-model" value="${escHtml(llm.openrouter_model || '')}"></div>
-        <div class="field"><label>OpenRouter API Key</label><input type="password" id="set-or-key" placeholder="Leave blank to keep current"></div>
+        <div class="field"><label>Provider</label>
+          <select id="set-provider" onchange="applyProviderPreset()">
+            <option value="openrouter">OpenRouter</option>
+            <option value="openai">OpenAI</option>
+            <option value="groq">Groq</option>
+            <option value="together">Together AI</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="">Custom / other (OpenAI-compatible)</option>
+          </select>
+        </div>
+        <div class="field"><label>API Base URL</label><input type="text" id="set-base-url" placeholder="https://openrouter.ai/api/v1"></div>
+        <div class="field"><label>Model</label><input type="text" id="set-model" placeholder="e.g. meta-llama/llama-3.1-8b-instruct:free"></div>
+        <div class="field"><label>API Key</label><input type="password" id="set-api-key" placeholder="Leave blank to keep current"></div>
+        <div class="field"><label><input type="checkbox" id="set-enable-local" style="width:auto;margin-right:8px;">Also use a local Ollama engine (optional)</label></div>
         <button class="btn" style="width:auto;" onclick="saveLLMSettings()">Save Settings</button>
       </div>
     </div>`;
@@ -1266,14 +1279,45 @@ async function renderSettings(el) {
     html += `<p style="color:#ff8b7a;">Failed to load settings.</p>`;
   }
   el.innerHTML = html;
+  // populate LLM provider fields
+  const llmState = window._lastLlm;
+  if (llmState) {
+    const sel = document.getElementById('set-provider');
+    const bl = document.getElementById('set-base-url');
+    const ml = document.getElementById('set-model');
+    const prov = (llmState.provider || '').trim().toLowerCase();
+    if (sel) sel.value = ['openrouter','openai','groq','together','deepseek'].includes(prov) ? prov : '';
+    if (bl) bl.value = llmState.base_url || '';
+    if (ml) ml.value = llmState.model || '';
+    const elc = document.getElementById('set-enable-local');
+    if (elc) elc.checked = !!llmState.enable_local;
+  }
   renderBusyWindows();
+}
+const _PROVIDER_PRESETS = {
+  openrouter: { url: 'https://openrouter.ai/api/v1', model: 'meta-llama/llama-3.1-8b-instruct:free' },
+  openai: { url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  groq: { url: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
+  together: { url: 'https://api.together.xyz/v1', model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
+  deepseek: { url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+};
+function applyProviderPreset() {
+  const sel = document.getElementById('set-provider');
+  const bl = document.getElementById('set-base-url');
+  const ml = document.getElementById('set-model');
+  const preset = _PROVIDER_PRESETS[(sel && sel.value) || ''];
+  if (!preset) return;
+  if (bl) bl.value = preset.url;
+  if (ml) ml.placeholder = preset.model;
+  if (ml && !ml.value) ml.value = preset.model;
 }
 async function saveLLMSettings() {
   const body = {
-    ollama_url: document.getElementById('set-ollama-url').value,
-    ollama_model: document.getElementById('set-ollama-model').value,
-    openrouter_model: document.getElementById('set-or-model').value,
-    openrouter_key: document.getElementById('set-or-key').value,
+    provider: (document.getElementById('set-provider') || {}).value || '',
+    base_url: (document.getElementById('set-base-url') || {}).value || '',
+    model: (document.getElementById('set-model') || {}).value || '',
+    api_key: (document.getElementById('set-api-key') || {}).value || '',
+    enable_local: !!(document.getElementById('set-enable-local') || {}).checked,
   };
   try { await api('/settings/llm', { method: 'PUT', body: JSON.stringify(body) }); showToast('Settings saved', 'success'); } catch (e) { showToast(e.message, 'error'); }
 }

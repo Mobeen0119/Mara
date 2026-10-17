@@ -8,6 +8,7 @@ from core.database import get_connection
 from core.deps import require_user
 from core import generation
 from core.llm import LLMManager
+from core.llm.openai_provider import DEFAULT_BASE_URL, DEFAULT_CLOUD_MODEL
 from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
 from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest, PersonaRequest
 from core.routes.goal_routes import regenerate_plan_bg
@@ -55,11 +56,19 @@ def get_llm(user: dict = Depends(require_user)):
         except Exception:
             cfg = {}
     import os
+    base_url = cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL") or DEFAULT_BASE_URL
+    model = (cfg.get("model") or os.environ.get("OPENAI_MODEL")
+             or os.environ.get("OPENROUTER_MODEL") or DEFAULT_CLOUD_MODEL)
     return {
+        "provider": cfg.get("provider") or "",
+        "base_url": base_url,
+        "model": model,
+        "api_key_set": bool(cfg.get("api_key") or cfg.get("openrouter_key")
+                            or os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY")),
+        "enable_local": cfg.get("enable_local", False),
         "ollama_url": _clean_ollama_url(cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434")),
         "ollama_model": cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
-        "openrouter_model": cfg.get("openrouter_model") or os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
-        "openrouter_key_set": bool(cfg.get("openrouter_key") or os.environ.get("OPENROUTER_API_KEY")),
+        "openrouter_model": model,
     }
 
 
@@ -73,14 +82,31 @@ def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_user)):
             cfg = json.loads(row[0])
         except Exception:
             cfg = {}
+    if body.api_key is not None and body.api_key.strip():
+        cfg["api_key"] = body.api_key.strip()
+        cfg.pop("openrouter_key", None)
+    if body.openrouter_key is not None and body.openrouter_key.strip():
+        cfg["api_key"] = body.openrouter_key.strip()
+        cfg.pop("openrouter_key", None)
+    if body.model is not None and body.model.strip():
+        cfg["model"] = body.model.strip()
+    elif body.openrouter_model is not None and body.openrouter_model.strip():
+        cfg["model"] = body.openrouter_model.strip()
+    if body.base_url is not None and body.base_url.strip():
+        cfg["base_url"] = body.base_url.strip()
+        if not body.provider:
+            cfg.pop("provider", None)
+    if body.provider is not None:
+        if body.provider.strip():
+            cfg["provider"] = body.provider.strip()
+        else:
+            cfg.pop("provider", None)
+    if body.enable_local is not None:
+        cfg["enable_local"] = bool(body.enable_local)
     if body.ollama_url is not None:
         cfg["ollama_url"] = body.ollama_url.strip()
     if body.ollama_model is not None:
         cfg["ollama_model"] = body.ollama_model.strip()
-    if body.openrouter_model is not None:
-        cfg["openrouter_model"] = body.openrouter_model.strip()
-    if body.openrouter_key is not None and body.openrouter_key.strip():
-        cfg["openrouter_key"] = body.openrouter_key.strip()
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES ('llm', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

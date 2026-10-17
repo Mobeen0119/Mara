@@ -7,9 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from core.llm.base import GenerationResult, ProviderState
 from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
 from core.llm.ollama_provider import OllamaProvider
-from core.llm.openrouter_provider import OpenRouterProvider
+from core.llm.openai_provider import DEFAULT_BASE_URL, DEFAULT_CLOUD_MODEL, OpenAICompatProvider
 
-DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"
+DEFAULT_OPENROUTER_MODEL = DEFAULT_CLOUD_MODEL
 
 # OpenRouter free-tier can echo a moderation verdict instead of a reply. Never treat that as a win.
 _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
@@ -140,16 +140,66 @@ def _ollama_base_url(raw=None):
     return raw
 
 
+def _local_enabled():
+    """Local Ollama is OFF by default. The app is built to run on any machine with
+    just an API key; the local engine is an optional extra (ELOISE_ENABLE_LOCAL=1
+    or the Settings toggle) for people who want it."""
+    try:
+        v = (os.environ.get("ELOISE_ENABLE_LOCAL", "") or "").strip().lower()
+        if v:
+            return v in ("1", "true", "yes", "on")
+    except Exception:
+        pass
+    return False
+
+
+def _infer_label(base_url):
+    base_url = (base_url or "").lower()
+    for label, needle in (
+        ("openrouter", "openrouter"),
+        ("groq", "groq"),
+        ("openai", "openai"),
+        ("deepseek", "deepseek"),
+        ("together", "together"),
+        ("mistral", "mistral"),
+        ("xai", "x.ai"),
+        ("anthropic", "anthropic"),
+    ):
+        if needle in base_url:
+            return label
+    return "cloud"
+
+
 def build_providers(db=None, config=None):
-    config = config or {}
-    ollama = OllamaProvider(
-        base_url=_ollama_base_url(),
-        model=config.get("ollama_model") or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
-    )
-    or_key = config.get("openrouter_key") or os.environ.get("OPENROUTER_API_KEY", "")
-    or_model = config.get("openrouter_model") or os.environ.get("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
-    openrouter = OpenRouterProvider(api_key=or_key, model=or_model)
-    return [ollama, openrouter]
+    """Providers for THIS deployment. The cloud provider (any OpenAI-compatible
+    endpoint) is always built; the local Ollama engine is only added when explicitly
+    enabled. No local model is required to run the app."""
+    config = dict(config or {})
+    # Normalize legacy OpenRouter-only settings into the generic fields.
+    if config.get("openrouter_key") and not config.get("api_key"):
+        config["api_key"] = config["openrouter_key"]
+    if config.get("openrouter_model") and not config.get("model"):
+        config["model"] = config["openrouter_model"]
+    if config.get("openrouter_key") and not config.get("base_url") and not config.get("model"):
+        config["base_url"] = DEFAULT_BASE_URL
+
+    base_url = (config.get("base_url") or os.environ.get("OPENAI_BASE_URL")
+                or os.environ.get("OPENROUTER_URL") or DEFAULT_BASE_URL)
+    api_key = (config.get("api_key") or os.environ.get("OPENAI_API_KEY")
+               or os.environ.get("OPENROUTER_API_KEY") or "")
+    model = (config.get("model") or os.environ.get("OPENAI_MODEL")
+             or os.environ.get("OPENROUTER_MODEL") or DEFAULT_CLOUD_MODEL)
+    label = (config.get("provider") or "").strip() or _infer_label(base_url)
+    providers = [OpenAICompatProvider(api_key=api_key, model=model, base_url=base_url, name=label)]
+
+    enable_local = config.get("enable_local") if ("enable_local" in config) else _local_enabled()
+    if enable_local:
+        ollama = OllamaProvider(
+            base_url=_ollama_base_url(config.get("ollama_url")),
+            model=config.get("ollama_model") or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
+        )
+        providers.append(ollama)
+    return providers
 
 
 def provider_config(db):
@@ -183,17 +233,16 @@ class LLMManager:
             return by_name
 
     def _ordered(self, prefer_cloud=False):
-        """Provider attempt order, per use case:
-        - Plans (prefer_cloud=True): OpenRouter FIRST — cloud runs in parallel with the
-          local chat model, so a schedule draw never blocks (or is blocked by) chat.
-          Falls back to the local model when no key is set or the cloud fails.
-        - Chat (default/prefer_cloud=False): the LOCAL model FIRST (the user explicitly
-          wants local output for his conversations); OpenRouter only as a fallback."""
+        """Provider attempt order:
+        - prefer_cloud=True (plan draws/redraws): cloud FIRST, local as fallback.
+        - default (chat): local first IF one is enabled, else cloud. With no local
+          engine configured (the default) both paths simply use the cloud provider."""
         providers = self._providers()
-        o, l = providers.get("openrouter"), providers.get("ollama")
+        cloud = [p for p in providers.values() if p.name != "ollama"]
+        local = [p for p in providers.values() if p.name == "ollama"]
         if prefer_cloud:
-            return [p for p in (o, l) if p is not None]
-        return [p for p in (l, o) if p is not None]
+            return cloud + local
+        return local + cloud
 
     def generate(self, system_prompt, user_prompt, timeout=30, max_tokens=None,
                  prefer_cloud=False, model_override=None, lock_wait=60) -> GenerationResult:
@@ -204,9 +253,10 @@ class LLMManager:
         # Status can be wrong (slow probe, transient failure), and a generate call is the
         # real test. Only skip providers that are plainly missing (e.g. no API key at all).
         for p in ordered:
-            # Skip OpenRouter if no API key
-            if p.name == "openrouter" and not getattr(p, "api_key", ""):
-                logger.debug("skipping openrouter: no API key")
+            # Skip cloud providers without a key; status can be wrong (slow probe) but
+            # an empty key can never succeed. Local Ollama never needs a key.
+            if getattr(p, "requires_key", False) and not getattr(p, "api_key", ""):
+                logger.debug("skipping %s: no API key", p.name)
                 continue
             logger.info("trying provider: %s (model: %s)", p.name, p.model)
             if p.name == "ollama":
@@ -245,7 +295,7 @@ class LLMManager:
                 return result
         return GenerationResult(
             ok=False, provider="none", model="none",
-            error="no usable provider (start local model or add an API key)",
+            error="no usable provider (add an API key in Settings)",
         )
 
     def _attempt(self, p, system_prompt, user_prompt, timeout, max_tokens, model_override=None):
@@ -288,7 +338,7 @@ class LLMManager:
         ordered = self._ordered(prefer_cloud=prefer_cloud)
         logger = logging.getLogger("eloise.llm")
         for p in ordered:
-            if p.name == "openrouter" and not getattr(p, "api_key", ""):
+            if getattr(p, "requires_key", False) and not getattr(p, "api_key", ""):
                 continue
             stream = getattr(p, "generate_stream", None)
             if stream is None:
@@ -358,17 +408,26 @@ class LLMManager:
         return out
 
     def status_dict(self):
+        providers = self._providers()
         statuses = self.statuses()
-        by_name = {s.name: s for s in statuses}
-        ollama = by_name.get("ollama")
-        openrouter = by_name.get("openrouter")
+        by_state = {s.name: s for s in statuses}
+        cloud = next((p for name, p in providers.items() if name != "ollama"), None)
+        ollama = providers.get("ollama")
+        cloud_st = by_state.get(cloud.name) if cloud else None
+        ollama_st = by_state.get("ollama") if ollama else None
         return {
-            "local_reachable": ollama is not None and ollama.state != ProviderState.UNREACHABLE,
-            "local_model_available": ollama is not None and ollama.state == ProviderState.READY,
+            "provider": (cloud.name if cloud else None),
+            "base_url": (cloud.base_url if cloud else None),
+            "cloud_model": (cloud.model if cloud else None),
+            "cloud_configured": bool(cloud and cloud.api_key),
+            "api_key_set": bool(cloud and cloud.api_key),
+            "cloud_error": (cloud_st.detail if cloud_st and cloud_st.state != ProviderState.READY else None),
+            "local_enabled": _local_enabled(),
+            "local_reachable": ollama_st is not None and ollama_st.state != ProviderState.UNREACHABLE,
+            "local_model_available": ollama_st is not None and ollama_st.state == ProviderState.READY,
             "ollama_model": (ollama.model if ollama else None),
             "ollama_url": _ollama_base_url(),
-            "ollama_error": (None if ollama and ollama.usable else (ollama.detail if ollama else None)),
-            "cloud_configured": openrouter is not None and openrouter.state == ProviderState.READY,
-            "openrouter_model": (openrouter.model if openrouter else None),
-            "openrouter_error": (openrouter.detail if openrouter and not openrouter.usable else None),
+            "ollama_error": (None if (ollama_st and ollama_st.usable) else (ollama_st.detail if ollama_st else None)),
+            "openrouter_model": (cloud.model if cloud else None),
+            "openrouter_error": (cloud_st.detail if cloud_st and cloud_st.state != ProviderState.READY else None),
         }

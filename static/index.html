@@ -8,7 +8,9 @@
 </head>
 <body>
 
-<!-- ===================== AUTH / VELVET ROOM ===================== -->
+<div class="bokeh" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+
+<!-- ===================== AUTH ===================== -->
 <section id="auth-screen" class="auth-stage hidden">
   <div class="auth-wrap">
     <div class="brand-mark"><span class="brand-name">Eloise</span> <span class="brand-digit">//exe</span></div>
@@ -20,34 +22,80 @@
   </div>
 </section>
 
-<!-- ===================== APP / CONTROL DESK ===================== -->
+<!-- ===================== APP ===================== -->
 <section id="app-screen" class="hidden">
-  <aside class="sidebar">
-    <div class="brand"><span class="brand-mark"><span class="brand-name">Eloise</span><span class="brand-digit">//exe</span></span></div>
-    <p class="tagline">execution is the only discipline</p>
-    <nav class="nav">
-      <div class="nav-group">
-        <div class="nav-group-title">Desk</div>
-        <a class="nav-item" data-screen="today" onclick="navigate('today')"><span class="icon">&#x25B5;</span> Today</a>
-        <a class="nav-item" data-screen="board" onclick="navigate('board')"><span class="icon">&#x27A1;</span> Board</a>
-        <a class="nav-item" data-screen="goals" onclick="navigate('goals')"><span class="icon">&#x2197;</span> Goals</a>
-      </div>
-      <div class="nav-group">
-        <div class="nav-group-title">Lines</div>
-        <a class="nav-item" data-screen="new-goal" onclick="navigate('new-goal')"><span class="icon">+</span> File Goal</a>
-        <a class="nav-item" data-screen="schedule" onclick="navigate('schedule')"><span class="icon">&#x2140;</span> Schedule</a>
-        <a class="nav-item" data-screen="global-chat" onclick="navigate('global-chat')"><span class="icon">&#x2709;</span> Eloise</a>
-        <a class="nav-item" data-screen="settings" onclick="navigate('settings')"><span class="icon">&#x2699;</span> Settings</a>
-      </div>
+
+  <aside class="rail">
+    <a class="rail-brand" onclick="navigate('today')" title="Eloise — home">E</a>
+    <nav class="rail-nav">
+      <button class="rail-item" data-screen="today" onclick="navigate('today')" title="Today">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg>
+        <span>Today</span>
+      </button>
+      <button class="rail-item" data-screen="board" onclick="navigate('board')" title="Board">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+        <span>Board</span>
+      </button>
+      <button class="rail-item" data-screen="goals" onclick="navigate('goals')" title="Goals">
+        <svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>
+        <span>Goals</span>
+      </button>
+      <button class="rail-item" data-screen="new-goal" onclick="navigate('new-goal')" title="File a goal">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        <span>File</span>
+      </button>
+      <button class="rail-item" data-screen="schedule" onclick="navigate('schedule')" title="Schedule">
+        <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="1"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+        <span>Schedule</span>
+      </button>
+      <button class="rail-item" data-screen="settings" onclick="navigate('settings')" title="Settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 8.9 19a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 5 8.9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        <span>Settings</span>
+      </button>
     </nav>
-    <div class="sidebar-foot">
-      <div class="foot-row"><span id="user-name" class="ember-dot"></span><span id="user-label"></span></div>
-      <div class="foot-momentum" id="foot-momentum"></div>
+    <div class="rail-foot">
+      <button class="rail-item rail-chat" id="rail-chat" onclick="toggleChatPanel()" title="Talk to Eloise">
+        <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>Eloise</span>
+        <i class="rail-dot" id="rail-dot"></i>
+      </button>
+      <div class="rail-user" id="rail-user" title="Signed in">?</div>
     </div>
   </aside>
 
   <main id="main-content" class="main"></main>
+
+  <!-- Persistent chat side panel -->
+  <aside id="chat-panel" class="chat-panel" aria-hidden="true">
+    <div class="panel-head">
+      <div class="panel-id">
+        <span class="panel-sigil">E</span>
+        <div class="panel-meta">
+          <div class="panel-name">Eloise</div>
+          <div class="panel-model" id="panel-model">checking the line…</div>
+        </div>
+      </div>
+      <button class="panel-close" onclick="toggleChatPanel(false)" title="Close">&times;</button>
+    </div>
+    <div id="chat-container" class="chat-container"></div>
+    <div class="chat-quick">
+      <button class="chip quick-chip" onclick="quickChat('Today')">Today</button>
+      <button class="chip quick-chip" onclick="quickChat('Score')">Score</button>
+      <button class="chip quick-chip" onclick="quickChat('Fire')">Urgent</button>
+      <button class="chip quick-chip" onclick="quickChat('Momentum')">Momentum</button>
+      <button class="chip quick-chip" onclick="quickChat('Stakes')">Stakes</button>
+      <button class="chip quick-chip" onclick="quickChat('Fuck it')">Fuck it</button>
+    </div>
+    <div class="chat-input">
+      <input type="text" id="global-chat-input" placeholder="Say something…" autocomplete="off">
+      <button class="btn send-btn" onclick="sendGlobalChat()" title="Send">
+        <svg viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+      </button>
+    </div>
+  </aside>
 </section>
+
+<div id="toasts" class="toasts"></div>
 
 <script src="/static/js/app.js"></script>
 </body>

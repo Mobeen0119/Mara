@@ -443,9 +443,8 @@ def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
         by_date.setdefault(d, []).append(e)
     final = []
     for d, day_entries in sorted(by_date.items()):
-        # keep the earliest 3 distinct blocks for that date
         day_entries.sort(key=lambda e: (_to_min(e.get("start_time")) or 0))
-        final.extend(day_entries[:3])
+        final.extend(day_entries)
     # Cross-goal conflict resolution: pull this user's OTHER goals' blocks and
     # this user's global blocked windows, shift any overlapping entry to the
     # next free slot.
@@ -603,9 +602,23 @@ def create_goal(body: GoalCreateRequest, user: dict = Depends(require_user)):
     # kick off plan generation in the background thread so response is
     # immediate
     threading.Thread(target=_regenerate_plan_bg, args=(user, goal["id"]), daemon=True).start()
-    # return questionnaire questions so the frontend can ask them
-    questions = generation.goal_questionnaire(title)
-    return {"id": goal["id"], "async": True, "questions": questions}
+    # questions are fetched right after via POST /goals/{id}/clarify (the
+    # model writes them for this specific goal); returning none here keeps
+    # creation instant.
+    return {"id": goal["id"], "async": True}
+
+
+@router.post("/goals/{goal_id}/clarify")
+def clarify_goal(goal_id: int, user: dict = Depends(require_user)):
+    """Model-written clarifying questions for THIS goal (2-3 sharp ones), so
+    the frontend can ask them instead of a hardcoded category set. Falls back
+    to the built-in sets when the model is unreachable."""
+    goal = _goal_or_404(user, goal_id)
+    conn = get_connection()
+    questions = generation.generate_clarify_questions(
+        goal.get("title") or goal.get("display_title") or "", db=conn,
+    )
+    return {"questions": questions}
 
 
 @router.post("/goals/{goal_id}/details")

@@ -68,15 +68,16 @@ class EloiseScheduler:
             html = build_daily_email_html(
                 user["name"], tasks, round(total, 1), 0, goal_title=goals[0]["display_title"] if goals else None
             )
-            from core.mailer import send_email
-            ok = send_email(user["email"], "Eloise - your day", "See your schedule in the app.", html)
+            from core.mailer import send_email_detailed
+            ok, err = send_email_detailed(user["email"], "Eloise - your day", "See your schedule in the app.", html)
             kind = "daily_digest" if ok else "daily_digest_failed"
-        except Exception:
+        except Exception as exc:
             kind = "daily_digest_failed"
             ok = False
+            err = f"{type(exc).__name__}: {exc}"
         conn.execute(
             "INSERT INTO logs (user_id, kind, message) VALUES (?,?,?)",
-            (user["id"], kind, f"digest: {len(tasks)} tasks, {round(total,1)}h" + ("" if ok else " (mail failed)")),
+            (user["id"], kind, f"digest: {len(tasks)} tasks, {round(total,1)}h" + ("" if ok else f" (mail failed: {err})")),
         )
         conn.commit()
 

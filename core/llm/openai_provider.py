@@ -12,18 +12,94 @@ from core.llm.base import GenerationResult, LLMProvider, ProviderState, Provider
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_CLOUD_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
 
+# Provider presets shared by the API and the Settings UI: pick a provider and
+# the endpoint + a sane default model come with it, so "paste a key and go"
+# never leaves a stale base URL or model from the previous provider behind.
+PROVIDER_PRESETS = [
+    {
+        "id": "openrouter", "label": "OpenRouter",
+        "url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.1-8b-instruct:free",
+        "match": ["openrouter.ai"], "key_prefix": "sk-or-",
+    },
+    {
+        "id": "gemini", "label": "Google Gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "model": "gemini-3.5-flash-lite",
+        "match": ["generativelanguage.googleapis.com"], "key_prefix": "AIza",
+    },
+    {
+        "id": "openai", "label": "OpenAI",
+        "url": "https://api.openai.com/v1", "model": "gpt-4o-mini",
+        "match": ["api.openai.com"], "key_prefix": "sk-",
+    },
+    {
+        "id": "groq", "label": "Groq",
+        "url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile",
+        "match": ["groq.com"], "key_prefix": "gsk_",
+    },
+    {
+        "id": "cerebras", "label": "Cerebras",
+        "url": "https://api.cerebras.ai/v1", "model": "llama-3.3-70b",
+        "match": ["cerebras.ai"], "key_prefix": "csk-",
+    },
+    {
+        "id": "deepseek", "label": "DeepSeek",
+        "url": "https://api.deepseek.com/v1", "model": "deepseek-chat",
+        "match": ["deepseek.com"], "key_prefix": "",
+    },
+    {
+        "id": "together", "label": "Together AI",
+        "url": "https://api.together.xyz/v1",
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "match": ["together.xyz"], "key_prefix": "",
+    },
+    {
+        "id": "mistral", "label": "Mistral",
+        "url": "https://api.mistral.ai/v1", "model": "mistral-small-latest",
+        "match": ["api.mistral.ai"], "key_prefix": "",
+    },
+]
+PRESET_BY_ID = {p["id"]: p for p in PROVIDER_PRESETS}
+
+
+def preset_for_base_url(base_url):
+    """The preset id whose endpoint matches this base URL, else None."""
+    raw = (base_url or "").lower()
+    if not raw:
+        return None
+    for preset in PROVIDER_PRESETS:
+        if any(needle in raw for needle in preset["match"]):
+            return preset["id"]
+    return None
+
+
+def preset_for_api_key(api_key):
+    """The preset id whose key prefix matches this API key, else None. Used to
+    auto-select the provider the moment a key is pasted (sk-or- = OpenRouter,
+    AIza = Gemini, gsk_ = Groq, csk- = Cerebras, sk- = OpenAI)."""
+    key = (api_key or "").strip()
+    if not key:
+        return None
+    # OpenAI keys are also sk-*, so check the longer OpenRouter prefix first.
+    for preset in PROVIDER_PRESETS:
+        prefix = preset.get("key_prefix") or ""
+        if prefix and key.startswith(prefix):
+            return preset["id"]
+    return None
+
 
 def clean_base_url(raw):
     raw = (raw or "").strip()
     if not raw:
         return DEFAULT_BASE_URL
-    # If someone pastes a full /chat/completions endpoint, strip to the base.
+    # Reduce a pasted full endpoint to its base ("/v1" is part of the base and
+    # must survive — the request URL is base + /chat/completions). Only a
+    # trailing /chat/completions (or /v1/chat/completions) gets removed.
     raw = raw.rstrip("/")
-    for suffix in ("/chat/completions", "/v1/chat/completions", "/v1", "/api/v1"):
-        if raw.endswith(suffix):
-            raw = raw[: -len(suffix)]
-            break
-    return raw.rstrip("/") or DEFAULT_BASE_URL
+    if raw.endswith("/chat/completions"):
+        raw = raw[: -len("/chat/completions")].rstrip("/")
+    return raw or DEFAULT_BASE_URL
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -48,7 +124,7 @@ class OpenAICompatProvider(LLMProvider):
             "Content-Type": "application/json",
         }
         if "openrouter.ai" in self.base_url:
-            headers["HTTP-Referer"] = "https://github.com/Mobeen0119/Mara"
+            headers["HTTP-Referer"] = "https://github.com/Mobeen0119/Eloise"
             headers["X-Title"] = "Eloise"
         return headers
 

@@ -25,11 +25,23 @@ const api = async (path, opts = {}) => {
 };
 
 /* ---------------- helpers ---------------- */
-function escHtml(s) {
-  if (s === null || s === undefined) return '';
-  const div = document.createElement('div');
-  div.textContent = String(s);
-  return div.innerHTML;
+function linkify(text) {
+  if (typeof text !== 'string') return text;
+  return text.replace(/https?:\/\/[^\s<>()]+(?:[^\s<().,!?;:'"\]])?/gi, (m) => {
+    try {
+      const url = new URL(m);
+      let label = 'link';
+      const host = url.hostname.toLowerCase();
+      if (host.includes('youtube') || host.includes('youtu.be') || host.includes('vimeo')) label = 'video';
+      else if (/\.(mp4|webm|mov|avi)(\?|#|$)/i.test(url.pathname)) label = 'video';
+      else if (host.includes('drive.google') || host.includes('docs.google') || host.includes('notion')) label = 'doc';
+      else if (/\.(pdf)(\?|#|$)/i.test(url.pathname)) label = 'pdf';
+      else if (/\.(jpg|jpeg|png|webp|gif|svg)(\?|#|$)/i.test(url.pathname)) label = 'image';
+      return `<a class="chat-link" href="${url.href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    } catch (e) {
+      return `<a class="chat-link" href="${m}" target="_blank" rel="noopener noreferrer">link</a>`;
+    }
+  });
 }
 function fmtTime(t) {
   if (!t) return '';
@@ -43,11 +55,12 @@ function fmtHours(h) {
   return `${h}h`;
 }
 function showToast(msg, type) {
+  const wrap = document.getElementById('toasts') || document.body;
   const t = document.createElement('div');
-  t.className = 'toast' + (type === 'error' ? ' error' : '');
+  t.className = 'toast' + (type === 'error' ? ' error' : type === 'success' ? ' success' : '');
   t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 3200);
+  wrap.appendChild(t);
+  setTimeout(() => t.remove(), 4200);
 }
 
 function safeLink(url) {
@@ -74,7 +87,11 @@ function openModal(title, bodyHtml, actionsHtml) {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
   document.body.appendChild(overlay);
 }
-function closeModal() { const m = document.getElementById('app-modal'); if (m) m.remove(); }
+function escHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = (s == null ? '' : String(s));
+  return div.innerHTML;
+}
 function confirmModal(title, body, confirmLabel, danger) {
   return new Promise((resolve) => {
     window._resolveModal = resolve;
@@ -209,23 +226,22 @@ function logout() {
 function enterApp() {
   document.getElementById('auth-screen').classList.add('hidden');
   document.getElementById('app-screen').classList.remove('hidden');
-  document.getElementById('user-name').textContent = userName || '';
-  document.getElementById('user-label').textContent = '';
-  document.getElementById('user-name').classList.add('ember-dot');
+  const ru = document.getElementById('rail-user');
+  if (ru) ru.textContent = (userName || '?').slice(0, 1).toUpperCase();
   navigate('today');
+  mountChatPanel();
   refreshFootMomentum();
   setTimeout(maybeOnboarding, 350);
 }
 
 async function refreshFootMomentum() {
-  const el = document.getElementById('foot-momentum');
+  const el = document.getElementById('rail-user');
   if (!el) return;
   try {
     const m = await api('/momentum');
-    const cls = m.momentum >= 70 ? 'var(--ok)' : m.momentum >= 40 ? 'var(--amber)' : 'var(--blood)';
-    el.innerHTML = `momentum <div class="mini-meter"><span style="width:${m.momentum}%;background:${cls}"></span></div> ${m.momentum}`;
-  } catch (e) { el.innerHTML = '';
-  }
+    el.title = `${userName || 'you'} — momentum ${m.momentum}`;
+    el.dataset.momentum = m.momentum;
+  } catch (e) { /* silent */ }
 }
 
 /* ============================================================
@@ -289,14 +305,37 @@ async function onboardSeedGo() {
 const onboardSeed = onboardSeedGo;
 
 /* ============================================================
-   Navigation & router
+   Navigation & router — hash-backed so refresh keeps the page and
+   the browser back button works.
    ============================================================ */
-function navigate(screen, param) {
+const KNOWN_SCREENS = ['today', 'board', 'goals', 'new-goal', 'goal', 'schedule',
+                       'global-chat', 'settings'];
+let _hashLock = false;
+
+function navigate(screen, param, fromHash) {
+  // The chat is a persistent side panel now, not a screen. Legacy #global-chat
+  // links and the rail button open it over whatever page you're on.
+  if (screen === 'global-chat') {
+    openChatPanel();
+    screen = 'today';
+  }
+  if (!fromHash && KNOWN_SCREENS.includes(screen)) {
+    const h = '#' + screen + (param !== undefined && param !== null && param !== ''
+      ? '/' + encodeURIComponent(param) : '');
+    if (location.hash !== h) {
+      _hashLock = true;
+      location.hash = h;
+      setTimeout(() => { _hashLock = false; }, 0);
+    }
+  }
   currentScreen = screen;
-  document.querySelectorAll('.nav-item').forEach(n =>
+  document.querySelectorAll('.rail-item').forEach(n =>
     n.classList.toggle('active', n.dataset.screen === screen)
   );
   const main = document.getElementById('main-content');
+  main.classList.remove('scene-in');
+  void main.offsetWidth; // restart the entrance animation
+  main.classList.add('scene-in');
   switch (screen) {
     case 'today': renderToday(main); break;
     case 'board': renderBoard(main); break;
@@ -304,12 +343,25 @@ function navigate(screen, param) {
     case 'new-goal': renderNewGoal(main); break;
     case 'goal': renderGoalDetail(main, param); break;
     case 'schedule': renderSchedule(main); break;
-    case 'global-chat': renderGlobalChat(main); break;
     case 'settings': renderSettings(main); break;
     default: renderToday(main);
   }
   if (token) setTimeout(pollCheckIn, 600);
 }
+
+function routeFromHash() {
+  const raw = (location.hash || '').replace(/^#/, '');
+  if (!raw) return false;
+  const [screen, param] = raw.split('/');
+  const s = screen || 'today';
+  if (!KNOWN_SCREENS.includes(s)) return false;
+  navigate(s, param ? decodeURIComponent(param) : undefined, true);
+  return true;
+}
+window.addEventListener('hashchange', () => {
+  if (_hashLock) return;
+  routeFromHash();
+});
 
 /* ============================================================
    Today
@@ -581,14 +633,17 @@ async function renderGoalDetail(el, id) {
       }
     } else {
       dates.forEach(d => {
+        const isPast = d < new Date().toISOString().slice(0, 10);
         html += `<div class="schedule-day"><div class="schedule-day-head"><span>${escHtml(d)}</span><span class="chip hot">${byDate[d].length}</span></div>`;
         byDate[d].forEach(a => {
           const timeStr = a.start_time && a.end_time ? `${fmtTime(a.start_time)} — ${fmtTime(a.end_time)}` : '';
-          const cls = a.status === 'done' ? 'done' : a.status === 'missed' ? 'missed' : '';
+          const done = a.status === 'done';
+          const missed = a.status === 'missed' && !done;
+          const cls = done ? 'done' : missed ? 'missed' : '';
           html += `<div class="schedule-row ${cls}">
             <span class="time">${timeStr || '—'}</span>
-            <span class="title">${escHtml(a.title)}</span>
-            <span class="task-name">${escHtml(a.status)}</span>
+            <span class="title">${escHtml(a.title)}${missed ? '<span class="chip warn row-flag">FAILED</span>' : ''}</span>
+            <span class="task-name"><button class="btn btn-sm ${done ? 'btn-ghost' : missed ? 'btn-warn' : ''}" onclick="toggleTask(${a.id}, this)">${done ? 'REOPEN' : 'DONE'}</button></span>
           </div>`;
         });
         html += `</div>`;
@@ -791,13 +846,18 @@ async function createGoal() {
   if (!title || !deadline) { showToast('Name and deadline needed', 'error'); return; }
   try {
     const r = await api('/goals', { method: 'POST', body: JSON.stringify({ title, deadline, reminder_time: reminder, constraints: window._constraints || [] }) });
-    // if questionnaire questions returned, show them before finishing
-    if (r.questions && r.questions.length > 0) {
-      showQuestionnaire(r.id, title, r.questions);
-    } else {
-      showToast('Filed. Eloise draws the lines.', 'success');
-      navigate('goals');
-    }
+    // The MODEL writes the clarifying questions for this specific goal (not a
+    // hardcoded category set). If the model is unreachable, skip straight to
+    // the board — creation never blocks on it.
+    try {
+      const c = await api(`/goals/${r.id}/clarify`, { method: 'POST' });
+      if (c.questions && c.questions.length > 0) {
+        showQuestionnaire(r.id, title, c.questions);
+        return;
+      }
+    } catch (qe) { /* model down: file without questions */ }
+    showToast('Filed. Eloise draws the lines.', 'success');
+    navigate('goals');
   } catch (e) { showToast(e.message, 'error'); }
 }
 
@@ -839,17 +899,27 @@ async function submitQuestionnaire(e, goalId) {
 async function renderSchedule(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Schedule</div><h1>…</h1></div>`;
   try {
-    const schedule = await api('/schedule');
+    const payload = await api('/schedule');
     const today = new Date().toISOString().slice(0, 10);
-    let html = `<div class="page-header"><div class="kicker">15 days out</div><h1>The run of show.</h1><p class="sub">Tap a day to open it. Tick tasks as they close.</p><div class="header-rule"></div></div>`;
+    const missedTotal = payload.missed_total || 0;
+    let html = `<div class="page-header"><div class="kicker">15 days out</div><h1>The run of show.</h1><p class="sub">Tap a day to open it. Tick tasks as they close. Overdue sits on top until you deal with it.</p><div class="header-rule"></div></div>`;
+    if (missedTotal) {
+      html += `<div class="banner banner-bad"><strong>${missedTotal} task${missedTotal === 1 ? '' : 's'} slipped.</strong> They're marked failed until you close them out or redraw the plan.</div>`;
+    }
     const dates = {};
-    for (const goalId of Object.keys(schedule)) {
-      const data = schedule[goalId];
+    const goalsMap = payload.dates || {};
+    for (const goalId of Object.keys(goalsMap)) {
+      const data = goalsMap[goalId];
       for (const dateStr of Object.keys(data.by_date)) {
         (dates[dateStr] = dates[dateStr] || []).push(...data.by_date[dateStr].map(a => ({ ...a, goal: data.title })));
       }
     }
-    const sorted = Object.keys(dates).sort();
+    // Past-due first (most recent miss on top), today, then the future.
+    const sorted = Object.keys(dates).sort((a, b) => {
+      const ap = a < today, bp = b < today;
+      if (ap !== bp) return ap ? -1 : 1;
+      return ap ? b.localeCompare(a) : a.localeCompare(b);
+    });
     if (sorted.length === 0) {
       html += `<div class="empty-state"><h3>Nothing booked.</h3><p>File a goal to start the run.</p></div>`;
     } else {
@@ -857,29 +927,39 @@ async function renderSchedule(el) {
       sorted.forEach((d, di) => {
         const list = dates[d].sort((x, y) => (x.start_time || '').localeCompare(y.start_time || ''));
         const doneCount = list.filter(a => a.status === 'done').length;
+        const missedCount = list.filter(a => a.status === 'missed').length;
         const total = list.length;
         const isToday = d === today;
+        const isPast = d < today;
         const pct = total ? Math.round(doneCount / total * 100) : 0;
-        const open = isToday || di < 2 ? 'open' : '';
-        html += `<div class="schedule-day ${open}">
+        const open = isToday || isPast || di < 2 ? 'open' : '';
+        const dayChip = isToday
+          ? '<span class="chip bad">NOW</span>'
+          : (isPast && missedCount ? `<span class="chip warn">${missedCount} MISSED</span>` : '');
+        html += `<div class="schedule-day ${open} ${isPast && missedCount ? 'has-missed' : ''}">
           <div class="schedule-day-head sdh-click" onclick="toggleDay(this)">
             <span class="sdh-left">
               <span class="caret">&#9656;</span>
               <span>${escHtml(d)}</span>
-              ${isToday ? '<span class="chip bad">NOW</span>' : ''}
+              ${dayChip}
             </span>
             <span class="sdh-right"><span class="chip ${doneCount===total?doneCount?'ok':'':doneCount?'hot':'off'}">${doneCount}/${total} done</span><span class="prog-bar"><span style="width:${pct}%"></span></span></span>
           </div>
           <div class="sdh-body">`;
         list.forEach(a => {
           const timeStr = a.start_time && a.end_time ? `${fmtTime(a.start_time)} — ${fmtTime(a.end_time)}` : '';
-          const cls = a.status === 'done' ? 'done' : a.status === 'missed' ? 'missed' : '';
+          const done = a.status === 'done';
+          const missed = a.status === 'missed' && !done;
+          const cls = done ? 'done' : missed ? 'missed' : '';
           const nowHere = isToday && a.start_time && a.end_time && inNowRange(a.start_time, a.end_time);
+          const rowLabel = missed
+            ? '<span class="chip warn row-flag">FAILED</span>'
+            : '';
           html += `<div class="schedule-row ${cls} ${nowHere ? 'now' : ''}">
             <span class="time">${nowHere ? '<span class="pulse-now">&#9679;</span> ' : ''}${timeStr || '—'}</span>
-            <span class="title">${escHtml(a.title)}<span class="task-name-inline">${escHtml(a.goal)}</span></span>
+            <span class="title">${escHtml(a.title)}${rowLabel}<span class="task-name-inline">${escHtml(a.goal)}</span></span>
             <span class="task-name">
-              <button class="btn btn-sm ${a.status === 'done' ? 'btn-ghost' : ''}" onclick="toggleTask(${a.id}, this)">${a.status === 'done' ? 'REOPEN' : 'DONE'}</button>
+              <button class="btn btn-sm ${done ? 'btn-ghost' : missed ? 'btn-warn' : ''}" onclick="toggleTask(${a.id}, this)">${done ? 'REOPEN' : 'DONE'}</button>
             </span>
           </div>`;
         });
@@ -910,9 +990,14 @@ async function toggleTask(id, btn) {
     const r = await api(`/actions/${id}/toggle`, { method: 'POST' });
     const done = r.status === 'done';
     row.classList.toggle('done', done);
+    row.classList.toggle('missed', !done && r.status === 'missed');
     btn.textContent = done ? 'REOPEN' : 'DONE';
     btn.classList.toggle('btn-ghost', done);
-    const head = row.closest('.schedule-day').querySelector('.sdh-right');
+    const flag = row.querySelector('.row-flag');
+    if (flag) flag.style.display = done ? 'none' : '';
+    const day = row.closest('.schedule-day');
+    const head = day && day.querySelector('.sdh-right');
+    if (!head) return;
     const bar = head.querySelector('.prog-bar>span');
     // refetch to recompute counters
     const items = Array.from(row.parentElement.querySelectorAll('.schedule-row'));
@@ -920,92 +1005,84 @@ async function toggleTask(id, btn) {
     const chip = head.querySelector('.chip');
     chip.textContent = `${dnc}/${t} done`;
     chip.className = 'chip ' + (dnc === t ? 'ok' : (dnc ? 'hot' : 'off'));
-    bar.style.width = Math.round(dnc / t * 100) + '%';
+    if (bar) bar.style.width = Math.round(dnc / t * 100) + '%';
   } catch (e) { showToast(e.message, 'error'); }
 }
 
 /* ============================================================
-   Chat (global)
+   Chat side panel — persistent, sits beside whatever page is open.
    ============================================================ */
-async function renderGlobalChat(el) {
-  el.innerHTML = `<div class="page-header"><div class="kicker">Direct line</div><h1>Eloise.</h1><p class="sub">No motivation. No excuses. Task gets done.</p><div class="header-rule"></div></div>
-    <div id="eloise-console" class="console mood-idle">
-      <div class="console-head">
-        <div class="console-sigil">E</div>
-        <div class="console-id">
-          <div class="console-name">ELOISE <span class="console-ver">//exe v2.1.4</span></div>
-          <div class="console-boot" id="eloise-boot">SEATING…</div>
-        </div>
-        <div class="console-glow" id="eloise-glow"></div>
-      </div>
-      <div class="console-state" id="eloise-state">STATE: BOOTING — the machine is watching you.</div>
-      <div class="console-telemetry" id="eloise-telemetry"></div>
-    </div>
-    <div id="chat-container" class="chat-container"></div>
-    <div class="chat-quick">
-      <span class="kicker" style="display:block;margin-bottom:8px;">Tap a wire</span>
-      <button class="chip quick-chip" onclick="quickChat('Today')">Today</button>
-      <button class="chip quick-chip" onclick="quickChat('Score')">Score</button>
-      <button class="chip quick-chip" onclick="quickChat('Fire')">Urgent</button>
-      <button class="chip quick-chip" onclick="quickChat('Momentum')">Momentum</button>
-      <button class="chip quick-chip" onclick="quickChat('Stakes')">Stakes</button>
-      <button class="chip quick-chip" onclick="quickChat('Fuck it')">Fuck it</button>
-    </div>
-    <div class="chat-input">
-      <input type="text" id="global-chat-input" placeholder="Talk to Eloise...">
-      <button class="btn btn-sm" onclick="sendGlobalChat()">Send</button>
-    </div>`;
-  // live console telemetry + mood
-  renderEloiseConsole();
+let _chatMounted = false;
+
+function toggleChatPanel(force) {
+  const p = document.getElementById('chat-panel');
+  if (!p) return;
+  const open = force === undefined ? p.classList.contains('closed') : force;
+  p.classList.toggle('closed', !open);
+  p.setAttribute('aria-hidden', open ? 'false' : 'true');
+  document.getElementById('app-screen').classList.toggle('panel-open', open);
+  const railDot = document.getElementById('rail-dot');
+  if (railDot) railDot.classList.toggle('on', open);
+  if (open) {
+    if (!_chatMounted) mountChatPanel();
+    const inp = document.getElementById('global-chat-input');
+    if (inp) setTimeout(() => inp.focus(), 120);
+  }
+}
+function openChatPanel() { toggleChatPanel(true); }
+
+async function mountChatPanel() {
+  if (_chatMounted) return;
+  _chatMounted = true;
   const chatEl = document.getElementById('chat-container');
+  const inp = document.getElementById('global-chat-input');
+  if (inp) {
+    inp.onkeypress = (e) => { if (e.key === 'Enter') sendGlobalChat(); };
+    inp.oninput = () => {
+      const dot = document.getElementById('rail-dot');
+      if (dot) dot.classList.toggle('unread', !inp.value && chatEl && chatEl._lastUserMsg);
+    };
+  }
+  refreshPanelModel();
+  if (!chatEl) return;
   try {
     const h = await api('/chat');
-    h.messages.forEach(m => appendChatMsg(chatEl, m.role, m.content));
-  } catch (e) {}
-  const inp = document.getElementById('global-chat-input');
-  inp.focus();
-  inp.onkeypress = (e) => { if (e.key === 'Enter') sendGlobalChat(); };
+    if (h.messages && h.messages.length) {
+      h.messages.forEach(m => appendChatMsg(chatEl, m.role, m.content));
+    } else {
+      appendChatMsg(chatEl, 'eloise', "Seat's warm. Say something — or don't, I'll wait.");
+    }
+  } catch (e) {
+    const err = document.createElement('div');
+    err.className = 'chat-msg eloise chat-error';
+    err.textContent = `Couldn't load the thread: ${e.message}`;
+    chatEl.appendChild(err);
+  }
 }
 
-/* Eloise console: live telemetry + mood-reactive glow. Pulls /api/eloise. */
-async function renderEloiseConsole() {
-  const con = document.getElementById('eloise-console');
-  if (!con) return;
+/* Live model/provider line in the panel header — so "is chat even on?" is
+   answerable at a glance instead of guessing from a dead screen. */
+async function refreshPanelModel() {
+  const el = document.getElementById('panel-model');
+  if (!el) return;
   try {
-    const s = await api('/eloise');
-    con.className = `console mood-${escHtml(s.mood)}`;
-    const boot = document.getElementById('eloise-boot');
-    if (boot) boot.textContent = `SEATED ${s.uptime} · online`;
-    const state = document.getElementById('eloise-state');
-    if (state) state.textContent = s.status;
-    const tel = document.getElementById('eloise-telemetry');
-    if (tel) {
-      let cells = [
-        { k: 'MOMENTUM', v: `${s.momentum}/100` },
-        { k: 'STREAK', v: `${s.streak}d` },
-        { k: 'BURN', v: `${s.burn_hours}h/day` },
-      ];
-      if (s.top_pressure) {
-        const pc = s.top_pressure.score;
-        const cls = pc >= 8 ? 'c-bad' : pc >= 6 ? 'c-hot' : pc >= 4 ? 'c-warn' : 'c-ok';
-        cells.unshift({ k: `TOP PRESSURE · ${escHtml(s.top_pressure.goal)}`, v: `${pc}/10`, cls });
-      }
-      tel.innerHTML = cells.map(c =>
-        `<div class="cell ${c.cls || ''}"><span class="cell-k">${c.k}</span><span class="cell-v">${c.v}</span></div>`
-      ).join('');
+    const s = await api('/status');
+    if (s.cloud_configured) {
+      el.textContent = `${s.provider || 'cloud'} · ${s.cloud_model || 'model'} — live`;
+      el.className = 'panel-model live';
+    } else {
+      el.textContent = 'no model armed — open Settings';
+      el.className = 'panel-model dead';
     }
-  } catch (e) {}
-}
-/* Flip the console over to booting while Eloise "thinks", then re-derive her mood. */
-function flashTyping() {
-  const con = document.getElementById('eloise-console');
-  if (con) con.className = 'console mood-idle';
-  renderEloiseConsole();
+  } catch (e) {
+    el.textContent = 'line check failed';
+    el.className = 'panel-model dead';
+  }
 }
 function appendChatMsg(container, role, text, source) {
   const div = document.createElement('div');
   div.className = 'chat-msg ' + role;
-  div.textContent = text;
+  div.innerHTML = linkify(text);
   if (role === 'eloise' && source && source !== 'fallback' && source !== 'completion') {
     const tag = document.createElement('span');
     tag.className = 'chat-src';
@@ -1047,9 +1124,13 @@ function finishTyping(bubble, text, source) {
   bubble.classList.remove('typing');
   bubble.innerHTML = '';
   const txt = document.createElement('span');
-  txt.textContent = text;
+  txt.innerHTML = linkify(text);
   bubble.appendChild(txt);
-  if (source && (source === 'ollama' || source === 'openrouter')) {
+  // Show the engine on every real reply — not just ollama/openrouter. The old
+  // filter hid the badge whenever the source resolved to "openai" (which is
+  // what Gemini/OpenAI-compatible endpoints report), so a working chat looked
+  // dead and unconfigured.
+  if (source && source !== 'fallback' && source !== 'completion' && source !== 'guardrail') {
     const tag = document.createElement('span');
     tag.className = 'chat-src';
     tag.textContent = (source === 'ollama' ? 'local' : source);
@@ -1066,31 +1147,50 @@ function setTypingText(bubble, text) {
   bubble.classList.remove('typing');
   bubble.innerHTML = '';
   const txt = document.createElement('span');
-  txt.textContent = text;
+  txt.innerHTML = linkify(text);
   bubble.appendChild(txt);
   bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
 }
 
 async function quickChat(cmd) {
   const chatEl = document.getElementById('chat-container');
-  if (!chatEl) { navigate('global-chat'); setTimeout(() => quickChat(cmd), 400); return; }
+  if (!chatEl) return;
+  openChatPanel();
+  if (chatEl._busy) { showToast('I\'m still answering the last one', 'error'); return; }
+  chatEl._busy = true;
   const bubble = addTyping(chatEl);
   try {
     const r = await api('/chat/quick', { method: 'POST', body: JSON.stringify({ command: cmd.toLowerCase() }) });
     finishTyping(bubble, r.reply, r.source);
   } catch (e) {
     finishTyping(bubble, e.message, null);
+    bubble.classList.add('chat-error');
+  } finally {
+    chatEl._busy = false;
   }
 }
 
 async function streamChatReply(goalId, message, onDelta) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = 'Bearer ' + token;
-  const res = await fetch('/api/chat/stream', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ goal_id: goalId, message }),
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 95000);
+  let res;
+  try {
+    res = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ goal_id: goalId, message }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') {
+      throw new Error('The model went quiet for 95 seconds — the connection dropped. Try again; if it keeps stalling, open Settings and hit Test connection.');
+    }
+    throw new Error('Network dropped mid-reply. Send it again.');
+  }
+  clearTimeout(timer);
   if (res.status === 401) { logout(); throw new Error('unauthorized'); }
   if (!res.ok) {
     let detail = res.statusText;
@@ -1099,26 +1199,39 @@ async function streamChatReply(goalId, message, onDelta) {
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+  const idle = setTimeout(() => ctrl.abort(), 95000);
   let buf = '';
   let full = '';
   let source = null;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buf.indexOf('\n\n')) !== -1) {
-      const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
-      if (!raw.startsWith('data: ')) continue;
-      let ev;
-      try { ev = JSON.parse(raw.slice(6)); } catch (e) { continue; }
-      if (ev.error) { const msg = ev.detail || 'model connection dropped'; throw new Error(msg); }
-      if (ev.delta) { full += ev.delta; onDelta(full); }
-      if (ev.done) { source = ev.source || source; }
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        if (!raw.startsWith('data: ')) continue;
+        let ev;
+        try { ev = JSON.parse(raw.slice(6)); } catch (e) { continue; }
+        if (ev.error) { const msg = ev.detail || 'model connection dropped'; throw new Error(msg); }
+        if (ev.delta) { full += ev.delta; onDelta(full); }
+        if (ev.done) { source = ev.source || source; }
+      }
     }
+  } catch (e) {
+    clearTimeout(idle);
+    if (e.name === 'AbortError') {
+      throw new Error('The reply stalled mid-stream. Send it again — if it keeps stalling, check Settings > LLM Provider → Test connection.');
+    }
+    throw e;
   }
-  if (!full && (!source || source === 'offline')) {
-    throw new Error("The model didn't answer, and I won't fake one. It may be off, the key may be wrong, or it echoed my prompt back. Check the LLM settings and key, then send that again.");
+  clearTimeout(idle);
+  // An empty reply with a live source means the cleaner ate everything (or the
+  // model echoed my prompt back). The old check only errored for "offline", so
+  // a live-but-empty reply drew a blank bubble and read as "chat is broken".
+  if (!full) {
+    throw new Error("The model returned nothing usable — it may have echoed my prompt back or come out blank. Try rephrasing; if every reply is empty, open Settings and hit Test connection.");
   }
   return { text: full, source: source || 'llm' };
 }
@@ -1126,22 +1239,29 @@ async function streamChatReply(goalId, message, onDelta) {
 async function sendGlobalChat() {
   const inp = document.getElementById('global-chat-input');
   const chatEl = document.getElementById('chat-container');
+  if (!inp || !chatEl) return;
+  openChatPanel();
+  if (chatEl._busy) { showToast('I\'m still answering the last one', 'error'); return; }
   const msg = (inp.value || '').trim();
   if (!msg) return;
   inp.value = '';
+  chatEl._busy = true;
   appendChatMsg(chatEl, 'user', msg);
+  chatEl._lastUserMsg = true;
   const bubble = addTyping(chatEl);
-  flashTyping();
   try {
     const r = await streamChatReply(null, msg, (partial) => {
       setTypingText(bubble, partial);
       chatEl.scrollTop = chatEl.scrollHeight;
     });
     finishTyping(bubble, r.text, r.source);
+    refreshPanelModel();
   } catch (e) {
     finishTyping(bubble, e.message, null);
+    bubble.classList.add('chat-error');
+  } finally {
+    chatEl._busy = false;
   }
-  renderEloiseConsole();
 }
 
 /* ============================================================
@@ -1161,9 +1281,11 @@ async function sendGoalChat(goalId) {
   const inp = document.getElementById('goalchat-input');
   const cc = document.getElementById('goalchat-container');
   if (!inp || !cc) return;
+  if (cc._busy) { showToast('I\'m still answering the last one', 'error'); return; }
   const msg = (inp.value || '').trim();
   if (!msg) return;
   inp.value = '';
+  cc._busy = true;
   appendChatMsg(cc, 'user', msg);
   const bubble = addTyping(cc);
   try {
@@ -1173,7 +1295,12 @@ async function sendGoalChat(goalId) {
     });
     finishTyping(bubble, r.text, r.source);
     if (r.source === 'completion') setTimeout(() => navigate('goals'), 1000);
-  } catch (e) { finishTyping(bubble, e.message, null); }
+  } catch (e) {
+    finishTyping(bubble, e.message, null);
+    bubble.classList.add('chat-error');
+  } finally {
+    cc._busy = false;
+  }
 }
 
 /* ============================================================
@@ -1185,30 +1312,44 @@ async function renderSettings(el) {
     const [llm, status] = await Promise.all([api('/settings/llm'), api('/status')]);
     window._lastLlm = llm;
     window._lastStatus = status;
+    const presets = (llm && llm.presets) || [];
+    const presetOpts = presets.map(p =>
+      `<option value="${escHtml(p.id)}">${escHtml(p.label)}</option>`).join('');
+    const keyChip = llm.api_key_set
+      ? `<span class="chip ${llm.key_source === 'env' ? 'warn' : 'ok'}">${llm.key_source === 'env' ? 'key from .env' : 'key saved'}</span>`
+      : '<span class="chip off">no key yet</span>';
+    const lastTest = window._llmTest;
+    const testChip = lastTest
+      ? `<span class="chip ${lastTest.ok ? 'ok' : 'bad'}">${lastTest.ok ? 'last test: replies' : 'last test: failed'}</span>`
+      : '';
     html += `<div class="settings-section"><h3>LLM Provider</h3>
       <div class="card">
-        <div style="margin-bottom:18px;">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
-            ${status.cloud_configured ? '<span class="chip hot"><span class="ember-dot"></span> Cloud engine armed (' + escHtml(status.provider || 'cloud') + ')</span>' : '<span class="chip off">&#x25CB; No API key — paste one below</span>'}
-            ${status.local_model_available ? '<span class="chip hot">Local engine live</span>' : ''}
-          </div>
-          <p style="font-size:13px;color:var(--bone-dim);">Model: ${escHtml(status.cloud_model || 'not set')}${status.cloud_error ? ' · ' + escHtml(status.cloud_error) : ''}</p>
+        <div class="llm-status">
+          ${status.cloud_configured ? '<span class="chip hot"><span class="ember-dot"></span> Cloud engine armed</span>' : '<span class="chip off">No model talking — paste a key</span>'}
+          ${keyChip}
+          ${testChip}
+          ${status.local_model_available ? '<span class="chip hot">Local engine live</span>' : ''}
+          <span class="chip">${escHtml(status.cloud_model || 'no model')}</span>
         </div>
         <div class="field"><label>Provider</label>
           <select id="set-provider" onchange="applyProviderPreset()">
-            <option value="openrouter">OpenRouter</option>
-            <option value="openai">OpenAI</option>
-            <option value="groq">Groq</option>
-            <option value="together">Together AI</option>
-            <option value="deepseek">DeepSeek</option>
+            ${presetOpts}
             <option value="">Custom / other (OpenAI-compatible)</option>
           </select>
         </div>
+        <div class="field"><label>API Key</label>
+          <input type="password" id="set-api-key" placeholder="paste it — the provider snaps to match" autocomplete="off">
+          <p class="field-hint">Pasting is detected: sk-or- is OpenRouter, AIza is Gemini, gsk_ is Groq, csk- is Cerebras. Blank keeps the current key.</p>
+        </div>
         <div class="field"><label>API Base URL</label><input type="text" id="set-base-url" placeholder="https://openrouter.ai/api/v1"></div>
         <div class="field"><label>Model</label><input type="text" id="set-model" placeholder="e.g. meta-llama/llama-3.1-8b-instruct:free"></div>
-        <div class="field"><label>API Key</label><input type="password" id="set-api-key" placeholder="Leave blank to keep current"></div>
         <div class="field"><label><input type="checkbox" id="set-enable-local" style="width:auto;margin-right:8px;">Also use a local Ollama engine (optional)</label></div>
-        <button class="btn" style="width:auto;" onclick="saveLLMSettings()">Save Settings</button>
+        <div class="llm-actions">
+          <button class="btn" style="width:auto;" onclick="saveLLMSettings()">Save &amp; Test</button>
+          <button class="btn btn-ghost" style="width:auto;" onclick="testLLMSettings()">Test connection</button>
+          ${llm.api_key_set && llm.key_source === 'settings' ? '<button class="btn btn-ghost" style="width:auto;" onclick="clearLLMKey()">Forget saved key</button>' : ''}
+        </div>
+        <div id="llm-test-result" class="llm-test"></div>
       </div>
     </div>`;
     html += `<div class="settings-section"><h3>Daily Check-in</h3>
@@ -1244,6 +1385,16 @@ async function renderSettings(el) {
         <button class="btn" style="width:auto;" onclick="savePersona()">Save Persona</button>
       </div>
     </div>`;
+    let locVal = '';
+    try { const lc = await api('/settings/location'); locVal = lc.location || ''; } catch (e) {}
+    html += `<div class="settings-section"><h3>Location</h3>
+      <div class="card">
+        <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">Where you actually live. Chat and schedules only suggest services, shops and apps that exist here — no DoorDash in Lahore.</p>
+        <div class="field"><label>Country / city</label>
+          <input type="text" id="set-location" value="${escHtml(locVal)}" placeholder="e.g. Pakistan"></div>
+        <button class="btn" style="width:auto;" onclick="saveLocation()">Save Location</button>
+      </div>
+    </div>`;
     try {
       const me = await api('/me');
       const inp = document.getElementById('set-checkin-time');
@@ -1258,20 +1409,26 @@ async function renderSettings(el) {
     // Email channel section + on-demand digest
     let em = null;
     try { em = await api('/email/status'); } catch (e) {}
-    const emCls = em && em.configured && em.user_has_email ? 'ok' : (em && em.configured ? 'hot' : 'off');
-    const emLabel = em && em.configured && em.user_has_email
+    const emLive = em && em.configured && em.user_has_email;
+    const emCls = emLive ? 'ok' : (em && em.configured ? 'hot' : 'off');
+    const emLabel = emLive
       ? 'Mail channel live'
-      : (em && em.configured ? `Armed, needs your email${em.host ? ' via ' + escHtml(em.host) : ''}` : 'SMTP off');
+      : (em && em.configured ? `Armed, needs your email${em.host ? ' via ' + escHtml(em.host) : ''}` : 'SMTP not usable yet');
+    const emProblems = (em && em.problems && em.problems.length)
+      ? `<ul class="problem-list">${em.problems.map(p => `<li>${escHtml(p)}</li>`).join('')}</ul>`
+      : '';
     html += `<div class="settings-section"><h3>Email / Digests</h3>
       <div class="card">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
           <span class="chip ${emCls}">${emLabel}</span>
-          ${em && !em.configured ? '<span class="chip off">set SMTP_HOST + MAIL_FROM in .env</span>' : ''}
+          ${em && em.host ? `<span class="chip">${escHtml(em.host)}:${em.port || 587}</span>` : ''}
+          ${em && em.from ? `<span class="chip">from ${escHtml(em.from)}</span>` : ''}
         </div>
-        ${em && em.hint ? `<p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">${escHtml(em.hint)}</p>` : ''}
+        ${emProblems}
+        ${em && em.hint && !emLive ? `<p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">${escHtml(em.hint)}</p>` : ''}
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
           <button class="btn" style="width:auto;" onclick="sendDigest()">Email me the week</button>
-          <span class="chip ${em && em.configured && em.user_has_email ? 'ok' : 'off'}">${em && em.user_has_email ? escHtml(userName || 'you') : 'add an email to get mail'}</span>
+          <span class="chip ${em && em.user_has_email ? 'ok' : 'off'}">${em && em.user_has_email ? escHtml(userName || 'you') : 'add an email to get mail'}</span>
         </div>
       </div>
     </div>`;
@@ -1286,40 +1443,99 @@ async function renderSettings(el) {
     const bl = document.getElementById('set-base-url');
     const ml = document.getElementById('set-model');
     const prov = (llmState.provider || '').trim().toLowerCase();
-    if (sel) sel.value = ['openrouter','openai','groq','together','deepseek'].includes(prov) ? prov : '';
+    if (sel) {
+      const known = (llmState.presets || []).some(p => p.id === prov);
+      sel.value = known ? prov : '';
+    }
     if (bl) bl.value = llmState.base_url || '';
     if (ml) ml.value = llmState.model || '';
     const elc = document.getElementById('set-enable-local');
     if (elc) elc.checked = !!llmState.enable_local;
   }
+  // Pasting a key snaps the provider to match it, so a Gemini key never
+  // silently lands on an OpenRouter endpoint (the old way nothing changed).
+  const keyInput = document.getElementById('set-api-key');
+  if (keyInput) keyInput.addEventListener('input', _detectProviderFromKey);
   renderBusyWindows();
 }
-const _PROVIDER_PRESETS = {
-  openrouter: { url: 'https://openrouter.ai/api/v1', model: 'meta-llama/llama-3.1-8b-instruct:free' },
-  openai: { url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
-  groq: { url: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
-  together: { url: 'https://api.together.xyz/v1', model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
-  deepseek: { url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-};
+function _llmPresets() {
+  return (window._lastLlm && window._lastLlm.presets) || [];
+}
+function _presetById(id) {
+  return _llmPresets().find(p => p.id === id) || null;
+}
+function _detectProviderFromKey() {
+  const key = ((document.getElementById('set-api-key') || {}).value || '').trim();
+  const sel = document.getElementById('set-provider');
+  if (!key || !sel) return;
+  // Longest prefixes first: sk-or- must win over the generic sk- of OpenAI.
+  const probes = ['sk-or-', 'AIza', 'gsk_', 'csk-', 'sk-'];
+  const ids = ['openrouter', 'gemini', 'groq', 'cerebras', 'openai'];
+  const idx = probes.findIndex(p => key.startsWith(p));
+  if (idx < 0) return;
+  const want = ids[idx];
+  if (sel.value === want) return;
+  if (!_presetById(want)) return;
+  sel.value = want;
+  applyProviderPreset();
+  showToast(`Looks like a ${_presetById(want).label} key — preset applied`, 'success');
+}
 function applyProviderPreset() {
   const sel = document.getElementById('set-provider');
+  const preset = _presetById((sel && sel.value) || '');
+  if (!preset) return; // custom endpoint: the operator owns both fields
   const bl = document.getElementById('set-base-url');
   const ml = document.getElementById('set-model');
-  const preset = _PROVIDER_PRESETS[(sel && sel.value) || ''];
-  if (!preset) return;
+  // Always overwrite: a provider switch must never inherit the previous
+  // provider's endpoint or model.
   if (bl) bl.value = preset.url;
-  if (ml) ml.placeholder = preset.model;
-  if (ml && !ml.value) ml.value = preset.model;
+  if (ml) ml.value = preset.model;
 }
-async function saveLLMSettings() {
-  const body = {
+function _llmFormBody() {
+  return {
     provider: (document.getElementById('set-provider') || {}).value || '',
     base_url: (document.getElementById('set-base-url') || {}).value || '',
     model: (document.getElementById('set-model') || {}).value || '',
     api_key: (document.getElementById('set-api-key') || {}).value || '',
     enable_local: !!(document.getElementById('set-enable-local') || {}).checked,
   };
-  try { await api('/settings/llm', { method: 'PUT', body: JSON.stringify(body) }); showToast('Settings saved', 'success'); } catch (e) { showToast(e.message, 'error'); }
+}
+function _setTestResult(kind, text) {
+  const box = document.getElementById('llm-test-result');
+  if (!box) return;
+  box.className = 'llm-test ' + (kind || '');
+  box.textContent = text || '';
+}
+async function saveLLMSettings() {
+  try {
+    await api('/settings/llm', { method: 'PUT', body: JSON.stringify(_llmFormBody()) });
+    showToast('Settings saved', 'success');
+  } catch (e) { showToast(e.message, 'error'); return; }
+  await testLLMSettings();
+}
+async function testLLMSettings() {
+  _setTestResult('pending', 'Contacting the provider…');
+  try {
+    const r = await api('/settings/llm/test', { method: 'POST', body: JSON.stringify(_llmFormBody()) });
+    window._llmTest = { ok: r.ok, at: Date.now() };
+    if (r.ok) {
+      _setTestResult('ok', `${r.provider} answers — ${r.model} replied in ${r.latency_ms}ms. Eloise is live.`);
+      showToast('Provider replies — you are live', 'success');
+    } else {
+      _setTestResult('bad', r.error || 'Provider did not reply.');
+      showToast('Provider failed — details on the card', 'error');
+    }
+  } catch (e) {
+    _setTestResult('bad', e.message);
+    showToast('Test failed', 'error');
+  }
+}
+async function clearLLMKey() {
+  try {
+    await api('/settings/llm', { method: 'PUT', body: JSON.stringify({ clear_key: true }) });
+    showToast('Saved key forgotten — falling back to .env', 'success');
+    navigate('settings');
+  } catch (e) { showToast(e.message, 'error'); }
 }
 async function saveCheckinTime() {
   const t = document.getElementById('set-checkin-time').value;
@@ -1329,6 +1545,13 @@ async function saveCheckinTime() {
 async function savePersona() {
   const p = (document.getElementById('set-persona') || {}).value || '';
   try { await api('/settings/persona', { method: 'PUT', body: JSON.stringify({ persona: p }) }); showToast('Persona saved — Eloise obeys it from now on', 'success'); } catch (e) { showToast(e.message, 'error'); }
+}
+async function saveLocation() {
+  const v = ((document.getElementById('set-location') || {}).value || '').trim();
+  try {
+    const r = await api('/settings/location', { method: 'PUT', body: JSON.stringify({ location: v }) });
+    showToast(`Location saved — suggestions now match ${r.location}`, 'success');
+  } catch (e) { showToast(e.message, 'error'); }
 }
 function renderBusyWindows() {
   const wrap = document.getElementById('busy-list');
@@ -1371,9 +1594,11 @@ async function sendDigest() {
    ============================================================ */
 window.addEventListener('DOMContentLoaded', () => {
   if (token) {
-    document.getElementById('user-name').textContent = userName || '';
-    document.getElementById('user-name').classList.add('ember-dot');
+    const ru = document.getElementById('rail-user');
+    if (ru) ru.textContent = (userName || '?').slice(0, 1).toUpperCase();
     enterApp();
+    // Restore the page from the URL hash (refresh keeps your place).
+    if (!routeFromHash()) navigate('today');
   } else {
     document.getElementById('auth-screen').classList.remove('hidden');
     renderAuth();

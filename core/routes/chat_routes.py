@@ -214,6 +214,7 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         return {"reply": refusal, "source": "guardrail"}
 
     persona = generation.user_persona(conn, user["id"])
+    location = generation.user_location(conn, user["id"])
     step_done = generation.step_done_detected(message)
     if goal_id:
         # goal-scoped chat: pull that goal's actual scheduled tasks so the
@@ -227,18 +228,22 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         )
         text, source = generation.generate_chat_reply(
             user["name"], goal_name, history, message, db=conn, plan_lines=plan_lines,
-            persona=persona, step_done=step_done,
+            persona=persona, step_done=step_done, location=location,
         )
     else:
         board = _active_board_snapshot(conn, user["id"])
         text, source = generation.generate_global_chat_reply(
             user["name"], [board], history, message, db=conn, persona=persona,
+            location=location,
         )
     if source == "offline" or not text:
         conn.commit()
         raise HTTPException(
             status_code=503,
-            detail="The model didn't give a usable reply — it may be off, unreachable, or it only echoed back the question (sometimes the fast local chat model needs pulling first: `ollama pull<OLLAMA_CHAT_MODEL>`). Start/check Ollama or the LLM settings, then send that again.",
+            detail="The model didn't give a usable reply — it may be unreachable, or it only "
+                   "echoed back the question. Open Settings > LLM Provider, paste an API key "
+                   "and hit Test connection: the test shows the real error. Once it answers, "
+                   "send that again.",
         )
     # Duplicate gate: a weak model that just said the same thing will say it
     # again. Spamming the exact previous line is not a reply, so refuse it as
@@ -347,6 +352,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
         collected = []
         gconn = get_connection()
         persona = generation.user_persona(gconn, user["id"])
+        location = generation.user_location(gconn, user["id"])
         step_done = generation.step_done_detected(message)
         if goal_id:
             plan_rows = gconn.execute(
@@ -358,12 +364,13 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
             )
             stream = generation.stream_chat_reply(
                 user["name"], goal_name, history, message, db=gconn, plan_lines=plan_lines,
-                persona=persona, step_done=step_done,
+                persona=persona, step_done=step_done, location=location,
             )
         else:
             board = _active_board_snapshot(gconn, user["id"])
             stream = generation.stream_global_chat_reply(
                 user["name"], [board], history, message, db=gconn, persona=persona,
+                location=location,
             )
         source = None
         try:
@@ -387,7 +394,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
             yield _json.dumps({"done": True, "source": source or "offline"})
         except Exception:
             yield _json.dumps({"error": True, "done": True, "source": "offline",
-                               "detail": "The model didn't give a usable reply — it may be off, unreachable, or it only echoed back the question. Start Ollama or check the LLM settings, then send that again."})
+                               "detail": "The model didn't give a usable reply — it may be unreachable, or it only echoed back the question. Open Settings > LLM Provider and hit Test connection: that shows the real error. Fix it there, then send that again."})
 
     return StreamingResponse(
         (f"data: {frame}\n\n" for frame in generate()),

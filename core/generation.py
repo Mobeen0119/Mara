@@ -25,8 +25,10 @@ _manager = None
 
 # A chat reply is short by contract (at most 2 lines). Capping the model's
 # output turns that contract into a hard guarantee AND makes replies fast
-# (fewer generated tokens, especially on the CPU-bound local model).
-_MAX_CHAT_TOKENS = 120
+# (fewer generated tokens, especially on the CPU-bound local model). 120 cut
+# replies off mid-sentence (which read as broken/repetitive); 400 finishes
+# any honest 2-4 line answer without letting a rambler run.
+_MAX_CHAT_TOKENS = 400
 
 # Plan draws have their own output ceiling so a slow CPU box FINISHES instead
 # of timing out mid-JSON. A single request CANNOT carry a whole month (60+
@@ -142,15 +144,25 @@ def absorb_persona_directive(db, user_id, message):
     return merged
 
 
+DEFAULT_LOCATION = "Pakistan"
+
+
+def user_location(db, user_id):
+    """The user's country/city — used to keep suggestions to services that
+    actually exist where they live (no DoorDash in Pakistan)."""
+    try:
+        row = db.execute("SELECT location FROM users WHERE id=?", (user_id,)).fetchone()
+        return ((row and row["location"]) or "").strip() or DEFAULT_LOCATION
+    except Exception:
+        return DEFAULT_LOCATION
+
+
 def chat_system_prompt(db, user_id):
-    sys = BASE_SYSTEM_PROMPT
-    p = user_persona(db, user_id)
-    if p:
-        sys += (
-            "\n\nYou have a standing personality contract with this user that they set "
-            "explicitly. It OVERRIDES the default tone above. Follow it to the letter:\n" + p
-        )
-    return sys
+    return _with_persona(
+        BASE_SYSTEM_PROMPT,
+        user_persona(db, user_id),
+        location=user_location(db, user_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +220,10 @@ def goal_completion_detected(message):
 
 
 GUARDRAIL_REFUSAL = (
-    "That doesn't belong on this board, and I won't plan it. If this involves a family "
-    "member or a minor, or anyone without full consent, it's not something Eloise touches. "
-    "A real goal — for a partner, a project, a date, an exam — I'll build a real plan for. "
-    "That, I'm all in on."
+    "No. Minors, anyone without consent, or family — that never goes on this board, "
+    "and I won't plan it or discuss it. A real goal with a consenting adult partner, "
+    "a date, a trip, a night that actually matters: name it and I'll build it properly. "
+    "That's the deal."
 )
 
 
@@ -240,42 +252,73 @@ def _pick(items):
 # --- Content-safety guardrail
 # ------------------------------------------------- Precise, not paranoid:
 # Eloise plans REAL goals — including romantic / intimate ones with a partner
-# (cf / wife / partner). She refuses only sexual abuse of a family member or
-# minor, and coercion / violence. Thread-aware so follow-ups like "sister" or
-# "consent" after an incest message are still refused.
+# (gf / wife / partner), and she answers sexual-wellness questions plainly.
+# She refuses only sexual content involving a family member or a minor, and
+# coercion / violence. Word-BOUNDARY matching only: substring scanning used to
+# refuse "document my progress" ('cum' in document), "every person" ('son' in
+# person), "choose between" ('teen' in between) and "grow grapes" ('rape' in
+# grapes). Thread-aware so follow-ups like "sister" after an incest message are
+# still refused.
 
-_FAMILY_ABUSE = ["sister", "brothers", "brother", "mom", "mother", "dad", "father",
-                 "daughter", "son", "aunt", "uncle", "niece", "nephew", "stepmom",
-                 "stepdad", "step-sister", "step-sister", "cousin"]
-_MINOR = ["child", "kid", "minor", "underage", "years old", "gril", "12-year", "13-year",
-          "14-year", "15-year", "16-year", "17-year", "schoolgirl", "school-girl", "teen",
-          "teenage", "infant", "baby"]
-_PARTNER = ["girlfriend", "gf ", "gf.", "gf,", "wife", "wifey", "husband", "husby",
-            "boyfriend", "bf ", "bf.", "bf,", "partner", "spouse", "fiance", "fiancé",
-            "fiancee", "fiancée", "lover", "my girl", "my man", "babe", "bae"]
-_SEXUAL = ["dick", "penis", "fuck", "sex", "rape", "pussy", "vagina", "suck", "cum",
-            "have sex", "sleep with", "make love", "sex with", "incest", "molest",
-            "naked", "boobs", "breasts", "ejaculate", "wedding night", "honeymoon",
-            "bed my", "in bed with", "intimate with", "first night"]
-_COERCION = ["rape", "force her", "force him", "force you", "without her consent",
-             "without his consent", "no consent", "drug", "drugged", "knock out",
-             "blackmail", "threaten", "hold her down", "hold him down", "tie up", "tied up"]
-_VIOLENCE = ["kill my", "murder", "stab", "bomb", "shoot my", "poison", "beat up",
-             "assault", "hurt my", "strangle", "choke"]
+def _word_re(words):
+    return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
+
+
+_FAMILY_RE = _word_re([
+    "sister", "brother", "sibling", "mom", "mum", "mother", "dad", "father", "daughter",
+    "son", "aunt", "uncle", "niece", "nephew", "stepmom", "stepdad", "step-sister",
+    "step-brother", "cousin",
+])
+_MINOR_RE = _word_re([
+    "child", "children", "kid", "kids", "minor", "underage", "teen", "teens", "teenage",
+    "infant", "baby", "schoolgirl", "school-girl", "school boy", "schoolboy", "gril",
+    "years old", "year old", "year-old", "years-old",
+])
+_PARTNER_RE = _word_re([
+    "girlfriend", "gf", "wife", "wifey", "husband", "boyfriend", "bf", "partner",
+    "spouse", "fiance", "fiancé", "fiancee", "fiancée", "lover",
+])
+_PARTNER_PHRASES = ["my girl", "my man", "babe", "bae"]
+_SEXUAL_RE = _word_re([
+    "dick", "penis", "fuck", "fucking", "sex", "sexual", "rape", "raping", "raped",
+    "pussy", "vagina", "blowjob", "handjob", "cum", "cumming", "orgasm", "masturbate",
+    "masturbation", "naked", "nude", "boobs", "breasts", "ejaculate", "incest",
+    "molest", "creampie", "porn",
+])
+_SEXUAL_PHRASES = [
+    "sleep with", "make love", "have sex", "sex with", "intimate with", "in bed with",
+    "first night", "wedding night", "honeymoon", "hook up", "hookup",
+]
+_COERCION_RE = _word_re([
+    "rape", "raping", "raped", "drugged", "knock out", "knocked out", "blackmail",
+    "blackmailed", "threaten", "threatened",
+])
+_COERCION_PHRASES = [
+    "force her", "force him", "force you", "without her consent", "without his consent",
+    "no consent", "drug her", "drug him", "hold her down", "hold him down",
+    "tie her up", "tie him up", "tied up",
+]
+_VIOLENCE_RE = _word_re([
+    "murder", "stab", "stabbing", "bomb", "poison", "assault", "strangle", "choke",
+])
+_VIOLENCE_PHRASES = ["kill my", "shoot my", "beat up", "hurt my"]
+
+
+def _has_phrase(t, phrases):
+    return any(p in t for p in phrases)
 
 
 def _is_truly_harmful(msg, context=""):
     """Detect requests Eloise must refuse. Returns True for:
-    - sexual abuse of a family member or minor (thread-aware),
+    - sexual content involving a family member or minor (thread-aware),
     - coercion / non-consent or real-world violence.
-    Legitimate intimate / romantic goals with an adult partner (gf, wife, partner...) are
-    NOT blocked — they get a real plan, not a lecture."""
+    Everything else — partner intimacy, masturbation questions, crude language,
+    non-sexual family goals — is allowed. Returns (no tuple, just bool)."""
     t = (msg or "").lower()
     # Only the USER's own words carry intent. Eloise's replies must never be
     # scanned: her refusal text contains "minor"/"family member", and plan
-    # lines quote goal titles like "i have to fuck someone" — scanning them
-    # makes benign follow-ups ("tell me what to prioritize") look like abuse
-    # and re-refuse forever.
+    # lines quote goal titles — scanning them makes benign follow-ups look
+    # like abuse and re-refuse forever.
     user_lines = [
         ln for ln in (context or "").split("\n")
         if not ln.strip().lower().startswith(("eloise:", "assistant:"))
@@ -284,23 +327,24 @@ def _is_truly_harmful(msg, context=""):
     # follow-up to "i want to fuck my sister" they continue the same abuse
     # goal.
     full = ("\n".join(user_lines) + "\n" + t).lower()
-    has_partner = any(p in full for p in _PARTNER)
-    has_family = any(f in t or f in full for f in _FAMILY_ABUSE)
-    has_minor = any(m in t or m in full for m in _MINOR)
-    has_sex = any(s in t for s in _SEXUAL) or any(s in full for s in _SEXUAL)
+    has_partner = bool(_PARTNER_RE.search(full)) or _has_phrase(full, _PARTNER_PHRASES)
+    has_family = bool(_FAMILY_RE.search(full))
+    has_minor = bool(_MINOR_RE.search(full))
+    has_sex = bool(_SEXUAL_RE.search(t)) or _has_phrase(t, _SEXUAL_PHRASES) \
+        or bool(_SEXUAL_RE.search(full)) or _has_phrase(full, _SEXUAL_PHRASES)
 
     # 1) Coercion / non-consent / violence in this message — always refuse.
-    if any(c in t for c in _COERCION):
+    if _COERCION_RE.search(t) or _has_phrase(t, _COERCION_PHRASES):
         return True
-    if any(v in t for v in _VIOLENCE):
+    if _VIOLENCE_RE.search(t) or _has_phrase(t, _VIOLENCE_PHRASES):
         return True
 
-    # 2) Any sexual content targeting a minor — refuse.
+    # 2) Any sexual content involving a minor — refuse.
     if has_minor and has_sex:
         return True
 
-    # 3) Family + sexual in the thread, NOT a partner relationship — refuse. A
-    # partner relationship clears it (girlfriend/wife are consenting adults).
+    # 3) Family + sexual in the thread, NOT a partner relationship — refuse.
+    # A partner relationship clears it (girlfriend/wife are consenting adults).
     if has_sex and has_family and not has_partner:
         return True
 
@@ -420,8 +464,9 @@ def _clean_local_stream(stream_iter, user_message="", user_lines=None):
     yield "", (source or "ollama")
 
 
-def generate_global_chat_reply(user_name, goals_summary, history, message, db=None, persona=""):
-    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
+def generate_global_chat_reply(user_name, goals_summary, history, message, db=None, persona="",
+                               location=""):
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
     user_prompt = _global_chat_prompt(summary, history, user_name, message)
     if _is_truly_harmful(message, context=history):
@@ -429,9 +474,10 @@ def generate_global_chat_reply(user_name, goals_summary, history, message, db=No
     return _chat_llm(sys, user_prompt, db, user_message=message)
 
 
-def stream_global_chat_reply(user_name, goals_summary, history, message, db=None, persona=""):
+def stream_global_chat_reply(user_name, goals_summary, history, message, db=None, persona="",
+                             location=""):
     """Same as generate_global_chat_reply but streams text chunks (echo-cleaned)."""
-    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
     user_prompt = _global_chat_prompt(summary, history, user_name, message)
     if _is_truly_harmful(message, context=history):
@@ -453,20 +499,36 @@ def _plan_section(plan_lines):
     )
 
 
-def _with_persona(base, persona):
-    if not persona:
-        return base
-    return (
-        base
-        + "\n\nYou have a standing personality contract with this user that they set "
-        "explicitly. It OVERRIDES the default tone above. Follow it to the letter:\n"
-        + persona
-    )
+def _with_persona(base, persona, location=""):
+    sys = base
+    if persona:
+        sys += (
+            "\n\nYou have a standing personality contract with this user that they set "
+            "explicitly. It OVERRIDES the default tone above. Follow it to the letter:\n"
+            + persona
+        )
+    loc = (location or "").strip()
+    if loc:
+        sys += (
+            f"\n\nLOCATION: this user is based in {loc}. Only suggest services, apps, "
+            "shops, restaurants, delivery, payments, transport or venues that actually "
+            "exist and operate there — never assume US-only options (no DoorDash, "
+            "Target, CVS…) unless they truly exist in that country. Money amounts in "
+            "the local currency when natural. If a real-world step depends on local "
+            "infrastructure, adapt it to theirs."
+        )
+    else:
+        sys += (
+            "\n\nLOCATION: the user's country is not set. Never assume US-only "
+            "services; prefer globally-available or online options, and if a "
+            "recommendation truly depends on their country, ask it in one line."
+        )
+    return sys
 
 
 def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_lines="",
-                        persona="", step_done=False):
-    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
+                        persona="", step_done=False, location=""):
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     plan_section = _plan_section(plan_lines)
     user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
                                     step_done=step_done)
@@ -476,10 +538,10 @@ def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_li
 
 
 def stream_chat_reply(user_name, goal_name, history, message, db=None, plan_lines="",
-                      persona="", step_done=False):
+                      persona="", step_done=False, location=""):
     """Same as generate_chat_reply but streams text chunks (echo-cleaned). Yields
     (chunk, source)."""
-    sys = _with_persona(BASE_SYSTEM_PROMPT, persona)
+    sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     plan_section = _plan_section(plan_lines)
     user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
                                     step_done=step_done)
@@ -690,6 +752,54 @@ def goal_questionnaire(title):
             {"key": "biggest_blocker", "q": "What's the biggest thing blocking you right now?", "hint": "e.g. don't know where to start, missing info, no time"},
         ]
     return questions
+
+
+def generate_clarify_questions(title, db=None):
+    """Ask the MODEL for 2-4 clarifying questions written for THIS specific goal
+    (not the hardcoded category sets). Falls back to the built-in sets when no
+    LLM can serve clean JSON in time, so goal creation never blocks on it."""
+    sys = (
+        "You are Eloise, a sharp scheduling chief. The user just filed a goal. Write "
+        "3 short clarifying questions whose answers would let you build a real, "
+        "concrete day-by-day schedule for exactly this goal. Cover: the concrete "
+        "outcome (what 'done' looks like), the biggest constraint or blocker, and "
+        "the specifics only they know (people involved, budget, tools, hours "
+        "available, their country). Be direct and slightly dry — no fluff, no "
+        "therapist voice. One line per question."
+    )
+    user_prompt = (
+        f"Goal filed: {title}\n"
+        "Return ONLY a JSON array of exactly 3 objects, each like "
+        '{"key": "short_key", "q": "the question", "hint": "tiny example answer"}. '
+        "No markdown, no commentary, nothing outside the array."
+    )
+    try:
+        result = get_manager(db).generate(sys, user_prompt, timeout=30, max_tokens=250)
+    except Exception:
+        result = None
+    if result is not None and getattr(result, "ok", False) and result.text:
+        m = re.search(r"\[.*\]", result.text, re.S)
+        if m:
+            try:
+                raw = json.loads(m.group(0))
+                qs = []
+                for i, item in enumerate(raw[:4]):
+                    if not isinstance(item, dict):
+                        continue
+                    q = str(item.get("q") or "").strip()
+                    if not q:
+                        continue
+                    key = re.sub(r"[^a-z0-9_]", "_", str(item.get("key") or f"q{i + 1}").lower()).strip("_")[:32]
+                    qs.append({
+                        "key": key or f"q{i + 1}",
+                        "q": q[:220],
+                        "hint": str(item.get("hint") or "").strip()[:140],
+                    })
+                if qs:
+                    return qs
+            except Exception:
+                pass
+    return goal_questionnaire(title)
 
 
 def goal_details_summary(details_json):
@@ -1188,7 +1298,24 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         windows = ", ".join(
             f"{b[0] // 60:02d}:{b[0] % 60:02d}-{b[1] // 60:02d}:{b[1] % 60:02d}" for b in extra_blocked
         )
-        blocked_line = f"\nUser is ALWAYS unavailable in these windows (do not plan tasks here): {windows}"
+        blocked_line = (
+            f"\nHARD BLOCKED WINDOWS — NEVER schedule ANY task inside these, on ANY day: "
+            f"{windows}. They repeat every single day until the deadline. A task placed "
+            "at 5pm when the gym window is 5-7pm is a failed plan, not a judgment call."
+        )
+    location_line = ""
+    try:
+        loc = user_location(db, goal.get("user_id")).strip()
+    except Exception:
+        loc = ""
+    if loc:
+        location_line = (
+            f"\nUSER LOCATION: {loc}. Every service, app, shop, restaurant, delivery "
+            "option, payment method, transport or venue a task depends on must actually "
+            "exist and operate there — never suggest US-only options (DoorDash, Target, "
+            "CVS, Venmo…) unless they truly exist in that country. Money in the local "
+            "currency when natural."
+        )
     detail_line = ""
     details_summary = goal_details_summary(goal.get("details"))
     if details_summary:
@@ -1282,6 +1409,7 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         f"THE GOAL IS: {title}\n"
         f"Constraints: {cons}"
         f"{blocked_line}"
+        f"{location_line}"
         f"{chat_line}"
         f"{links_line}"
         f"{detail_line}"

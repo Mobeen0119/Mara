@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 
@@ -8,14 +9,48 @@ from core.database import get_connection
 from core.deps import require_user
 from core import generation
 from core.llm import LLMManager
-from core.llm.openai_provider import DEFAULT_BASE_URL, DEFAULT_CLOUD_MODEL
+from core.llm.openai_provider import (
+    DEFAULT_BASE_URL,
+    DEFAULT_CLOUD_MODEL,
+    PRESET_BY_ID,
+    PROVIDER_PRESETS,
+    OpenAICompatProvider,
+    clean_base_url,
+    preset_for_base_url,
+)
 from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
-from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest, PersonaRequest
+from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest, LLMTestRequest, LocationRequest, PersonaRequest
 from core.routes.goal_routes import regenerate_plan_bg
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _load_cfg(conn):
+    """The saved LLM settings row as a dict ({} when never saved)."""
+    row = conn.execute("SELECT value FROM app_settings WHERE key='llm'").fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return {}
+
+
+def _resolve_setting(cfg, field, env_names, default=""):
+    """Effective value for one provider field: saved setting first, then the
+    given environment variables in order, then the default. Mirrors how
+    build_providers() actually picks what it runs, so what Settings SHOWS is
+    what the app USES."""
+    val = (cfg.get(field) or "").strip()
+    if val:
+        return val
+    for name in env_names:
+        val = (os.environ.get(name) or "").strip()
+        if val:
+            return val
+    return default
 
 
 def _clean_ollama_url(raw):
@@ -48,23 +83,19 @@ def status(user: dict = Depends(require_user)):
 @router.get("/settings/llm")
 def get_llm(user: dict = Depends(require_user)):
     conn = get_connection()
-    row = conn.execute("SELECT value FROM app_settings WHERE key='llm'").fetchone()
-    cfg = {}
-    if row and row[0]:
-        try:
-            cfg = json.loads(row[0])
-        except Exception:
-            cfg = {}
-    import os
-    base_url = cfg.get("base_url") or os.environ.get("OPENAI_BASE_URL") or DEFAULT_BASE_URL
-    model = (cfg.get("model") or os.environ.get("OPENAI_MODEL")
-             or os.environ.get("OPENROUTER_MODEL") or DEFAULT_CLOUD_MODEL)
+    cfg = _load_cfg(conn)
+    base_url = _resolve_setting(cfg, "base_url", ("OPENAI_BASE_URL", "OPENROUTER_URL"), DEFAULT_BASE_URL)
+    model = _resolve_setting(cfg, "model", ("OPENAI_MODEL", "OPENROUTER_MODEL"), DEFAULT_CLOUD_MODEL)
+    saved_key = (cfg.get("api_key") or cfg.get("openrouter_key") or "").strip()
+    env_key = _resolve_setting({}, "api_key", ("OPENAI_API_KEY", "OPENROUTER_API_KEY"))
+    provider = (cfg.get("provider") or "").strip() or (preset_for_base_url(base_url) or "")
     return {
-        "provider": cfg.get("provider") or "",
+        "provider": provider,
         "base_url": base_url,
         "model": model,
-        "api_key_set": bool(cfg.get("api_key") or cfg.get("openrouter_key")
-                            or os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY")),
+        "api_key_set": bool(saved_key or env_key),
+        "key_source": ("settings" if saved_key else ("env" if env_key else None)),
+        "presets": PROVIDER_PRESETS,
         "enable_local": cfg.get("enable_local", False),
         "ollama_url": _clean_ollama_url(cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434")),
         "ollama_model": cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
@@ -75,32 +106,35 @@ def get_llm(user: dict = Depends(require_user)):
 @router.put("/settings/llm")
 def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_user)):
     conn = get_connection()
-    row = conn.execute("SELECT value FROM app_settings WHERE key='llm'").fetchone()
-    cfg = {}
-    if row and row[0]:
-        try:
-            cfg = json.loads(row[0])
-        except Exception:
-            cfg = {}
+    cfg = _load_cfg(conn)
+    provider = (body.provider or "").strip()
+    if provider:
+        cfg["provider"] = provider
+    else:
+        cfg.pop("provider", None)
+    # A chosen preset fills any endpoint/model the caller left blank, so an
+    # API client can post {provider, api_key} alone and get a working config —
+    # and a provider switch can never inherit the previous provider's model.
+    preset = PRESET_BY_ID.get(provider)
     if body.api_key is not None and body.api_key.strip():
         cfg["api_key"] = body.api_key.strip()
         cfg.pop("openrouter_key", None)
     if body.openrouter_key is not None and body.openrouter_key.strip():
         cfg["api_key"] = body.openrouter_key.strip()
         cfg.pop("openrouter_key", None)
+    if body.clear_key:
+        cfg.pop("api_key", None)
+        cfg.pop("openrouter_key", None)
     if body.model is not None and body.model.strip():
         cfg["model"] = body.model.strip()
     elif body.openrouter_model is not None and body.openrouter_model.strip():
         cfg["model"] = body.openrouter_model.strip()
+    elif preset:
+        cfg["model"] = preset["model"]
     if body.base_url is not None and body.base_url.strip():
         cfg["base_url"] = body.base_url.strip()
-        if not body.provider:
-            cfg.pop("provider", None)
-    if body.provider is not None:
-        if body.provider.strip():
-            cfg["provider"] = body.provider.strip()
-        else:
-            cfg.pop("provider", None)
+    elif preset:
+        cfg["base_url"] = preset["url"]
     if body.enable_local is not None:
         cfg["enable_local"] = bool(body.enable_local)
     if body.ollama_url is not None:
@@ -114,6 +148,46 @@ def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_user)):
     )
     conn.commit()
     return {"ok": True}
+
+
+@router.post("/settings/llm/test")
+def test_llm(body: LLMTestRequest, user: dict = Depends(require_user)):
+    """Send one tiny real request to the provider and report exactly what
+    happened. Fields left blank resolve from saved settings, then .env — so
+    this works as 'test what's configured' and 'test what I just typed'."""
+    cfg = _load_cfg(get_connection())
+    api_key = (body.api_key or "").strip() or _resolve_setting(
+        cfg, "api_key", ("OPENAI_API_KEY", "OPENROUTER_API_KEY"))
+    # Legacy rows may still carry openrouter_key under the old name.
+    if not api_key:
+        api_key = (cfg.get("openrouter_key") or "").strip()
+    base_url = clean_base_url(
+        (body.base_url or "").strip()
+        or _resolve_setting(cfg, "base_url", ("OPENAI_BASE_URL", "OPENROUTER_URL"), DEFAULT_BASE_URL)
+    )
+    model = ((body.model or "").strip()
+             or _resolve_setting(cfg, "model", ("OPENAI_MODEL", "OPENROUTER_MODEL"), DEFAULT_CLOUD_MODEL))
+    label = ((body.provider or "").strip()
+             or (cfg.get("provider") or "").strip()
+             or preset_for_base_url(base_url) or "cloud")
+    if not api_key:
+        return {
+            "ok": False, "provider": label, "model": model, "base_url": base_url,
+            "error": "No API key — paste one above, then test again.",
+        }
+    provider = OpenAICompatProvider(api_key=api_key, model=model, base_url=base_url, name=label)
+    result = provider.generate(
+        "You are a connectivity probe. Reply with exactly one word.",
+        "ping", timeout=25, max_tokens=16,
+    )
+    return {
+        "ok": result.ok,
+        "provider": provider.name,
+        "model": provider.model,
+        "base_url": provider.base_url,
+        "latency_ms": result.latency_ms,
+        "error": (None if result.ok else (result.error or "no reply from provider")),
+    }
 
 
 @router.put("/settings/checkin-time")
@@ -164,6 +238,20 @@ def get_persona(user: dict = Depends(require_user)):
     return {"persona": user_persona(get_connection(), user["id"])}
 
 
+@router.get("/settings/location")
+def get_location(user: dict = Depends(require_user)):
+    return {"location": (user.get("location") or "").strip() or generation.DEFAULT_LOCATION}
+
+
+@router.put("/settings/location")
+def put_location(body: LocationRequest, user: dict = Depends(require_user)):
+    loc = (body.location or "").strip()[:80]
+    conn = get_connection()
+    conn.execute("UPDATE users SET location=? WHERE id=?", (loc, user["id"]))
+    conn.commit()
+    return {"ok": True, "location": loc or generation.DEFAULT_LOCATION}
+
+
 @router.put("/settings/persona")
 def put_persona(body: PersonaRequest, user: dict = Depends(require_user)):
     from core.generation import user_persona
@@ -194,13 +282,15 @@ def get_settings(user: dict = Depends(require_user)):
 @router.post("/email/digest")
 def email_digest(user: dict = Depends(require_user)):
     """Send the full upcoming schedule to the user's email right now. Best-effort."""
-    from core.mailer import smtp_configured, send_email
+    from core.mailer import smtp_configured, send_email_detailed
     from core.persona import build_daily_email_html
     conn = get_connection()
     if not user["email"]:
         return {"ok": False, "reason": "no email on file", "hint": sched_email_hint("no-email")}
     if not smtp_configured():
-        return {"ok": False, "reason": "SMTP not configured", "hint": sched_email_hint("smtp")}
+        from core.mailer import smtp_diag
+        problems = "; ".join(smtp_diag()["problems"])
+        return {"ok": False, "reason": problems or "SMTP not configured", "hint": sched_email_hint("smtp")}
     today = date.today().isoformat()
     horizon = (date.today() + timedelta(days=7)).isoformat()
     goals = conn.execute(
@@ -240,31 +330,30 @@ def email_digest(user: dict = Depends(require_user)):
     body_lines.append("\nEloise")
     text = "\n".join(body_lines)
     html = build_daily_email_html(user["name"], tasks, round(total_hours, 1), days_to_nearest)
-    ok = send_email(user["email"], "Eloise - your week, no improvising", text, html)
-    return {"ok": ok, "reason": "sent" if ok else "send failed", "hint": sched_email_hint("ok") if ok else sched_email_hint("send")}
+    ok, err = send_email_detailed(user["email"], "Eloise - your week, no improvising", text, html)
+    if ok:
+        return {"ok": True, "reason": "sent", "hint": sched_email_hint("ok")}
+    return {"ok": False, "reason": err or "send failed", "hint": sched_email_hint("send")}
 
 
 @router.get("/email/status")
 def email_status(user: dict = Depends(require_user)):
-    from core.mailer import smtp_configured
-    conn = get_connection()
-    host = None
-    import os
-    if os.environ.get("SMTP_HOST"):
-        host = os.environ["SMTP_HOST"]
+    from core.mailer import smtp_diag
+    diag = smtp_diag()
+    hint = sched_email_hint("ok" if diag["configured"] and user["email"] else "smtp")
     return {
-        "configured": smtp_configured(),
-        "host": host,
+        **diag,
         "user_has_email": bool(user["email"]),
-        "hint": sched_email_hint("ok" if smtp_configured() and user["email"] else "smtp"),
+        "hint": hint,
+        "problems": diag["problems"] + ([] if user["email"] else ["No email on your profile."]),
     }
 
 
 def sched_email_hint(code):
     return {
         "no-email": "Add an email to get the schedule mailed to you.",
-        "smtp": "SMTP isn't armed — set SMTP_HOST/MAIL_FROM in your .env and restart.",
-        "send": "SMTP accepted the config but the send didn't land (bad login or relay).",
+        "smtp": "SMTP isn't armed — set SMTP_HOST, SMTP_USER and SMTP_PASS (16-char App Password) in your .env and restart.",
+        "send": "SMTP accepted the config but the send didn't land — check the error shown above.",
         "ok": "Mail channel is live.",
     }.get(code, "")
 
@@ -362,14 +451,23 @@ def schedule(user: dict = Depends(require_user)):
     conn = get_connection()
     today = date.today().isoformat()
     horizon = (date.today() + timedelta(days=14)).isoformat()
+    lookback = (date.today() - timedelta(days=14)).isoformat()
+    # Sweep: any still-pending task dated before today is a miss. Persist it so
+    # every "missed" counter in the app actually means something.
+    conn.execute(
+        "UPDATE actions SET status='missed' WHERE status='pending' AND date<? AND goal_id IN "
+        "(SELECT id FROM goals WHERE user_id=? AND status='active')",
+        (today, user["id"]),
+    )
+    conn.commit()
     goals = conn.execute(
         "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
     ).fetchall()
-    out = {}
+    out = {"dates": {}, "missed_total": 0}
     for g in goals:
         acts = conn.execute(
             "SELECT * FROM actions WHERE goal_id=? AND date>=? AND date<=? ORDER BY order_idx",
-            (g["id"], today, horizon),
+            (g["id"], lookback, horizon),
         ).fetchall()
         by_date = {}
         for a in acts:
@@ -377,5 +475,7 @@ def schedule(user: dict = Depends(require_user)):
                 "id": a["id"], "title": a["title"], "start_time": a["start_time"], "end_time": a["end_time"],
                 "status": a["status"], "goal_id": g["id"],
             })
-        out[str(g["id"])] = {"title": g["display_title"], "by_date": by_date}
+        missed_here = sum(1 for a in acts if a["status"] == "missed")
+        out["missed_total"] += missed_here
+        out["dates"][str(g["id"])] = {"title": g["display_title"], "by_date": by_date}
     return out

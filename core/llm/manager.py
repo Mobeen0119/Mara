@@ -131,6 +131,20 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
         t = t2
     if not t:
         return ""
+    # Sentence-level repetition guard: weak models loop the same sentence
+    # ("Get to work. Get to work. Get to work.") inside one reply. Keep each
+    # distinct sentence exactly once, in order.
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    seen = set()
+    kept = []
+    for p in parts:
+        key = re.sub(r"[^a-z0-9 ]", "", p.lower()).strip()
+        if len(key) >= 8:
+            if key in seen:
+                continue
+            seen.add(key)
+        kept.append(p)
+    t = " ".join(kept).strip()
     return t
 
 
@@ -407,7 +421,7 @@ class LLMManager:
             except Exception as exc:
                 logger.warning("provider %s stream errored: %s", p.name, exc)
                 continue
-        raise RuntimeError("no usable provider (start local model or add an API key)")
+        raise RuntimeError("no usable provider (add an API key in Settings > LLM Provider)")
 
     def statuses(self):
         providers = self._providers()

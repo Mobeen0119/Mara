@@ -117,6 +117,7 @@ def me(user: dict = Depends(require_user)):
         "is_guest": user["is_guest"],
         "checkin_time": user["checkin_time"] or "08:00",
         "last_checkin_at": user["last_checkin_at"],
+        "location": (user.get("location") or "").strip() or "Pakistan",
     }
 
 

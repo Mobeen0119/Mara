@@ -76,11 +76,22 @@ class LLMSettingsRequest(BaseModel):
     model: Optional[str] = None
     api_key: Optional[str] = None
     enable_local: Optional[bool] = None
+    # Forget the stored key and fall back to the environment (.env).
+    clear_key: Optional[bool] = None
     # Legacy fields, still accepted for older clients.
     ollama_url: Optional[str] = None
     ollama_model: Optional[str] = None
     openrouter_model: Optional[str] = None
     openrouter_key: Optional[str] = None
+
+
+class LLMTestRequest(BaseModel):
+    """Probe the provider with a one-word generation. Any field left blank is
+    resolved from saved settings, then .env — so you can test before saving."""
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 class CheckinTimeRequest(BaseModel):
@@ -98,6 +109,12 @@ class BlockedWindowsRequest(BaseModel):
 
 class PersonaRequest(BaseModel):
     persona: str = Field(default="", max_length=2000)
+
+
+class LocationRequest(BaseModel):
+    """Where the user actually lives — chat and plans only suggest services
+    that exist there (Pakistan by default, change it in Settings)."""
+    location: str = Field(default="", max_length=80)
 
 
 class ReminderSetRequest(BaseModel):

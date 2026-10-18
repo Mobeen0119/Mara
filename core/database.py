@@ -190,6 +190,7 @@ MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN blocked_windows TEXT DEFAULT '[]'",
     "ALTER TABLE goals ADD COLUMN details TEXT DEFAULT '{}'",
     "ALTER TABLE users ADD COLUMN persona TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN location TEXT DEFAULT 'Pakistan'",
 ]
 
 

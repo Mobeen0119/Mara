@@ -72,6 +72,10 @@ function safeLink(url) {
 /* ============================================================
    Modals
    ============================================================ */
+function closeModal() {
+  const m = document.getElementById('app-modal');
+  if (m) m.remove();
+}
 function openModal(title, bodyHtml, actionsHtml) {
   closeModal();
   const overlay = document.createElement('div');
@@ -226,7 +230,7 @@ function logout() {
 function enterApp() {
   document.getElementById('auth-screen').classList.add('hidden');
   document.getElementById('app-screen').classList.remove('hidden');
-  const ru = document.getElementById('rail-user');
+  const ru = document.getElementById('orbit-user');
   if (ru) ru.textContent = (userName || '?').slice(0, 1).toUpperCase();
   navigate('today');
   mountChatPanel();
@@ -235,7 +239,7 @@ function enterApp() {
 }
 
 async function refreshFootMomentum() {
-  const el = document.getElementById('rail-user');
+  const el = document.getElementById('orbit-user');
   if (!el) return;
   try {
     const m = await api('/momentum');
@@ -329,9 +333,10 @@ function navigate(screen, param, fromHash) {
     }
   }
   currentScreen = screen;
-  document.querySelectorAll('.rail-item').forEach(n =>
+  document.querySelectorAll('.orbit-item').forEach(n =>
     n.classList.toggle('active', n.dataset.screen === screen)
   );
+  toggleOrbit(false);
   const main = document.getElementById('main-content');
   main.classList.remove('scene-in');
   void main.offsetWidth; // restart the entrance animation
@@ -1014,15 +1019,42 @@ async function toggleTask(id, btn) {
    ============================================================ */
 let _chatMounted = false;
 
+let _orbitTimer = null;
+function toggleOrbit(force) {
+  const o = document.getElementById('orbit');
+  if (!o) return;
+  const open = force === undefined ? !o.classList.contains('open') : force;
+  o.classList.toggle('open', open);
+}
+function _bindOrbit() {
+  const o = document.getElementById('orbit');
+  if (!o) return;
+  const show = () => { clearTimeout(_orbitTimer); toggleOrbit(true); };
+  const hide = () => { clearTimeout(_orbitTimer); _orbitTimer = setTimeout(() => toggleOrbit(false), 220); };
+  o.addEventListener('mouseenter', show);
+  o.addEventListener('mouseleave', hide);
+  o.addEventListener('focusin', show);
+  o.addEventListener('focusout', (e) => { if (!o.contains(e.relatedTarget)) hide(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const tag = (e.target && e.target.tagName) || '';
+    if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
+    if (e.key === 'Escape') { toggleOrbit(false); return; }
+    const map = { '1': 'today', '2': 'board', '3': 'goals', '4': 'new-goal', '5': 'schedule', '6': 'settings' };
+    if (map[e.key]) { navigate(map[e.key]); return; }
+    if (e.key === 'c' || e.key === 'C') toggleChatPanel();
+  });
+}
+
 function toggleChatPanel(force) {
   const p = document.getElementById('chat-panel');
   if (!p) return;
-  const open = force === undefined ? p.classList.contains('closed') : force;
-  p.classList.toggle('closed', !open);
+  const open = force === undefined ? !p.classList.contains('open') : force;
+  p.classList.toggle('open', open);
   p.setAttribute('aria-hidden', open ? 'false' : 'true');
-  document.getElementById('app-screen').classList.toggle('panel-open', open);
-  const railDot = document.getElementById('rail-dot');
-  if (railDot) railDot.classList.toggle('on', open);
+  document.body.classList.toggle('chat-open', open);
+  const dot = document.getElementById('orbit-dot');
+  if (dot) dot.classList.toggle('on', open);
   if (open) {
     if (!_chatMounted) mountChatPanel();
     const inp = document.getElementById('global-chat-input');
@@ -1038,10 +1070,6 @@ async function mountChatPanel() {
   const inp = document.getElementById('global-chat-input');
   if (inp) {
     inp.onkeypress = (e) => { if (e.key === 'Enter') sendGlobalChat(); };
-    inp.oninput = () => {
-      const dot = document.getElementById('rail-dot');
-      if (dot) dot.classList.toggle('unread', !inp.value && chatEl && chatEl._lastUserMsg);
-    };
   }
   refreshPanelModel();
   if (!chatEl) return;
@@ -1593,8 +1621,9 @@ async function sendDigest() {
    Boot
    ============================================================ */
 window.addEventListener('DOMContentLoaded', () => {
+  _bindOrbit();
   if (token) {
-    const ru = document.getElementById('rail-user');
+    const ru = document.getElementById('orbit-user');
     if (ru) ru.textContent = (userName || '?').slice(0, 1).toUpperCase();
     enterApp();
     // Restore the page from the URL hash (refresh keeps your place).

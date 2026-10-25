@@ -692,6 +692,66 @@ def _hh_12_to_24(hh, mer):
     return hh + 12 if mer == "pm" else hh
 
 
+def parse_clock_list(text):
+    """Pull every clock time out of a string into minutes from midnight.
+    '23:30 - 07:00' -> [1410, 420]; '08:00, 13:00, 20:00' -> [480, 780, 1200]."""
+    out = []
+    for hh, mm, mer in re.findall(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", (text or "").lower()):
+        h, m = int(hh), int(mm) if mm else 0
+        if mer:
+            h = _hh_12_to_24(h, mer)
+        if 0 <= h < 24 and 0 <= m < 60:
+            out.append(h * 60 + m)
+    return out
+
+
+_ROUTINE_QUESTIONS = [
+    {"key": "sleep_schedule", "q": "When do you usually sleep, and when do you wake up?",
+     "hint": "e.g. 23:30 – 07:00"},
+    {"key": "meal_times", "q": "When do you usually eat — breakfast, lunch, dinner?",
+     "hint": "e.g. 08:00, 13:00, 20:00"},
+    {"key": "movement_time", "q": "When do you usually move, gym or play?",
+     "hint": "e.g. 18:00 (or type 'none')"},
+]
+
+
+def _merge_routine(questions):
+    """Always ask the basics — sleep, meals, movement — so the schedule is built
+    around a real human day instead of 8am-to-11pm straight work."""
+    seen = {q.get("key") for q in questions}
+    out = list(questions)
+    for rq in _ROUTINE_QUESTIONS:
+        if rq["key"] not in seen:
+            out.append(dict(rq))
+    return out[:6]
+
+
+def parse_routine_windows(details):
+    """Turn the user's sleep / meal / movement answers into busy windows (minutes)."""
+    d = details or {}
+    windows = []
+    sleep_times = parse_clock_list(d.get("sleep_schedule") or "")
+    if len(sleep_times) >= 2:
+        windows.append((sleep_times[0], sleep_times[1]))
+    for t in parse_clock_list(d.get("meal_times") or "")[:3]:
+        windows.append((t, t + 45))
+    mv = (d.get("movement_time") or "").strip().lower()
+    if mv and mv not in ("none", "no", "n/a", "-", "skip", "0"):
+        mt = parse_clock_list(d.get("movement_time") or "")
+        if mt:
+            windows.append((mt[0], mt[0] + 60))
+    return windows
+
+
+_DEFAULT_HUMAN_WINDOWS = [
+    (23 * 60, 7 * 60),
+    (7 * 60, 8 * 60),
+    (13 * 60, 13 * 60 + 45),
+    (18 * 60, 19 * 60),
+    (19 * 60 + 30, 20 * 60 + 15),
+]
+
+
 def goal_questionnaire(title):
     """Return 2-3 clarifying questions based on what kind of goal this is.
     The answers help generate a specific, actionable schedule instead of generic blocks."""
@@ -796,10 +856,10 @@ def generate_clarify_questions(title, db=None):
                         "hint": str(item.get("hint") or "").strip()[:140],
                     })
                 if qs:
-                    return qs
+                    return _merge_routine(qs)
             except Exception:
                 pass
-    return goal_questionnaire(title)
+    return _merge_routine(goal_questionnaire(title))
 
 
 def goal_details_summary(details_json):
@@ -877,10 +937,50 @@ def user_calendar_busy(db, user_id, exclude_goal_id, start_date, end_date):
     return busy
 
 
+_PERISHABLE_WORDS = (
+    "flower", "bouquet", "cake", "grocer", "produce", "fresh", "meat",
+    "milk", "dairy", "fruit", "vegetable", "ice cream", "ingredient",
+    "dessert", "seafood", "bakery", "salad",
+)
+_EVENT_WORDS = (
+    "date", "night", "dinner", "party", "wedding", "anniversary",
+    "birthday", "gift", "surprise", "proposal", "valentine", "celebration",
+    "getaway", "romantic", "hookup", "intimate",
+)
+
+
+def _is_perishable(text):
+    low = (text or "").lower()
+    return any(w in low for w in _PERISHABLE_WORDS)
+
+
+# Tasks that only make sense on the day itself (cooking, serving, decorating,
+# getting ready, picking up a fresh order). Treated like perishables when
+# ordering an event arc so they land on the event day, not days early.
+_SAME_DAY_WORDS = (
+    "cook", "serve", "bake", "roast", "grill", "fry", "assemble", "decorate",
+    "set up", "setup", "get ready", "pick up", "pickup", "collect", "deliver",
+    "dress", "hair", "makeup", "thaw", "warm", "reheat", "plate", "chill",
+)
+
+
+def _is_same_day(text):
+    low = (text or "").lower()
+    return _is_perishable(text) or any(w in low for w in _SAME_DAY_WORDS)
+
+
+def _is_event_goal(text):
+    low = (text or "").lower()
+    return any(w in low for w in _EVENT_WORDS)
+
+
 def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None):
     today = today or date.today().isoformat()
     deadline = goal["deadline"]
-    days = max(days_remaining(deadline, today), 1)
+    # Cover every day from today THROUGH the deadline (inclusive). Using only
+    # the raw gap silently dropped the deadline day itself — a "1 day left"
+    # goal planned today and forgot tomorrow, which is the day that matters.
+    span_days = min(max(days_remaining(deadline, today), 0) + 1, 121)
 
     # Load questionnaire details (if any) — these make the schedule specific.
     details = {}
@@ -901,6 +1001,13 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             blocked.append(w)
     # User-level "always busy" windows apply to EVERY goal in the same day.
     for w in (extra_blocked or []):
+        if w:
+            blocked.append(w)
+
+    # Sleep, meals and movement are not negotiable. Build around the times the
+    # user told us when filing; fall back to a sane default day if they skipped.
+    human_windows = parse_routine_windows(details) or _DEFAULT_HUMAN_WINDOWS
+    for w in human_windows:
         if w:
             blocked.append(w)
 
@@ -952,49 +1059,82 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             return None
         return (cur, cur + span)
 
-    # How many sessions a day gets is NOT a fixed '2-3'. It follows the
-    # deadline and the time that day actually has, so it can be MORE than 8 on
-    # a fully free day for a pressing goal (the hours are there — use them)
-    # and as FEW as one for an easy, long-running goal. No arbitrary 3-per-day
-    # cap.
-    if days <= 2:
-        wanted = 9
-    elif days <= 5:
-        wanted = 5
-    elif days <= 14:
-        wanted = 3
-    elif days <= 30:
-        wanted = 2
-    else:
-        wanted = 1
+    # --- deadline-aware backwards packing -------------------------------
+    # Parse the user's own "hours per day I can commit" answer so slot
+    # duration follows THEIR life, not a fixed 90-min guess.
+    commit_min = 120
+    tp = (details.get("time_per_day") or "").strip().lower()
+    m = re.search(r"(\d+)", tp)
+    if m:
+        n = int(m.group(1))
+        unit = tp[m.end():m.end() + 2]
+        # "30m" / "45 min" / a bare number over 16 all mean minutes, not hours.
+        is_minutes = ("m" in unit and "h" not in unit) or n > 16
+        if is_minutes:
+            commit_min = max(15, min(n, 16 * 60))
+        elif 1 <= n <= 16:
+            commit_min = n * 60
 
-    def slots_in_day(day_date=None):
+    # How many minutes does this person actually have free, per day, summed
+    # over the whole horizon? That caps how much we ever plan — we do NOT
+    # invent work beyond the time that exists.
+    def _free_minutes(day_date=None):
+        busy = _day_bounds(day_date)
+        cur = 8 * 60
+        free = 0
+        for (bs, be) in busy:
+            if be <= cur:
+                continue
+            if bs > cur:
+                free += bs - cur
+            cur = max(cur, be)
+        if cur < 23 * 60:
+            free += 23 * 60 - cur
+        return free
+
+    total_days = span_days
+    day_list = [(date.fromisoformat(today) + timedelta(days=i)).isoformat()
+                for i in range(total_days)]
+
+    # Budget: never exceed what the user said they can give per day, and
+    # never exceed the free time that actually exists on that day.
+    day_free = {d: min(_free_minutes(d), commit_min) for d in day_list}
+
+    # Slot length: split the daily commitment into whole sessions, minimum 45
+    # minutes (or the whole commitment if it is smaller) so every block is real
+    # work. No fixed per-day cap — sessions follow the hours actually committed.
+    min_sess = 45 if commit_min >= 45 else max(15, commit_min)
+    sessions_per_day = max(1, min(commit_min // min_sess, 16))
+    slot_len = max(min_sess, (commit_min // sessions_per_day) // 15 * 15)
+
+    def slots_in_day(day_date):
         busy = _day_bounds(day_date)
         chosen = []
-        cur = 8 * 60  # the usable part of a day opens at 8:00
-        span = 90
-        while cur + span <= 23 * 60 and len(chosen) < wanted:
-            cand = _free_from(busy, cur, chosen)
+        cur = 8 * 60
+        budget_left = day_free.get(day_date, 0)
+        min_req = min_sess
+        while len(chosen) < sessions_per_day and budget_left >= min_req:
+            span = min(slot_len, budget_left)
+            if span < min_req:
+                break
+            cand = _free_from(busy, cur, chosen, span=span)
             if not cand:
-                # No full 90-min window from here on; if the remainder of the
-                # day still has a meaningful free block, take a shorter honest
-                # slot rather than leaving the day bare.
-                short = _free_from(busy, cur, chosen, span=60)
-                if not short:
+                span = min(min_req, budget_left)
+                if span < min_req:
                     break
-                chosen.append(short)
-                cur = short[1]
-                continue
+                cand = _free_from(busy, cur, chosen, span=span)
+                if not cand:
+                    break
             chosen.append(cand)
+            budget_left -= (cand[1] - cand[0])
             cur = cand[1]
         return chosen
 
+    # Backwards packing: fill the LAST day first, walking back to today. If we
+    # run out of slots (blocked days, tiny windows), the EARLY days get left
+    # empty — never the day closest to the deadline, which is the one that
+    # actually decides whether the goal lands.
     entries = []
-    total_days = min(days, 120)
-    # Split the user's own questionnaire answers (syllabus / topic / …) into
-    # one concrete topic per day, else the fallback labels a session by the
-    # goal's own title. NEVER canned Eloise wording — only the user's text
-    # (hard rule).
     split_topics = None
     for key in ("syllabus", "topic", "domain", "requirements"):
         val = (details.get(key) or "").strip()
@@ -1004,22 +1144,47 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
                 split_topics = parts
                 break
     full_title = goal.get("title") or goal["display_title"]
+    is_event = _is_event_goal(full_title)
 
-    def _day_task(i, slot_idx):
-        if split_topics:
-            return split_topics[i % len(split_topics)]
-        return f"{full_title} — day {i + 1} part {slot_idx + 1}"
+    # Order tasks so anything that only makes sense ON the day (fresh flowers,
+    # cooking, decorating, getting ready) sits at the END of the sequence and
+    # lands on the event day — never days early where it would spoil or be
+    # pointless.
+    if split_topics and is_event:
+        same = [t for t in split_topics if _is_same_day(t)]
+        early = [t for t in split_topics if not _is_same_day(t)]
+        split_topics = early + same
 
-    for i in range(total_days):
-        day = (date.fromisoformat(today) + timedelta(days=i)).isoformat()
-        for slot_idx, (s, e) in enumerate(slots_in_day(day)):
-            entries.append({
-                "date": day,
-                "title": _day_task(i, slot_idx),
-                "start_time": f"{s // 60:02d}:{s % 60:02d}",
-                "end_time": f"{e // 60:02d}:{e % 60:02d}",
-                "status": "pending",
-            })
+    packed = []
+    for d in reversed(day_list):
+        day_slots = slots_in_day(d)
+        for (s, e) in reversed(day_slots):
+            packed.append((d, s, e))
+    if is_event and split_topics and len(packed) >= len(split_topics):
+        # An event is a short list of one-off jobs, not a syllabus you repeat.
+        # Take only the slots closest to the deadline so the arc builds up to
+        # the event, and schedule each task exactly once.
+        packed = packed[:len(split_topics)]
+    packed.reverse()
+
+    topic_seq = None
+    if split_topics:
+        if is_event and len(split_topics) <= len(packed):
+            topic_seq = list(split_topics[:len(packed)])
+        else:
+            topic_seq = [split_topics[i % len(split_topics)] for i in range(len(packed))]
+
+    for idx, (d, s, e) in enumerate(packed):
+        day_i = day_list.index(d)
+        title = topic_seq[idx] if topic_seq else f"{full_title} — day {day_i + 1}"
+        entries.append({
+            "date": d,
+            "title": title,
+            "start_time": f"{s // 60:02d}:{s % 60:02d}",
+            "end_time": f"{e // 60:02d}:{e % 60:02d}",
+            "duration_min": e - s,
+            "status": "pending",
+        })
     return entries
 
 
@@ -1303,6 +1468,48 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             f"{windows}. They repeat every single day until the deadline. A task placed "
             "at 5pm when the gym window is 5-7pm is a failed plan, not a judgment call."
         )
+    try:
+        _details = json.loads(goal.get("details") or "{}")
+    except Exception:
+        _details = {}
+    _routine = parse_routine_windows(_details)
+    if _routine:
+        _routine_txt = ", ".join(
+            f"{a // 60:02d}:{a % 60:02d}-{b // 60:02d}:{b % 60:02d}" for a, b in _routine
+        )
+        human_line = (
+            "\nHUMAN BASICS ARE MANDATORY, NOT OPTIONAL: the user's own routine blocks are "
+            f"{_routine_txt}. NEVER schedule a task inside them. Do not write tasks like "
+            "'skip lunch', 'work through dinner', 'skip the gym', 'skip the workout', "
+            "'stay up all night'. A person still eats, sleeps, moves and rests while "
+            "finishing this. If the deadline is tight, use the free waking hours — never "
+            "steal them from food, sleep or health."
+        )
+    else:
+        human_line = (
+            "\nHUMAN BASICS ARE MANDATORY, NOT OPTIONAL: never schedule a task during sleep "
+            "(23:00-07:00), meals (breakfast 07:00-08:00, lunch 13:00-13:45, dinner 19:30-20:15), "
+            "or the daily movement window (18:00-19:00). Do not write tasks like 'skip lunch', "
+            "'work through dinner', 'skip the gym', 'skip the workout', 'stay up all night'. "
+            "A person still eats, sleeps, moves and rests while finishing this. If the deadline "
+            "is tight, use the free waking hours — never steal them from food, sleep or health."
+        )
+    think_line = (
+        "\nTHINK ABOUT HOW TASKS DEPEND ON EACH OTHER BEFORE PLACING THEM:\n"
+        "- Perishables spoil. Flowers, food, cake, groceries, ice, fresh produce, meat, dairy: "
+        "buy them the SAME day they are used, or the morning of the event — never days earlier. "
+        "Do not schedule a purchase on Monday for an event on Thursday.\n"
+        "- Anything that must be followed by another step (buy -> use, print -> sign, "
+        "book -> attend) must have the follow-up in the same slot, the same day, or the very "
+        "next day at the latest. Never leave a stale gap.\n"
+        "- For exams/study: schedule studying the ACTUAL syllabus content (solve past papers, "
+        "work through chapter 4, write the lab report). NEVER schedule meta-work like "
+        "'build a schedule', 'make a study plan', 'prepare study materials', 'gather notes', "
+        "'create a study guide', 'collect resources', 'organize notes' — that is not studying "
+        "and it is not the task the user asked for.\n"
+        "- Every task must be finishable inside its own slot and must move the goal to done. "
+        "Completion is the only thing that counts."
+    )
     location_line = ""
     try:
         loc = user_location(db, goal.get("user_id")).strip()
@@ -1409,6 +1616,8 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         f"THE GOAL IS: {title}\n"
         f"Constraints: {cons}"
         f"{blocked_line}"
+        f"{human_line}"
+        f"{think_line}"
         f"{location_line}"
         f"{chat_line}"
         f"{links_line}"
@@ -1542,6 +1751,15 @@ def _title_ok(title, goal_ref=None):
         return False
     if any(v in low for v in ("start the next phase", "move to the next phase",
                               "go to the next phase", "next phase", "make progress on")):
+        return False
+    # Exam/study meta-work is not studying. Reject plan-making and
+    # material-gathering dressed up as tasks.
+    if any(p in low for p in (
+            "study materials", "study guide", "study plan", "study timetable",
+            "gather resources", "collect resources", "gather materials",
+            "build a schedule", "make a schedule", "create a schedule",
+            "make a timetable", "create a timetable", "build a timetable",
+            "organize notes", "organise notes", "compile notes")):
         return False
     # A title that STARTS with a weak planning verb ("Ensure aftercare and
     # safety", "Confirm way home") is a topic/vibe, not an action. Reject it

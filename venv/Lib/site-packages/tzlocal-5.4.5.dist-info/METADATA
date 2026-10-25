@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: tzlocal
-Version: 5.4.4
+Version: 5.4.5
 Summary: tzinfo object for the local timezone
 Author-email: Lennart Regebro <regebro@gmail.com>
 License-Expression: MIT
@@ -238,6 +238,8 @@ Contributors
 * Sam Treweek
 * Peter Di Pasquale
 * Rongrong
+* Muneeb Sheikh
+* Nicolò Daprelà
 
 (Sorry if I forgot someone)
 

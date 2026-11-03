@@ -101,13 +101,16 @@ def fallback_greeting(name):
 
 
 def build_daily_email_html(user_name, tasks, total_hours, days_left, goal_title=None):
+    from html import escape as _e
+    user_name = _e(str(user_name or ""))
+    goal_title = _e(str(goal_title)) if goal_title else goal_title
     lines = []
     for t in tasks:
-        date = t.get("date", "")
-        title = t.get("title", "Untitled task")
-        start = t.get("start_time", "")
-        end = t.get("end_time", "")
-        status = t.get("status", "pending")
+        date = _e(str(t.get("date", "")))
+        title = _e(str(t.get("title", "Untitled task")))
+        start = _e(str(t.get("start_time", "") or ""))
+        end = _e(str(t.get("end_time", "") or ""))
+        status = _e(str(t.get("status", "pending")))
         time_str = f"{start}–{end}" if start and end else "anytime"
         lines.append(f"<li><strong>{title}</strong> &middot; {date} · {time_str} · <em>{status}</em></li>")
     goal = ("<span style='color:#c99a3f;'>" + goal_title + "</span>") if goal_title else "Across all your active goals"

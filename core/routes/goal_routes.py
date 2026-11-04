@@ -1,14 +1,18 @@
 import json
 import logging
+import os
 import re as _re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
+from core import ratelimit
+from core.security import _utcnow
 from core.database import get_connection
 from core.deps import require_user
 from core import generation
@@ -26,19 +30,73 @@ from core.models import (
 logger = logging.getLogger("eloise")
 
 
-def _get_today():
-    try:
-        t = os.environ.get("ELOISE_TEST_TODAY")
-        if t:
-            return date.fromisoformat(t)
-    except Exception:
-        pass
-    return date.today()
+def _get_today(user=None):
+    """'Today' in the user's own timezone (honours ELOISE_TEST_TODAY for tests)."""
+    from core.clock import today_for
+    return today_for(user)
 
 
 router = APIRouter(prefix="/api", tags=["goals"])
 
 _plan_locks = {}
+_user_plan_locks = {}   # one draw at a time per user, so goal B sees goal A's finished blocks
+_user_locks_guard = threading.Lock()
+
+# One bounded pool for every background plan draw (the old code spawned a fresh
+# Thread per request, unbounded). A goal that is already queued/running is not
+# queued twice; a request that arrives mid-draw sets a flag so the draw runs
+# once more afterwards with the newest inputs, instead of being silently dropped.
+_PLAN_WORKERS = int(os.environ.get("ELOISE_PLAN_WORKERS", "3") or 3)
+_pool = None
+_queue_lock = threading.Lock()
+_queued = set()
+_rerun = {}
+
+
+def _get_pool():
+    global _pool
+    with _queue_lock:
+        if _pool is None:
+            _pool = ThreadPoolExecutor(max_workers=_PLAN_WORKERS, thread_name_prefix="plan")
+        return _pool
+
+
+def submit_plan(user, goal_id, prefer_cloud=False):
+    with _queue_lock:
+        if goal_id in _queued:
+            _rerun[goal_id] = (user, prefer_cloud or _rerun.get(goal_id, (None, False))[1])
+            return False
+        _queued.add(goal_id)
+    try:
+        _get_pool().submit(_run_plan_job, user, goal_id, prefer_cloud)
+    except RuntimeError:           # interpreter is exiting
+        with _queue_lock:
+            _queued.discard(goal_id)
+        return False
+    return True
+
+
+def _run_plan_job(user, goal_id, prefer_cloud):
+    try:
+        _regenerate_plan_bg(user, goal_id, prefer_cloud=prefer_cloud)
+    except Exception as exc:
+        logger.warning("plan job: goal %s crashed: %r", goal_id, exc)
+    finally:
+        again = None
+        with _queue_lock:
+            _queued.discard(goal_id)
+            again = _rerun.pop(goal_id, None)
+        if again:
+            submit_plan(again[0], goal_id, prefer_cloud=again[1])
+
+
+def shutdown_workers():
+    global _pool
+    with _queue_lock:
+        pool, _pool = _pool, None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
 
 # Retry bookkeeping per goal. A failed model call used to spawn "another
 # thread in 60s" forever — a single bad CPU spike could stack unbounded
@@ -48,6 +106,16 @@ _plan_locks = {}
 _PLAN_RETRY_MAX = 3
 _plan_retry_state = {}  # goal_id -> {"attempts": int, "scheduled": bool}
 _retry_state_lock = threading.Lock()
+
+
+def _replan_siblings(user, goal_id):
+    """A constraint typed into ANY goal guards every goal ('uni 9 to 1' is true for the
+    whole person), so when constraints change the user's OTHER live goals are redrawn."""
+    conn = get_connection()
+    for row in conn.execute(
+        "SELECT id FROM goals WHERE user_id=? AND status='active' AND id!=?", (user["id"], goal_id)
+    ).fetchall():
+        submit_plan(user, row["id"])
 
 
 def _goal_or_404(user, goal_id):
@@ -60,9 +128,10 @@ def _goal_or_404(user, goal_id):
     return dict(row)
 
 
-def _goal_payload(g, conn=None):
+def _goal_payload(g, conn=None, user=None):
     g = dict(g) if not isinstance(g, dict) else g
-    today = _get_today().isoformat()
+    today_d = _get_today(user)
+    today = today_d.isoformat()
     try:
         dl = generation.days_remaining(g["deadline"], today)
     except Exception:
@@ -79,7 +148,7 @@ def _goal_payload(g, conn=None):
                 "SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)
             ).fetchone()["c"]
             missed = sum(1 for a in actions if a["status"] == "missed")
-            pressure = generation.pressure_rating(g, actions, open_blockers=blockers, missed_days=missed)
+            pressure = generation.pressure_rating(g, actions, open_blockers=blockers, missed_days=missed, today=today_d)
         except Exception:
             pressure = None
     return {
@@ -97,13 +166,21 @@ def _goal_payload(g, conn=None):
     }
 
 
+def _dur(e):
+    s, f = _to_min(e.get("start_time")), _to_min(e.get("end_time"))
+    return (f - s) if (s is not None and f is not None and f > s) else 60
+
+
 def _insert_actions(conn, goal, entries):
-    for idx, e in enumerate(entries):
+    base = conn.execute(
+        "SELECT COALESCE(MAX(order_idx), -1) + 1 FROM actions WHERE goal_id=?", (goal["id"],)
+    ).fetchone()[0]
+    for idx, e in enumerate(entries, start=base):
         conn.execute(
             "INSERT INTO actions (goal_id, user_id, date, title, description, start_time, end_time, duration_min, status, order_idx) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (goal["id"], goal["user_id"], e["date"], e["title"], "", e.get("start_time", ""),
-             e.get("end_time", ""), 60, e.get("status", "pending"), idx),
+             e.get("end_time", ""), _dur(e), e.get("status", "pending"), idx),
         )
 
 
@@ -129,6 +206,23 @@ def active_goal_blocked_windows(conn, user):
     return blocked
 
 
+def _routine_windows(goal):
+    """Sleep / meals / movement as plain (start, end) windows with overnight spans
+    expressed past midnight, so the conflict resolver never slides a block into them."""
+    try:
+        details = json.loads(goal.get("details") or "{}")
+    except Exception:
+        details = {}
+    out = []
+    for s, e in (generation.parse_routine_windows(details) or generation._DEFAULT_HUMAN_WINDOWS):
+        if e <= s:
+            out.append((s, 24 * 60))
+            out.append((0, e))
+        else:
+            out.append((s, e))
+    return out
+
+
 def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
     logger.warning("plan bg: goal %s thread started", goal_id)
     try:
@@ -136,6 +230,8 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
     except Exception as exc:
         logger.warning("plan bg: goal %s lookup failed: %s", goal_id, exc)
         return
+    with _user_locks_guard:
+        ulock = _user_plan_locks.setdefault(user["id"], threading.Lock())
     lock = _plan_locks.setdefault(goal_id, threading.Lock())
     acquired = lock.acquire(blocking=False)
     if not acquired:
@@ -146,21 +242,25 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         except Exception:
             pass
         return
+    ulock.acquire()
     try:
-        time.sleep(0.5)
         conn = get_connection()
+        fresh = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        if fresh:
+            user = dict(fresh)        # blocked windows / timezone may have changed since queued
         # ELOISE IS THE SINGLE CONTROL UNIT: the user does not declare a
         # routine per goal. If they blocked gym 5-7am in ANY goal, every goal
         # knows. So each draw respects the union of the user's global blocked
         # windows AND every ACTIVE goal's own constraint windows
         # (gym/uni/sleep/whatever), parsed once here.
         blocked = active_goal_blocked_windows(conn, user)
+        blocked = blocked + _routine_windows(goal)
         # The slot grid must avoid the user's REAL calendar, not just declared
         # busy windows: other goals already occupy specific time on specific
         # days, and an LLM slot that lands on a booked block gets dropped
         # wholesale by conflict resolution (the whole plan silently collapsing
         # to "0 tasks").
-        today_iso = _get_today().isoformat()
+        today_iso = _get_today(user).isoformat()
         busy_by_date = generation.user_calendar_busy(
             conn, user["id"], goal_id, today_iso, goal.get("deadline") or today_iso
         )
@@ -223,6 +323,7 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         except Exception:
             pass
     finally:
+        ulock.release()
         lock.release()
 
 
@@ -264,7 +365,7 @@ def heal_stale_plans():
       confidently wrong '0 tasks across 0 days' summary and nothing ever re-drew them).
     Both get reset to 'active' and, if they still have no tasks, a fresh LOCAL-first
     generation is kicked at boot so the board and chat have something real to work with."""
-    today = _get_today().isoformat()
+    today = (_get_today() - timedelta(days=1)).isoformat()
     try:
         conn = get_connection()
         rows = conn.execute(
@@ -301,9 +402,7 @@ def heal_stale_plans():
                     logger.warning(
                         "plan bg: goal %s has no tasks — regenerating (was %s)", gid, g["plan_status"]
                     )
-                    threading.Thread(
-                        target=_regenerate_plan_bg, args=(dict(user), gid), daemon=True
-                    ).start()
+                    submit_plan(dict(user), gid)
         except Exception as exc:
             logger.warning("plan bg: heal goal %s failed: %r", gid, exc)
     # Hardcoded-title purge: the grid placeholder '— day N part 1' used to
@@ -339,9 +438,7 @@ def heal_stale_plans():
             user = conn.execute("SELECT * FROM users WHERE id=(SELECT user_id FROM goals WHERE id=?)", (gid,)).fetchone()
             if user:
                 logger.warning("plan bg: goal %s purged placeholder titles — regenerating", gid)
-                threading.Thread(
-                    target=_regenerate_plan_bg, args=(dict(user), gid), daemon=True,
-                ).start()
+                submit_plan(dict(user), gid)
         except Exception as exc:
             logger.warning("plan bg: purge placeholders goal %s failed: %r", gid, exc)
     # Self-contradictory plans: a goal whose pending tasks sit INSIDE its own
@@ -359,7 +456,7 @@ def heal_stale_plans():
               AND g.status NOT IN ('cancelled', 'succeeded')
               AND g.deadline >= ?
             """,
-            (_get_today().isoformat(),),
+            ((_get_today() - timedelta(days=1)).isoformat(),),
         ).fetchall()
     except Exception as exc:
         logger.warning("plan bg: constraint scan failed: %r", exc)
@@ -373,9 +470,7 @@ def heal_stale_plans():
                     logger.warning(
                         "plan bg: goal %s tasks violate its own blocked windows — redrawing", g["id"]
                     )
-                    threading.Thread(
-                        target=_regenerate_plan_bg, args=(dict(user), g["id"]), daemon=True,
-                    ).start()
+                    submit_plan(dict(user), g["id"])
         except Exception as exc:
             logger.warning("plan bg: constraint check goal %s failed: %r", g["id"], exc)
 
@@ -412,19 +507,15 @@ def _schedule_plan_retry(user, goal_id, delay=None):
     wait = delay if delay is not None else min(60 * (2 ** (attempt - 1)), 900)
 
     def _retry():
-        try:
-            time.sleep(wait)
-            try:
-                _regenerate_plan_bg(user, goal_id)
-            except Exception:
-                pass
-        finally:
-            with _retry_state_lock:
-                st = _plan_retry_state.get(goal_id)
-                if st:
-                    st["scheduled"] = False
+        with _retry_state_lock:
+            st = _plan_retry_state.get(goal_id)
+            if st:
+                st["scheduled"] = False
+        submit_plan(user, goal_id)
 
-    threading.Thread(target=_retry, daemon=True).start()
+    t = threading.Timer(wait, _retry)
+    t.daemon = True
+    t.start()
 
 
 def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
@@ -457,8 +548,21 @@ def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
         # wrong "0 tasks" summary. Keep whatever plan exists and let the retry
         # path re-run the draw against the real calendar.
         return None
-    conn.execute("DELETE FROM actions WHERE goal_id=?", (goal["id"],))
+    # A redraw replaces only the FUTURE pending tasks inside the window it just
+    # drew. Done and missed history is what momentum, streaks and pressure are
+    # computed from, and tasks beyond the detailed window stay as they are.
+    first_d, last_d = final[0]["date"], max(e["date"] for e in final)
+    first_start = min((e.get("start_time") or "00:00") for e in final if e["date"] == first_d)
+    # (a pending task earlier today than the new plan's first slot is left alone:
+    # it is a real miss, not something a redraw may erase)
+    conn.execute(
+        "DELETE FROM actions WHERE goal_id=? AND status='pending' AND date>=? AND date<=? "
+        "AND NOT (date=? AND start_time<?)",
+        (goal["id"], first_d, last_d, first_d, first_start),
+    )
     _insert_actions(conn, goal, final)
+    outline = generation.last_outline()
+    conn.execute("UPDATE goals SET outline=? WHERE id=?", (json.dumps(outline) if outline else "", goal["id"]))
     summary = f"{len(final)} tasks across {len(set(e['date'] for e in final))} days"
     if provider and provider != "fallback" and provider != "none":
         summary += f" · via {provider}"
@@ -581,15 +685,43 @@ def _resolve_cross_goal_slots(conn, goal, entries, blocked_min=None):
     return out
 
 
+GOAL_REFUSAL = (
+    "That goal doesn't go on this board — Eloise plans real goals, not incest or coercion. "
+    "A date, a hookup with protection, a memorable night for a partner: all in. That: no."
+)
+
+
+def _guard_title(title):
+    """The same content guardrail on EVERY path that writes a goal title (create AND edit)."""
+    if generation._is_truly_harmful(title or ""):
+        raise HTTPException(status_code=400, detail=GOAL_REFUSAL)
+
+
+def _clean_details(answers):
+    """Questionnaire answers go straight into model prompts: flat, small, strings only."""
+    if not isinstance(answers, dict) or len(answers) > 30:
+        raise HTTPException(status_code=400, detail="answers must be a small flat object")
+    out = {}
+    for k, v in answers.items():
+        if not isinstance(k, str) or len(k) > 40:
+            raise HTTPException(status_code=400, detail="bad answer key")
+        if isinstance(v, (int, float)):
+            v = str(v)
+        if not isinstance(v, str):
+            raise HTTPException(status_code=400, detail=f"answer '{k}' must be text")
+        out[k] = v.strip()[:500]
+    for v in out.values():
+        _guard_title(v)
+    return out
+
+
 @router.post("/goals")
 def create_goal(body: GoalCreateRequest, user: dict = Depends(require_user)):
     conn = get_connection()
     title = body.title.strip()[:120]
-    if generation._is_truly_harmful(title):
-        raise HTTPException(
-            status_code=400,
-            detail="That goal doesn't go on this board — Eloise plans real goals, not incest or coercion. A date, a hookup with protection, a memorable night for a partner: all in. That: no.",
-        )
+    _guard_title(title)
+    if body.deadline < _get_today(user).isoformat():
+        raise HTTPException(status_code=400, detail="that deadline has already passed")
     display = title if len(title) <= 60 else title[:57] + "..."
     constraints = json.dumps([c.strip() for c in body.constraints if c.strip()])
     cur = conn.execute(
@@ -601,7 +733,9 @@ def create_goal(body: GoalCreateRequest, user: dict = Depends(require_user)):
     goal = dict(conn.execute("SELECT * FROM goals WHERE id=?", (cur.lastrowid,)).fetchone())
     # kick off plan generation in the background thread so response is
     # immediate
-    threading.Thread(target=_regenerate_plan_bg, args=(user, goal["id"]), daemon=True).start()
+    submit_plan(user, goal["id"])
+    if json.loads(constraints):
+        _replan_siblings(user, goal["id"])
     # questions are fetched right after via POST /goals/{id}/clarify (the
     # model writes them for this specific goal); returning none here keeps
     # creation instant.
@@ -614,6 +748,7 @@ def clarify_goal(goal_id: int, user: dict = Depends(require_user)):
     the frontend can ask them instead of a hardcoded category set. Falls back
     to the built-in sets when the model is unreachable."""
     goal = _goal_or_404(user, goal_id)
+    ratelimit.enforce(f"llm:{user['id']}", 30, 60)
     conn = get_connection()
     questions = generation.generate_clarify_questions(
         goal.get("title") or goal.get("display_title") or "", db=conn,
@@ -625,11 +760,12 @@ def clarify_goal(goal_id: int, user: dict = Depends(require_user)):
 def save_goal_details(goal_id: int, user: dict = Depends(require_user), answers: dict = Body(default={})):
     """Save questionnaire answers and regenerate the schedule with them."""
     goal = _goal_or_404(user, goal_id)
+    answers = _clean_details(answers)
     conn = get_connection()
     conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps(answers), goal_id))
     conn.commit()
     # regenerate schedule with the new details
-    threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
+    submit_plan(user, goal_id)
     return {"ok": True}
 
 
@@ -639,7 +775,7 @@ def list_goals(user: dict = Depends(require_user)):
     rows = conn.execute("SELECT * FROM goals WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
     goals = []
     for g in rows:
-        payload = _goal_payload(g, conn=conn)
+        payload = _goal_payload(g, conn=conn, user=user)
         open_iv = conn.execute(
             "SELECT type FROM interventions WHERE goal_id=? AND user_id=? AND acknowledged=0",
             (g["id"], user["id"]),
@@ -664,8 +800,8 @@ def get_goal(goal_id: int, user: dict = Depends(require_user)):
         ).fetchall()
     ]
     chat_history = json.loads(goal["chat_history"] or "[]")
-    progress = generation.progress_stats(goal, actions)
-    payload = _goal_payload(goal, conn=conn)
+    progress = generation.progress_stats(goal, actions, today=_get_today(user))
+    payload = _goal_payload(goal, conn=conn, user=user)
     payload["plan"] = actions
     payload["blockers"] = blockers
     payload["chat_history"] = chat_history
@@ -679,6 +815,10 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
     conn = get_connection()
     fields = []
     vals = []
+    if body.title is not None:
+        _guard_title(body.title)
+    if body.deadline is not None and body.deadline < _get_today(user).isoformat():
+        raise HTTPException(status_code=400, detail="that deadline has already passed")
     if body.title is not None:
         fields.append("title=?")
         vals.append(body.title.strip()[:120])
@@ -695,19 +835,24 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
         fields.append("constraints=?")
         vals.append(json.dumps([c.strip() for c in body.constraints if c.strip()]))
     if not fields:
-        return _goal_payload(goal, conn=conn)
+        return _goal_payload(goal, conn=conn, user=user)
     vals.append(goal_id)
     conn.execute(f"UPDATE goals SET {', '.join(fields)} WHERE id=?", vals)
     # Changing the inputs that made a goal 'blocked' (no usable free time)
     # un-blocks it: kick a redraw so a relaxed window draws an honest schedule
     # right away.
     was_blocked = str(goal.get("plan_status") or "").startswith("blocked")
+    shapes_plan = (body.deadline is not None and body.deadline != goal.get("deadline")) or \
+                  (body.constraints is not None) or \
+                  (body.title is not None and body.title.strip() != (goal.get("title") or ""))
     if was_blocked:
         conn.execute("UPDATE goals SET plan_status='active', plan_summary='' WHERE id=?", (goal_id,))
     conn.commit()
-    if was_blocked:
-        threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
-    return _goal_payload(_goal_or_404(user, goal_id), conn=conn)
+    if was_blocked or shapes_plan:
+        submit_plan(user, goal_id)
+    if body.constraints is not None:
+        _replan_siblings(user, goal_id)
+    return _goal_payload(_goal_or_404(user, goal_id), conn=conn, user=user)
 
 
 @router.post("/goals/{goal_id}/plan")
@@ -719,6 +864,7 @@ def regen_plan(goal_id: int, user: dict = Depends(require_user), body: RegenPlan
     The goal is flagged plan_status='generating' so the UI can keep showing the current
     schedule and render the result when it settles."""
     goal = _goal_or_404(user, goal_id)
+    ratelimit.enforce(f"regen:{user['id']}", 12, 3600, "that's a lot of redraws — give the model a breather")
     conn = get_connection()
     existing = [dict(a) for a in conn.execute(
         "SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (goal_id,)
@@ -729,10 +875,7 @@ def regen_plan(goal_id: int, user: dict = Depends(require_user), body: RegenPlan
     # so it runs on the cloud model (fast, parallel with chat). Everything
     # automatic (create, retries, checkin, settings change) stays on the free
     # local model.
-    threading.Thread(
-        target=_regenerate_plan_bg, args=(user, goal_id),
-        kwargs={"prefer_cloud": True}, daemon=True,
-    ).start()
+    submit_plan(user, goal_id, prefer_cloud=True)
     return {"ok": True, "plan": existing, "source": "redraw-bg"}
 
 
@@ -746,7 +889,7 @@ def get_progress(goal_id: int, user: dict = Depends(require_user)):
             "SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (goal_id,)
         ).fetchall()
     ]
-    return generation.progress_stats(goal, actions)
+    return generation.progress_stats(goal, actions, today=_get_today(user))
 
 
 @router.post("/goals/{goal_id}/complete")
@@ -829,7 +972,7 @@ def remove_stake(goal_id: int, user: dict = Depends(require_user)):
 def momentum(user: dict = Depends(require_user)):
     """Streak + burn-rate + a 0-100 momentum meter derived from work actually done."""
     conn = get_connection()
-    stats = generation.momentum_stats(user["id"], db=conn)
+    stats = generation.momentum_stats(user["id"], db=conn, today=_get_today(user))
     # attach current stakes so the board can show what's on the line
     stakes = [
         dict(s) for s in conn.execute(
@@ -852,10 +995,14 @@ def enforce_stake(goal_id: int, user: dict = Depends(require_user)):
     ).fetchone()
     if not stake:
         raise HTTPException(status_code=404, detail="no stake on this file")
+    if goal["status"] == "succeeded":
+        raise HTTPException(status_code=400, detail="that file was closed as done; there is no debt")
+    if goal["status"] == "active" and goal["deadline"] >= _get_today(user).isoformat():
+        raise HTTPException(status_code=400, detail="the deadline hasn't passed yet; the bet is still live")
     from datetime import datetime
     conn.execute(
         "UPDATE stakes SET status='enforced', enforced_at=? WHERE id=?",
-        (datetime.utcnow().isoformat(), stake["id"]),
+        (_utcnow().isoformat(), stake["id"]),
     )
     conn.commit()
     roast = (
@@ -874,7 +1021,7 @@ def seed_demo(user: dict = Depends(require_user)):
         conn.execute("UPDATE users SET onboarding_done=1 WHERE id=?", (user["id"],))
         conn.commit()
         return {"seeded": False, "seeded_goals": [], "already": True}
-    today = _get_today()
+    today = _get_today(user)
     from datetime import timedelta as _td
     demos = [
         {
@@ -900,7 +1047,7 @@ def seed_demo(user: dict = Depends(require_user)):
     conn.execute("UPDATE users SET onboarding_done=1 WHERE id=?", (user["id"],))
     conn.commit()
     for gid in seeded:
-        threading.Thread(target=_regenerate_plan_bg, args=(user, gid), daemon=True).start()
+        submit_plan(user, gid)
     return {"seeded": True, "seeded_goals": seeded, "already": False}
 
 
@@ -912,6 +1059,9 @@ def delete_goal(goal_id: int, body: DeleteGoalRequest, user: dict = Depends(requ
     conn.execute("DELETE FROM blockers WHERE goal_id=?", (goal_id,))
     conn.execute("DELETE FROM chat_messages WHERE goal_id=?", (goal_id,))
     conn.execute("DELETE FROM plans WHERE goal_id=?", (goal_id,))
+    conn.execute("DELETE FROM stakes WHERE goal_id=?", (goal_id,))
+    conn.execute("DELETE FROM interventions WHERE goal_id=?", (goal_id,))
+    conn.execute("DELETE FROM attachments WHERE goal_id=?", (goal_id,))
     conn.execute("DELETE FROM goals WHERE id=?", (goal_id,))
     conn.commit()
     roasts = [
@@ -942,8 +1092,8 @@ def add_constraint(goal_id: int, body: ConstraintAddRequest, user: dict = Depend
     if str(goal.get("plan_status") or "").startswith("blocked"):
         conn.execute("UPDATE goals SET plan_status='active', plan_summary='' WHERE id=?", (goal_id,))
     conn.commit()
-    if str(goal.get("plan_status") or "").startswith("blocked"):
-        threading.Thread(target=_regenerate_plan_bg, args=(user, goal_id), daemon=True).start()
+    submit_plan(user, goal_id)
+    _replan_siblings(user, goal_id)
     return {"constraints": cons}
 
 
@@ -967,4 +1117,4 @@ def acknowledge_goal(goal_id: int, user: dict = Depends(require_user)):
 
 # expose the background regen helper for the check-in router
 def regenerate_plan_bg(user, goal_id):
-    _regenerate_plan_bg(user, goal_id)
+    submit_plan(user, goal_id)

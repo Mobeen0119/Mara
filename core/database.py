@@ -133,6 +133,41 @@ CREATE TABLE IF NOT EXISTS attachments (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS email_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  purpose TEXT NOT NULL DEFAULT 'verify',
+  expires_at TEXT NOT NULL,
+  used INTEGER DEFAULT 0,
+  FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+-- Idempotency ledger for scheduled work: one row per (user, goal, kind, local day).
+CREATE TABLE IF NOT EXISTS job_runs (
+  user_id INTEGER NOT NULL,
+  goal_id INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL,
+  day TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, goal_id, kind, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_actions_goal ON actions (goal_id, date);
+CREATE INDEX IF NOT EXISTS idx_actions_user_date ON actions (user_id, date);
+CREATE INDEX IF NOT EXISTS idx_goals_user ON goals (user_id, status);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
+
 CREATE TABLE IF NOT EXISTS stakes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -164,8 +199,17 @@ def get_connection():
     if parent:
         os.makedirs(parent, exist_ok=True)
     conn = getattr(_thread_local, "conn", None)
+    # A cached connection is only valid for the database file it was opened on
+    # (the storage dir can change: tests, reset_db).
+    if conn is not None and getattr(_thread_local, "path", None) != path:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = None
     if conn is None:
         conn = sqlite3.connect(path)
+        _thread_local.path = path
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         # Serialize concurrent writers/readers (plan bg threads, scheduler,
@@ -174,6 +218,10 @@ def get_connection():
         # see transient stale/empty rows. 8s is plenty for local writes.
         conn.execute("PRAGMA busy_timeout=8000")
         conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
         _thread_local.conn = conn
         with _SCHEMA_LOCK:
             conn.executescript(SCHEMA)
@@ -191,7 +239,28 @@ MIGRATIONS = [
     "ALTER TABLE goals ADD COLUMN details TEXT DEFAULT '{}'",
     "ALTER TABLE users ADD COLUMN persona TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN location TEXT DEFAULT 'Pakistan'",
+    "ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT ''",
+    "ALTER TABLE goals ADD COLUMN outline TEXT DEFAULT ''",
 ]
+
+# One-shot data migrations, keyed by PRAGMA user_version.
+#   v1: every pre-existing session token was a permanent bearer secret (and the
+#       old repo shipped a database full of them) -> invalidate them all, and
+#       promote the oldest real (non-guest) account to admin so a deployment is
+#       never left with nobody able to configure the LLM.
+def _data_migration_v1(conn):
+    conn.execute("UPDATE users SET token=NULL")
+    has_admin = conn.execute("SELECT 1 FROM users WHERE is_admin=1 LIMIT 1").fetchone()
+    if not has_admin:
+        first = conn.execute(
+            "SELECT id FROM users WHERE is_guest=0 ORDER BY id LIMIT 1"
+        ).fetchone()
+        if first:
+            conn.execute("UPDATE users SET is_admin=1 WHERE id=?", (first["id"],))
+
+
+_DATA_MIGRATIONS = [_data_migration_v1]
 
 
 def _migrate(conn):
@@ -199,12 +268,22 @@ def _migrate(conn):
         column = stmt.split("ADD COLUMN ")[1].split(" ")[0]
         table = stmt.split("ALTER TABLE ")[1].split(" ")[0]
         cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-        if column not in cols:
-            try:
-                conn.execute(stmt)
-                conn.commit()
-            except Exception:
-                pass
+        if column in cols:
+            continue
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # A concurrent process may have added it between our check and the
+            # ALTER; anything else is a real failure and must be loud.
+            if "duplicate column" not in str(exc).lower():
+                raise
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for i, fn in enumerate(_DATA_MIGRATIONS, start=1):
+        if version < i:
+            fn(conn)
+            conn.execute(f"PRAGMA user_version={i}")
+            conn.commit()
 
 
 def reset_db():

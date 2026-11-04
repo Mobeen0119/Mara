@@ -1,62 +1,59 @@
+import logging
 import threading
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
+from core import generation, ratelimit
+from core.clock import now_for
 from core.database import get_connection
 from core.deps import require_user
-from core import generation
-from core.routes.goal_routes import regenerate_plan_bg
 from core.models import CheckinRespondRequest
+from core.routes.goal_routes import submit_plan
 
+logger = logging.getLogger("eloise")
 router = APIRouter(prefix="/api", tags=["checkin"])
 
-
-# A "not done" checkin used to kick a regeneration thread for EVERY active
-# goal — with several goals that is N × (up to 180s) of serialized model calls
-# stacked in one burst, all fighting the single CPU box. Now only the 2 most
-# urgent goals are regenerated per checkin, and only one bulk run per app at a
-# time.
+# A "not done" check-in redraws only the most urgent goals, through the shared
+# bounded plan pool (not one new thread per goal).
 _MAX_REGEN_GOALS = 2
-_regen_guard = threading.Lock()
 
 
-def _regenerate_active_goals(user):
-    if not _regen_guard.acquire(blocking=False):
-        return
+def _hhmm_to_min(text, default=8 * 60):
     try:
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT id FROM goals WHERE user_id=? AND status='active' ORDER BY deadline ASC",
-            (user["id"],),
-        ).fetchall()
-        for r in rows[:_MAX_REGEN_GOALS]:
-            try:
-                regenerate_plan_bg(user, r["id"])
-            except Exception:
-                pass
-    finally:
-        _regen_guard.release()
+        h, m = (text or "").split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return default
 
 
 @router.get("/checkin")
 def checkin_status(user: dict = Depends(require_user)):
+    """Due once per LOCAL day, from the user's check-in time, when they have live goals."""
     conn = get_connection()
-    row = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-    last = row["last_checkin_at"]
-    if not last:
-        return {"due": False, "next_checkin_at": None, "reason": "first check-in not armed yet"}
-    from datetime import datetime, timedelta
-    try:
-        last_dt = datetime.fromisoformat(last)
-    except Exception:
-        last_dt = datetime.now()
-    due = (datetime.now() - last_dt) >= timedelta(hours=24)
-    return {"due": due, "last_checkin_at": last}
+    now = now_for(user)
+    has_goal = conn.execute(
+        "SELECT 1 FROM goals WHERE user_id=? AND status='active' LIMIT 1", (user["id"],)
+    ).fetchone()
+    last = user.get("last_checkin_at")
+    last_day = (last or "")[:10]
+    today = now.date().isoformat()
+    at = _hhmm_to_min(user.get("checkin_time"))
+    now_min = now.hour * 60 + now.minute
+    if not has_goal:
+        return {"due": False, "reason": "no active goals", "last_checkin_at": last}
+    due = last_day < today and now_min >= at
+    return {
+        "due": bool(due),
+        "last_checkin_at": last,
+        "checkin_time": user.get("checkin_time") or "08:00",
+        "reason": None if due else ("already checked in today" if last_day == today else "not time yet"),
+    }
 
 
 @router.post("/checkin/prompt")
 def checkin_prompt(user: dict = Depends(require_user)):
+    ratelimit.enforce(f"llm:{user['id']}", 30, 60)
     conn = get_connection()
     goals = conn.execute(
         "SELECT display_title FROM goals WHERE user_id=? AND status='active'", (user["id"],)
@@ -68,9 +65,9 @@ def checkin_prompt(user: dict = Depends(require_user)):
 
 @router.post("/checkin/respond")
 def checkin_respond(body: CheckinRespondRequest, user: dict = Depends(require_user)):
+    ratelimit.enforce(f"llm:{user['id']}", 30, 60)
     conn = get_connection()
-    from datetime import datetime
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    now = now_for(user).isoformat(sep=" ", timespec="seconds")
     resp, source = generation.generate_check_in_response(user["name"], body.done, db=conn)
     conn.execute(
         "INSERT INTO check_ins (user_id, result) VALUES (?,?)",
@@ -82,5 +79,9 @@ def checkin_respond(body: CheckinRespondRequest, user: dict = Depends(require_us
     )
     conn.commit()
     if not body.done:
-        threading.Thread(target=_regenerate_active_goals, args=(user,), daemon=True).start()
+        for r in conn.execute(
+            "SELECT id FROM goals WHERE user_id=? AND status='active' ORDER BY deadline ASC LIMIT ?",
+            (user["id"], _MAX_REGEN_GOALS),
+        ).fetchall():
+            submit_plan(user, r["id"])
     return {"message": resp, "source": source, "done": body.done}

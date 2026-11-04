@@ -5,10 +5,15 @@ from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from core import ratelimit
+from core.clock import now_for, today_for, tz_name_for
 from core.database import get_connection
-from core.deps import require_user
+from core.deps import require_admin, require_user
 from core import generation
 from core.llm import LLMManager
+from core.llm.anthropic_provider import AnthropicProvider
+from core.llm.keys import autoconfigure
+from core.security import UnsafeURL, validate_outbound_url
 from core.llm.openai_provider import (
     DEFAULT_BASE_URL,
     DEFAULT_CLOUD_MODEL,
@@ -20,7 +25,7 @@ from core.llm.openai_provider import (
 )
 from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
 from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest, LLMTestRequest, LocationRequest, PersonaRequest
-from core.routes.goal_routes import regenerate_plan_bg
+from core.routes.goal_routes import submit_plan
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -36,6 +41,15 @@ def _load_cfg(conn):
         return json.loads(row[0])
     except Exception:
         return {}
+
+
+def _save_cfg(conn, cfg):
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('llm', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (json.dumps(cfg),),
+    )
+    conn.commit()
 
 
 def _resolve_setting(cfg, field, env_names, default=""):
@@ -66,17 +80,31 @@ def _clean_ollama_url(raw):
     return raw
 
 
-def _build(conn):
-    return LLMManager(db=conn)
+def _host(url):
+    from urllib.parse import urlparse
+    return (urlparse(url or "").hostname or "").lower()
+
+
+def _effective(cfg):
+    base_url = _resolve_setting(cfg, "base_url", ("OPENAI_BASE_URL", "OPENROUTER_URL"), DEFAULT_BASE_URL)
+    return {
+        "base_url": clean_base_url(base_url),
+        "model": _resolve_setting(cfg, "model", ("OPENAI_MODEL", "OPENROUTER_MODEL"), DEFAULT_CLOUD_MODEL),
+        "saved_key": (cfg.get("api_key") or cfg.get("openrouter_key") or "").strip(),
+        "env_key": _resolve_setting({}, "api_key", ("OPENAI_API_KEY", "OPENROUTER_API_KEY")),
+    }
 
 
 @router.get("/status")
 def status(user: dict = Depends(require_user)):
-    conn = get_connection()
-    mgr = _build(conn)
+    """Is the model live? Everyone may ask; only admins see endpoint details."""
+    mgr = LLMManager()
     s = mgr.status_dict()
     from core.mailer import smtp_configured
     s["email_configured"] = smtp_configured()
+    if not user.get("is_admin"):
+        for k in ("base_url", "ollama_url", "cloud_error", "openrouter_error", "ollama_error"):
+            s.pop(k, None)
     return s
 
 
@@ -84,110 +112,150 @@ def status(user: dict = Depends(require_user)):
 def get_llm(user: dict = Depends(require_user)):
     conn = get_connection()
     cfg = _load_cfg(conn)
-    base_url = _resolve_setting(cfg, "base_url", ("OPENAI_BASE_URL", "OPENROUTER_URL"), DEFAULT_BASE_URL)
-    model = _resolve_setting(cfg, "model", ("OPENAI_MODEL", "OPENROUTER_MODEL"), DEFAULT_CLOUD_MODEL)
-    saved_key = (cfg.get("api_key") or cfg.get("openrouter_key") or "").strip()
-    env_key = _resolve_setting({}, "api_key", ("OPENAI_API_KEY", "OPENROUTER_API_KEY"))
-    provider = (cfg.get("provider") or "").strip() or (preset_for_base_url(base_url) or "")
-    return {
+    eff = _effective(cfg)
+    provider = (cfg.get("provider") or "").strip() or (preset_for_base_url(eff["base_url"]) or "")
+    base = {
+        "is_admin": bool(user.get("is_admin")),
         "provider": provider,
-        "base_url": base_url,
-        "model": model,
-        "api_key_set": bool(saved_key or env_key),
-        "key_source": ("settings" if saved_key else ("env" if env_key else None)),
+        "model": eff["model"],
+        "api_key_set": bool(eff["saved_key"] or eff["env_key"]),
+    }
+    if not user.get("is_admin"):
+        return base          # no endpoint, no key source, no presets: nothing to change here
+    return {
+        **base,
+        "base_url": eff["base_url"],
+        "protocol": cfg.get("protocol") or (PRESET_BY_ID.get(provider) or {}).get("protocol", "openai"),
+        "key_source": ("settings" if eff["saved_key"] else ("env" if eff["env_key"] else None)),
         "presets": PROVIDER_PRESETS,
+        "models": cfg.get("models") or [],
         "enable_local": cfg.get("enable_local", False),
         "ollama_url": _clean_ollama_url(cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434")),
         "ollama_model": cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
-        "openrouter_model": model,
+        "openrouter_model": eff["model"],
     }
 
 
 @router.put("/settings/llm")
-def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_user)):
+def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_admin)):
+    """Paste ANY key: the provider, endpoint and a sensible model are worked out
+    from the key itself (core/llm/keys.py) and verified against the provider.
+    The persona is not configured here and never changes with the provider."""
+    ratelimit.enforce(f"llmcfg:{user['id']}", 20, 60)
     conn = get_connection()
     cfg = _load_cfg(conn)
+    eff = _effective(cfg)
+    new_key = ((body.api_key or "").strip() or (body.openrouter_key or "").strip())
     provider = (body.provider or "").strip()
-    if provider:
-        cfg["provider"] = provider
-    else:
-        cfg.pop("provider", None)
-    # A chosen preset fills any endpoint/model the caller left blank, so an
-    # API client can post {provider, api_key} alone and get a working config —
-    # and a provider switch can never inherit the previous provider's model.
-    preset = PRESET_BY_ID.get(provider)
-    if body.api_key is not None and body.api_key.strip():
-        cfg["api_key"] = body.api_key.strip()
-        cfg.pop("openrouter_key", None)
-    if body.openrouter_key is not None and body.openrouter_key.strip():
-        cfg["api_key"] = body.openrouter_key.strip()
-        cfg.pop("openrouter_key", None)
+    detected = None
+
     if body.clear_key:
         cfg.pop("api_key", None)
         cfg.pop("openrouter_key", None)
-    if body.model is not None and body.model.strip():
-        cfg["model"] = body.model.strip()
-    elif body.openrouter_model is not None and body.openrouter_model.strip():
-        cfg["model"] = body.openrouter_model.strip()
-    elif preset:
-        cfg["model"] = preset["model"]
-    if body.base_url is not None and body.base_url.strip():
-        cfg["base_url"] = body.base_url.strip()
-    elif preset:
-        cfg["base_url"] = preset["url"]
+    elif new_key:
+        detected = autoconfigure(
+            new_key, base_url=(body.base_url or None), provider=(provider or None),
+            model=((body.model or body.openrouter_model or "").strip() or None),
+        )
+        if not detected["ok"]:
+            raise HTTPException(status_code=400, detail={"error": detected["error"], "tried": detected["tried"]})
+        cfg["api_key"] = new_key
+        cfg.pop("openrouter_key", None)
+        cfg.update({k: detected[k] for k in ("provider", "protocol", "base_url", "model")})
+        cfg["models"] = detected["models"]
+    else:
+        # No new key: only settings that do not redirect the saved key elsewhere.
+        preset = PRESET_BY_ID.get(provider)
+        target = (body.base_url or "").strip() or (preset["url"] if preset else "")
+        if target:
+            try:
+                validate_outbound_url(clean_base_url(target))
+            except UnsafeURL as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            if _host(clean_base_url(target)) != _host(eff["base_url"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="changing the endpoint sends your key somewhere new - paste that provider's key too",
+                )
+            cfg["base_url"] = clean_base_url(target)
+        if provider:
+            cfg["provider"] = provider
+            if preset:
+                cfg["protocol"] = preset.get("protocol", "openai")
+        model = ((body.model or body.openrouter_model or "").strip())
+        if model:
+            cfg["model"] = model
+        elif preset and _host(preset["url"]) == _host(eff["base_url"]) and not cfg.get("model"):
+            cfg["model"] = preset["model"]
+
     if body.enable_local is not None:
         cfg["enable_local"] = bool(body.enable_local)
     if body.ollama_url is not None:
         cfg["ollama_url"] = body.ollama_url.strip()
     if body.ollama_model is not None:
         cfg["ollama_model"] = body.ollama_model.strip()
-    conn.execute(
-        "INSERT INTO app_settings (key, value) VALUES ('llm', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (json.dumps(cfg),),
-    )
-    conn.commit()
-    return {"ok": True}
+    _save_cfg(conn, cfg)
+    out = {"ok": True}
+    if detected:
+        out.update({k: detected[k] for k in ("provider", "label", "protocol", "base_url", "model", "models", "verified")})
+    return out
 
 
 @router.post("/settings/llm/test")
-def test_llm(body: LLMTestRequest, user: dict = Depends(require_user)):
-    """Send one tiny real request to the provider and report exactly what
-    happened. Fields left blank resolve from saved settings, then .env — so
-    this works as 'test what's configured' and 'test what I just typed'."""
+def test_llm(body: LLMTestRequest, user: dict = Depends(require_admin)):
+    """Send one tiny real request to the provider and report exactly what happened.
+    The SAVED key is only ever sent to the endpoint it was saved for: pointing the
+    test at another URL requires pasting that URL's key in the request."""
+    ratelimit.enforce(f"llmtest:{user['id']}", 10, 60)
     cfg = _load_cfg(get_connection())
-    api_key = (body.api_key or "").strip() or _resolve_setting(
-        cfg, "api_key", ("OPENAI_API_KEY", "OPENROUTER_API_KEY"))
-    # Legacy rows may still carry openrouter_key under the old name.
+    eff = _effective(cfg)
+    typed_key = (body.api_key or "").strip()
+    base_in = (body.base_url or "").strip()
+    detection = None
+
+    if typed_key:
+        detection = autoconfigure(typed_key, base_url=(base_in or None),
+                                  provider=((body.provider or "").strip() or None),
+                                  model=((body.model or "").strip() or None))
+        if not detection["ok"]:
+            return {"ok": False, "provider": "unknown", "model": body.model or "", "base_url": base_in,
+                    "error": detection["error"], "tried": detection["tried"]}
+        api_key, base_url, protocol = typed_key, detection["base_url"], detection["protocol"]
+        model, label = detection["model"], detection["provider"]
+    else:
+        base_url = clean_base_url(base_in or eff["base_url"])
+        if base_in and _host(base_url) != _host(eff["base_url"]):
+            return {"ok": False, "provider": "custom", "model": body.model or eff["model"], "base_url": base_url,
+                    "error": "To test a different endpoint, paste its API key - the saved key is never sent to it."}
+        try:
+            validate_outbound_url(base_url)
+        except UnsafeURL as exc:
+            return {"ok": False, "provider": "custom", "model": eff["model"], "base_url": base_url, "error": str(exc)}
+        api_key = eff["saved_key"] or eff["env_key"]
+        model = (body.model or "").strip() or eff["model"]
+        label = ((body.provider or "").strip() or (cfg.get("provider") or "").strip()
+                 or preset_for_base_url(base_url) or "cloud")
+        protocol = cfg.get("protocol") or (PRESET_BY_ID.get(label) or {}).get("protocol", "openai")
     if not api_key:
-        api_key = (cfg.get("openrouter_key") or "").strip()
-    base_url = clean_base_url(
-        (body.base_url or "").strip()
-        or _resolve_setting(cfg, "base_url", ("OPENAI_BASE_URL", "OPENROUTER_URL"), DEFAULT_BASE_URL)
-    )
-    model = ((body.model or "").strip()
-             or _resolve_setting(cfg, "model", ("OPENAI_MODEL", "OPENROUTER_MODEL"), DEFAULT_CLOUD_MODEL))
-    label = ((body.provider or "").strip()
-             or (cfg.get("provider") or "").strip()
-             or preset_for_base_url(base_url) or "cloud")
-    if not api_key:
-        return {
-            "ok": False, "provider": label, "model": model, "base_url": base_url,
-            "error": "No API key — paste one above, then test again.",
-        }
-    provider = OpenAICompatProvider(api_key=api_key, model=model, base_url=base_url, name=label)
+        return {"ok": False, "provider": label, "model": model, "base_url": base_url,
+                "error": "No API key - paste one above, then test again."}
+
+    if protocol == "anthropic":
+        provider = AnthropicProvider(api_key=api_key, model=model, base_url=base_url, name=label)
+    else:
+        provider = OpenAICompatProvider(api_key=api_key, model=model, base_url=base_url, name=label)
     result = provider.generate(
-        "You are a connectivity probe. Reply with exactly one word.",
-        "ping", timeout=25, max_tokens=16,
+        "You are a connectivity probe. Reply with exactly one word.", "ping", timeout=25, max_tokens=16,
     )
-    return {
-        "ok": result.ok,
-        "provider": provider.name,
-        "model": provider.model,
-        "base_url": provider.base_url,
-        "latency_ms": result.latency_ms,
+    out = {
+        "ok": result.ok, "provider": provider.name, "model": provider.model,
+        "protocol": protocol, "base_url": provider.base_url, "latency_ms": result.latency_ms,
         "error": (None if result.ok else (result.error or "no reply from provider")),
     }
+    if detection:
+        out["detected"] = {"provider": detection["provider"], "verified": detection["verified"],
+                           "models": detection["models"]}
+    return out
 
 
 @router.put("/settings/checkin-time")
@@ -228,7 +296,7 @@ def put_blocked_windows(body: BlockedWindowsRequest, user: dict = Depends(requir
     for g in conn.execute(
         "SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)
     ).fetchall():
-        regenerate_plan_bg(user, g["id"])
+        submit_plan(user, g["id"])
     return {"ok": True, "blocked_windows": cleaned}
 
 
@@ -264,14 +332,6 @@ def put_persona(body: PersonaRequest, user: dict = Depends(require_user)):
 
 @router.get("/settings")
 def get_settings(user: dict = Depends(require_user)):
-    conn = get_connection()
-    row = conn.execute("SELECT value FROM app_settings WHERE key='llm'").fetchone()
-    cfg = {}
-    if row and row[0]:
-        try:
-            cfg = json.loads(row[0])
-        except Exception:
-            cfg = {}
     return {
         "checkin_time": user["checkin_time"] or "08:00",
         "llm": get_llm(user=user),
@@ -284,15 +344,20 @@ def email_digest(user: dict = Depends(require_user)):
     """Send the full upcoming schedule to the user's email right now. Best-effort."""
     from core.mailer import smtp_configured, send_email_detailed
     from core.persona import build_daily_email_html
+    ratelimit.enforce(f"digest:{user['id']}", 5, 3600, "that's enough mail for one hour")
     conn = get_connection()
+    if user["email"] and not user.get("verified"):
+        return {"ok": False, "reason": "confirm your email first (check your inbox or resend from Settings)",
+                "hint": sched_email_hint("no-email")}
     if not user["email"]:
         return {"ok": False, "reason": "no email on file", "hint": sched_email_hint("no-email")}
     if not smtp_configured():
         from core.mailer import smtp_diag
         problems = "; ".join(smtp_diag()["problems"])
         return {"ok": False, "reason": problems or "SMTP not configured", "hint": sched_email_hint("smtp")}
-    today = date.today().isoformat()
-    horizon = (date.today() + timedelta(days=7)).isoformat()
+    today_d = today_for(user)
+    today = today_d.isoformat()
+    horizon = (today_d + timedelta(days=7)).isoformat()
     goals = conn.execute(
         "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
     ).fetchall()
@@ -361,7 +426,7 @@ def sched_email_hint(code):
 @router.get("/today")
 def today(user: dict = Depends(require_user)):
     conn = get_connection()
-    today = date.today().isoformat()
+    today = today_for(user).isoformat()
     goals = conn.execute(
         "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
     ).fetchall()
@@ -403,13 +468,16 @@ def acknowledge(iv_id: int, user: dict = Depends(require_user)):
 @router.get("/scoreboard")
 def scoreboard(user: dict = Depends(require_user)):
     conn = get_connection()
-    today = date.today().isoformat()
+    today = today_for(user).isoformat()
     rows = conn.execute(
         "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
     ).fetchall()
     scored = []
     for g in rows:
-        dl = generation.days_remaining(g["deadline"], today)
+        try:
+            dl = generation.days_remaining(g["deadline"], today)
+        except ValueError:                 # legacy row with a non-date deadline
+            dl = 0
         plan = conn.execute(
             "SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (g["id"],)
         ).fetchall()
@@ -449,9 +517,10 @@ def scoreboard(user: dict = Depends(require_user)):
 @router.get("/schedule")
 def schedule(user: dict = Depends(require_user)):
     conn = get_connection()
-    today = date.today().isoformat()
-    horizon = (date.today() + timedelta(days=14)).isoformat()
-    lookback = (date.today() - timedelta(days=14)).isoformat()
+    today_d = today_for(user)
+    today = today_d.isoformat()
+    horizon = (today_d + timedelta(days=14)).isoformat()
+    lookback = (today_d - timedelta(days=14)).isoformat()
     # Sweep: any still-pending task dated before today is a miss. Persist it so
     # every "missed" counter in the app actually means something.
     conn.execute(
@@ -463,7 +532,7 @@ def schedule(user: dict = Depends(require_user)):
     goals = conn.execute(
         "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
     ).fetchall()
-    out = {"dates": {}, "missed_total": 0}
+    out = {"dates": {}, "missed_total": 0, "today": today}
     for g in goals:
         acts = conn.execute(
             "SELECT * FROM actions WHERE goal_id=? AND date>=? AND date<=? ORDER BY order_idx",
@@ -479,3 +548,84 @@ def schedule(user: dict = Depends(require_user)):
         out["missed_total"] += missed_here
         out["dates"][str(g["id"])] = {"title": g["display_title"], "by_date": by_date}
     return out
+
+
+@router.get("/day")
+def day_view(date: str = "", user: dict = Depends(require_user)):
+    """Everything the 24-hour dial needs for one day: the planned blocks plus the
+    parts of the day that are NOT free (sleep, meals, the user's always-busy
+    windows and every goal's own constraints), and the current local time."""
+    from datetime import date as _date
+    conn = get_connection()
+    now = now_for(user)
+    try:
+        day = _date.fromisoformat(date) if date else now.date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    iso = day.isoformat()
+    items = []
+    for a in conn.execute(
+        "SELECT a.*, g.display_title FROM actions a JOIN goals g ON g.id=a.goal_id "
+        "WHERE a.user_id=? AND a.date=? AND g.status='active' ORDER BY a.start_time",
+        (user["id"], iso),
+    ).fetchall():
+        items.append({"id": a["id"], "goal_id": a["goal_id"], "goal_title": a["display_title"],
+                      "title": a["title"], "start_time": a["start_time"], "end_time": a["end_time"],
+                      "status": a["status"]})
+
+    def _fmt(m):
+        m %= 24 * 60
+        return f"{m // 60:02d}:{m % 60:02d}"
+
+    busy = []
+    for w in generation.user_blocked_windows(user):
+        busy.append({"label": "always busy", "kind": "busy", "start": _fmt(w[0]), "end": _fmt(w[1])})
+    details = {}
+    for g in conn.execute("SELECT constraints, details FROM goals WHERE user_id=? AND status='active'",
+                          (user["id"],)).fetchall():
+        for c in json.loads(g["constraints"] or "[]"):
+            w = generation.parse_time_window(c)
+            if w:
+                busy.append({"label": c[:24], "kind": "busy", "start": _fmt(w[0]), "end": _fmt(w[1])})
+        try:
+            d = json.loads(g["details"] or "{}")
+            details = {**details, **{k: v for k, v in d.items() if v}}
+        except Exception:
+            pass
+    sleep = generation.parse_clock_list(details.get("sleep_schedule") or "")
+    bed, wake = (sleep[0], sleep[1]) if len(sleep) >= 2 else (23 * 60, 7 * 60)
+    meals = generation.parse_clock_list(details.get("meal_times") or "")[:3] or [8 * 60, 13 * 60, 20 * 60]
+    busy.append({"label": "sleep", "kind": "sleep", "start": _fmt(bed), "end": _fmt(wake)})
+    for t in meals:
+        busy.append({"label": "meal", "kind": "meal", "start": _fmt(t), "end": _fmt(t + 45)})
+    return {
+        "date": iso,
+        "is_today": iso == now.date().isoformat(),
+        "now": _fmt(now.hour * 60 + now.minute),
+        "timezone": tz_name_for(user),
+        "items": items,
+        "busy": busy,
+    }
+
+
+@router.get("/triage")
+def triage_view(user: dict = Depends(require_user)):
+    """Which goal wins when life does not fit, and which soft commitments should give way."""
+    from core import triage
+    return triage.triage(get_connection(), user, today_for(user).isoformat())
+
+
+@router.get("/outline/{goal_id}")
+def goal_outline(goal_id: int, user: dict = Depends(require_user)):
+    """The monthly/weekly roadmap for a far-off goal (empty for short, daily-planned goals)."""
+    row = get_connection().execute(
+        "SELECT outline, deadline FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="goal not found")
+    try:
+        data = json.loads(row["outline"]) if row["outline"] else None
+    except Exception:
+        data = None
+    left = generation.days_remaining(row["deadline"], today_for(user).isoformat())
+    return {"scope": generation.scope_for(left), "outline": data}

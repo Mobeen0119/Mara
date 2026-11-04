@@ -255,6 +255,17 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         # (gym/uni/sleep/whatever), parsed once here.
         blocked = active_goal_blocked_windows(conn, user)
         blocked = blocked + _routine_windows(goal)
+        try:
+            from core import triage as _triage
+            kind = generation.effort_profile(goal, 30)["kind"]
+            wins = [(w["start"], w["end"]) for w in _triage._windows(conn, user) if generation.is_workout_label(w["label"])]
+            generation.set_workout_windows(wins if kind == "habit" else [])
+            if kind == "habit" and wins:
+                # the gym window is this goal's own resource, not an obstacle
+                blocked = [b for b in blocked if tuple(b) not in set(wins)]
+        except Exception as exc:
+            logger.warning("workout window lookup failed: %r", exc)
+            generation.set_workout_windows([])
         # The slot grid must avoid the user's REAL calendar, not just declared
         # busy windows: other goals already occupy specific time on specific
         # days, and an LLM slot that lands on a booked block gets dropped
@@ -278,7 +289,11 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
             logger.warning("plan bg: goal %s LLM attempt failed: %r", goal_id, exc)
             better = None
         if better:
-            written = _write_plan(conn, goal, better, blocked_min=blocked,
+            resolve_blocked = blocked
+            if generation.effort_profile(goal, 30)["kind"] == "event":
+                # dinner is part of the event evening, so meal windows don't push it around
+                resolve_blocked = [b for b in blocked if not ((b[1] - b[0]) % 1440 <= 90 and 12 * 60 <= b[0] % 1440 < 22 * 60)]
+            written = _write_plan(conn, goal, better, blocked_min=resolve_blocked,
                                   provider=generation.last_provider())
             if written:
                 _reset_plan_retries(goal_id)
@@ -337,9 +352,10 @@ def _action_violates_goal_windows(goal):
     except Exception:
         return False
     windows = []
+    habit = generation.effort_profile(goal, 30)["kind"] == "habit"
     for c in cons:
         w = generation.parse_time_window(c)
-        if w:
+        if w and not (habit and generation.is_workout_label(c)):   # a habit goal USES its gym window
             windows.append(w)
     if not windows:
         return False

@@ -1,10 +1,19 @@
+"""Priority triage across ALL of a person's goals.
 
+The planner decides when; this decides what wins when life doesn't fit. It ranks
+goals by evidence (days left, remaining work, slippage, what is at stake) and, when
+something is on fire, names the SOFT commitments (gym, hobbies, social) that should
+give way - never the hard ones (class, work, sleep, meals, family). The output is a
+plain-fact "call" Eloise can state with confidence because every number in it is
+computed, not guessed.
+"""
 import json
 import re
 from datetime import date
 
 from core import generation
 
+# Things whose failure is expensive/irreversible. 3 = exam-grade, 2 = serious.
 _STAKES_3 = ("exam", "viva", "defense", "defence", "thesis", "interview", "visa", "tax",
              "submission", "submit", "board", "finals", "final exam", "court", "surgery")
 _STAKES_2 = ("proposal", "pitch", "investor", "startup", "launch", "client", "contract",
@@ -51,9 +60,9 @@ def _windows(conn, user):
             pass
     for lab in labels:
         w = generation.parse_time_window(lab)
-        if not w or lab.strip().lower() in seen:
+        if not w or tuple(w) in seen:               # "gym 5-7pm" and "gym 5 to 7 pm" are one window
             continue
-        seen.add(lab.strip().lower())
+        seen.add(tuple(w))
         out.append({"label": lab.strip(), "start": w[0], "end": w[1],
                     "hours": round(((w[1] - w[0]) % 1440) / 60, 1), "kind": window_kind(lab)})
     return out

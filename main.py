@@ -1,3 +1,4 @@
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,6 +28,12 @@ MAX_BODY_BYTES = 1_000_000  # no endpoint here needs more than a chat message / 
 @asynccontextmanager
 async def lifespan(_app):
     goal_routes.heal_stale_plans()
+    try:
+        import asyncio
+        from core.routes.settings_routes import bootstrap_llm_from_env
+        await asyncio.to_thread(bootstrap_llm_from_env)
+    except Exception as exc:                      # a bad key must never stop the app booting
+        logging.getLogger("eloise").warning("env LLM bootstrap skipped: %r", exc)
     eloise_scheduler.start()
     try:
         yield
@@ -65,6 +72,14 @@ _CSP = (
     "script-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; "
     "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 )
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    """Any crash is logged WITH its traceback and returned as JSON the UI can show,
+    naming the error type (never the message, which may hold user data)."""
+    logging.getLogger("eloise").exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": f"Server error ({type(exc).__name__}) - check the server console"})
 
 
 @app.middleware("http")

@@ -38,10 +38,22 @@ def tz_name_for(user):
     return name if valid_tz(name) else (default_tz_name() if valid_tz(default_tz_name()) else "UTC")
 
 
+def _tzinfo(name):
+    """The zone, or None when the OS has no timezone database (Windows without the
+    `tzdata` package). None means: use this machine's own local time."""
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
 def now_for(user=None):
-    """Naive datetime in the user's local wall-clock time."""
-    tz = ZoneInfo(tz_name_for(user)) if ZoneInfo else timezone.utc
-    now = datetime.now(timezone.utc).astimezone(tz).replace(tzinfo=None)
+    """Naive datetime in the user's local wall-clock time. Never raises."""
+    tz = _tzinfo(tz_name_for(user))
+    utc_now = datetime.now(timezone.utc)
+    now = (utc_now.astimezone(tz) if tz else utc_now.astimezone()).replace(tzinfo=None)
     forced = os.environ.get("ELOISE_TEST_TODAY")
     if forced:
         try:

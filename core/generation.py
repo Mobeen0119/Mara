@@ -2,12 +2,14 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import date, datetime, timedelta
 
 from core.llm import LLMManager
 
 logger = logging.getLogger("eloise.plan")
 from core.llm.manager import _VERDICT_ECHO, _strip_prompt_echo
+from core import planner
 from core.persona import (
     BASE_SYSTEM_PROMPT,
     CHECK_IN_NO_SYSTEM_PROMPT,
@@ -63,31 +65,28 @@ def _chat_lock_wait():
 # Which provider drew the most recent plan (set by _llm_plan_call /
 # _chat_llm), so the UI can honestly report "drawn by local / drawn by
 # openrouter".
-_last_provider = None
+_state = threading.local()   # per-thread: concurrent users must never see each other's value
 
 # When the user's own blocked windows consume every usable slot in a day, the
 # honest truth is NOT "the model is down" — it's "your windows leave no free
 # time", and the schedule must say exactly that instead of retrying a model
 # that isn't the problem.
-_plan_blocked_reason = None
-
-
 def plan_blocked_reason():
-    return _plan_blocked_reason
+    return getattr(_state, "plan_blocked_reason", None)
+
+
+def last_outline():
+    return getattr(_state, "outline", None)
 
 
 def last_provider():
-    return _last_provider
+    return getattr(_state, "last_provider", None)
 
 
 def get_manager(db=None):
     global _manager
     if _manager is None:
-        _manager = LLMManager(db=db)
-    elif db is not None:
-        # Refresh the connection so provider_config reads the live
-        # app_settings.
-        _manager._db = db
+        _manager = LLMManager()
     return _manager
 
 
@@ -231,7 +230,6 @@ def _chat_llm(sys_prompt, user_prompt, db, user_message=""):
     """Call the real model with NO canned fallback. If the model can't be reached,
     returns ("", "offline") — the caller surfaces that as a genuine error, never as
     fabricated Eloise text. The user explicitly wants no hardcoded replies."""
-    global _last_provider
     result = get_manager(db).generate(
         sys_prompt, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
         model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
@@ -240,7 +238,7 @@ def _chat_llm(sys_prompt, user_prompt, db, user_message=""):
         return "", "offline"
     if _VERDICT_ECHO.search(result.text[:80]):
         return "", "offline"
-    _last_provider = result.provider or "llm"
+    _state.last_provider = result.provider or "llm"
     cleaned = _strip_prompt_echo(result.text, user_message=user_message)
     return cleaned, result.provider or "llm"
 
@@ -381,6 +379,11 @@ def _global_chat_prompt(summary, history, user_name, message):
         f"reply; say it fresh or push back. "
         f"Keep it SHORT: at most 2 LINES, but COMPLETE — actually answer the whole question, then "
         f"stop. Never leave it hanging, never end by asking them to re-ask. Do NOT echo this prompt. "
+        f"PRIORITIES: when the board shows a PRIORITY CALL, that ranking is computed from real "
+        f"deadlines and workload, so own it: say it as your judgment, first, with the actual "
+        f"reason and number (e.g. 'Fuck the gym this week - the exam is 5 days out and 11 hours "
+        f"are still open.'). Never hedge it with 'maybe' or 'you might consider'. If there is no "
+        f"PRIORITY CALL, do not invent a crisis. "
         f"Only output your reply."
     )
 
@@ -712,6 +715,8 @@ _ROUTINE_QUESTIONS = [
      "hint": "e.g. 08:00, 13:00, 20:00"},
     {"key": "movement_time", "q": "When do you usually move, gym or play?",
      "hint": "e.g. 18:00 (or type 'none')"},
+    {"key": "peak_energy", "q": "When is your head clearest — morning, afternoon or night?",
+     "hint": "e.g. morning"},
 ]
 
 
@@ -723,7 +728,7 @@ def _merge_routine(questions):
     for rq in _ROUTINE_QUESTIONS:
         if rq["key"] not in seen:
             out.append(dict(rq))
-    return out[:6]
+    return out[:7]
 
 
 def parse_routine_windows(details):
@@ -974,7 +979,249 @@ def _is_event_goal(text):
     return any(w in low for w in _EVENT_WORDS)
 
 
-def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None):
+
+
+# ---------------------------------------------------------------------------
+# Effort model. A goal is not "fill every free hour until the deadline".
+#   event   - one-off with a date (date night, party, proposal): the work is a few
+#             hours, done in the LAST days; perishables (flowers, food) land on the
+#             day; one early slot handles anything with lead time (bookings, orders).
+#   habit   - a practice (gym, six-pack, run, diet): sessions live INSIDE the
+#             user's own window for it (their 'gym 5-6'), plus short movement
+#             snacks after meals - so the routine they already have is the plan.
+#   project - everything else: the horizon planner above.
+# ---------------------------------------------------------------------------
+_HABIT_WORDS = ("gym", "workout", "work out", "six pack", "six-pack", "6 pack", "6-pack", "abs",
+                "fitness", "get fit", "lose weight", "weight loss", "fat loss", "muscle", "bulk",
+                "cut ", "run ", "running", "marathon", "yoga", "diet", "walk daily", "stretch",
+                "pushup", "push-up", "pull-up", "body")
+_WORKOUT_LABELS = ("gym", "workout", "work out", "run", "jog", "yoga", "swim", "training", "exercise", "sport")
+_EVENT_BUDGET_MIN = {"hookup": 360, "romance": 300, "event": 420}
+_EVENT_ACTIVE_DAYS = 3
+_state_workout = threading.local()
+
+
+def set_workout_windows(windows):
+    """[(start_min, end_min), ...] - the user's own gym/exercise windows."""
+    _state_workout.windows = list(windows or [])
+
+
+def workout_windows():
+    return list(getattr(_state_workout, "windows", []) or [])
+
+
+def is_workout_label(text):
+    low = (text or "").lower()
+    return any(re.search(rf"\b{re.escape(w)}", low) for w in _WORKOUT_LABELS)
+
+
+def effort_profile(goal, days_left):
+    title = (goal.get("title") or goal.get("display_title") or "")
+    low = title.lower() + " "
+    kind = _goal_kind(title)
+    if kind == "hookup" or kind == "romance" or _is_event_goal(title):
+        ek = "hookup" if kind == "hookup" else "romance" if kind == "romance" else "event"
+        return {"kind": "event", "event_kind": ek, "budget_min": _EVENT_BUDGET_MIN[ek],
+                "active_days": min(_EVENT_ACTIVE_DAYS if ek != "event" else 4, max(days_left + 1, 1))}
+    if any(w in low for w in _HABIT_WORDS):
+        return {"kind": "habit"}
+    return {"kind": "project"}
+
+
+def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_days=5):
+    """Keep only the final `active_days`, plus ONE early lead-time slot, within a time budget."""
+    if not horizon:
+        return horizon
+    last_days = [d for d, sl in horizon if sl][-active_days:]
+    keep = {d: sl for d, sl in horizon if d in set(last_days)}
+    lead = None
+    if len(horizon) > active_days + 3:
+        cutoff = (date.fromisoformat(deadline) - timedelta(days=lead_days)).isoformat()
+        cands = [(d, sl) for d, sl in horizon if d <= cutoff and d not in keep and sl]
+        if cands:
+            d, sl = cands[-1]
+            lead = (d, [min(sl, key=lambda x: -(x[1] - x[0]))][:1])
+    out = []
+    spent = 0
+    if lead:                                              # the lead slot is part of the budget
+        budget_min -= min(lead[1][0][1] - lead[1][0][0], 60)
+    for d in reversed(sorted(keep)):                      # nearest the event first
+        slots = []
+        for sl in sorted(keep[d], key=lambda x: x[0])[:3]:
+            dur = sl[1] - sl[0]
+            if spent + dur > budget_min:
+                break
+            slots.append(sl)
+            spent += dur
+        out.append((d, slots))
+    out.sort()
+    if lead:
+        d, sl = lead
+        dur = min(sl[0][1] - sl[0][0], 60)
+        out.insert(0, (d, [(sl[0][0], sl[0][0] + dur)]))
+    return [(d, sl) for d, sl in out if sl]
+
+
+def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, detail_days=None):
+    """Sessions inside the user's workout windows (one per day, a rest day every 7th),
+    plus a 5-minute movement snack right after each meal."""
+    t0 = date.fromisoformat(today)
+    end = date.fromisoformat(deadline)
+    span = min((end - t0).days + 1, 121)
+    if detail_days:
+        span = min(span, detail_days)
+    out = []
+    for i in range(span):
+        d = (t0 + timedelta(days=i)).isoformat()
+        busy = list(others_for(d) or [])
+        slots = []
+        rest = (i % 7) == 6
+        if not rest:
+            for (ws, we) in windows[:1]:
+                if we <= ws:
+                    continue
+                if i == 0 and now_min is not None and ws < now_min + LEAD_TODAY_MIN:
+                    continue
+                if not any(ws < be and bs < we for bs, be in busy):
+                    slots.append((ws, we))
+        for (ms, me) in meal_windows:
+            a, b = me % 1440, me % 1440 + 5
+            if i == 0 and now_min is not None and a < now_min + LEAD_TODAY_MIN:
+                continue
+            if b <= 23 * 60 and not any(a < be and bs < b for bs, be in busy) \
+                    and not any(a < we and ws < b for ws, we in windows):
+                slots.append((a, b))
+        if slots:
+            out.append((d, sorted(slots)))
+    return out
+
+
+LEAD_TODAY_MIN = 30
+
+# ---------------------------------------------------------------------------
+# Horizon-aware planning. Nobody plans day-by-day 4 months out: far goals get a
+# monthly roadmap, mid-range goals a weekly one, and only the near days are
+# drawn hour-by-hour. The detailed window rolls forward every day.
+# ---------------------------------------------------------------------------
+WEEKLY_AT = 56        # > 8 weeks out  -> weekly outline
+MONTHLY_AT = 75       # > ~2.5 months  -> monthly outline
+DETAIL_DAYS = 14      # hour-by-hour days kept ahead in weekly/monthly mode
+_PHASES = ((0.25, "Foundations"), (0.60, "Build"), (0.85, "Pressure test"), (1.01, "Final push"))
+
+
+def scope_for(days_left):
+    """'daily' | 'weekly' | 'monthly' from how far away the deadline is."""
+    if days_left > MONTHLY_AT:
+        return "monthly"
+    if days_left > WEEKLY_AT:
+        return "weekly"
+    return "daily"
+
+
+def detail_days_for(days_left):
+    """How many days from today get hour-by-hour tasks (None = all of them)."""
+    return None if scope_for(days_left) == "daily" else DETAIL_DAYS
+
+
+def _phase_at(frac):
+    for limit, name in _PHASES:
+        if frac < limit:
+            return name
+    return _PHASES[-1][1]
+
+
+def build_outline_periods(today, deadline, scope, slot_minutes_by_date):
+    """Deterministic roadmap skeleton: periods with a phase and a REAL hours budget
+    (the sum of the free slots the planner actually found in that period)."""
+    t0 = date.fromisoformat(today)
+    end = date.fromisoformat(deadline)
+    total = max((end - t0).days + 1, 1)
+    step = 30 if scope == "monthly" else 7
+    periods, cur = [], t0
+    while cur <= end:
+        last = min(cur + timedelta(days=step - 1), end)
+        mins = sum(m for d, m in slot_minutes_by_date.items() if cur.isoformat() <= d <= last.isoformat())
+        mid = ((cur - t0).days + (last - cur).days / 2) / total
+        periods.append({
+            "kind": "month" if scope == "monthly" else "week",
+            "start": cur.isoformat(), "end": last.isoformat(),
+            "phase": _phase_at(mid), "hours": round(mins / 60, 1), "objective": "",
+        })
+        cur = last + timedelta(days=1)
+    return periods
+
+
+def generate_outline_objectives(goal, periods, db=None):
+    """One short model call fills each period's concrete objective. Failure leaves
+    the objective empty; the phase + real hours budget still show. Nothing canned."""
+    if not periods:
+        return periods
+    title = (goal.get("title") or goal.get("display_title") or "").strip()
+    details = goal_details_summary(goal.get("details"))
+    listing = "\n".join(
+        f'{i}. {p["start"]} .. {p["end"]} - phase "{p["phase"]}" - {p["hours"]}h of real free time'
+        for i, p in enumerate(periods)
+    )
+    prompt = (
+        f"Goal: {title}. Deadline: {goal.get('deadline')}. {('Details: ' + details) if details else ''}\n"
+        f"Write the roadmap: ONE concrete objective per period below, each a measurable outcome "
+        f"reachable inside that period's hours (what is finished, how much, how it is tested - "
+        f"e.g. 'Finish chapters 1-5, then score 70%+ on two past papers'). Max 18 words each. "
+        f"Periods build on one another and end with the goal done by the deadline. "
+        f"No planning/organising meta-tasks.\n{listing}\n"
+        'Return ONLY a JSON array: [{"i":0,"objective":"..."}, ...]'
+    )
+    try:
+        res = get_manager(db).generate(BASE_SYSTEM_PROMPT, prompt, timeout=90, max_tokens=900)
+    except Exception as exc:
+        logger.warning("outline call failed: %r", exc)
+        return periods
+    if not getattr(res, "ok", False):
+        return periods
+    try:
+        m = re.search(r"\[.*\]", res.text, re.S)
+        for row in json.loads(m.group(0)) if m else []:
+            i = int(row.get("i"))
+            obj = " ".join(str(row.get("objective") or "").split())[:160]
+            if 0 <= i < len(periods) and len(obj.split()) >= 3:
+                periods[i]["objective"] = obj
+    except Exception as exc:
+        logger.warning("outline parse failed: %r", exc)
+    return periods
+
+
+def _kind_rules(profile):
+    kind = (profile or {}).get("kind")
+    if kind == "event":
+        return (
+            "THIS IS A ONE-OFF EVENT, NOT A GRIND. The whole job is a few hours, so the slots are "
+            "few and sit in the last days. Anything perishable or fresh (flowers, food, cake, "
+            "ironing, hair/outfit) happens on the event day or the day before - never earlier, it "
+            "would wilt or spoil. The single earliest slot is for lead-time items only (booking, "
+            "ordering a non-perishable gift, asking/confirming). Name real, specific actions - "
+            "what to buy and where, what to message, what to prepare - not 'plan the date'.\n"
+        )
+    if kind == "habit":
+        return (
+            "THIS IS A PHYSICAL HABIT. Long slots (30+ min) are the person's own gym/exercise window: "
+            "name the session - muscle group, 4-6 exercises, sets x reps - and rotate groups so no "
+            "muscle is hit two days running. Slots of 10 minutes or less are MOVEMENT SNACKS right "
+            "after a meal: one exact exercise and rep count (e.g. '25 push-ups, then 30s plank'). "
+            "Add a one-line food target to the session slots when it serves the goal (protein, "
+            "calories) - no lectures.\n"
+        )
+    return ""
+
+
+def period_for(outline, day_iso):
+    for p in (outline or {}).get("periods", []):
+        if p["start"] <= day_iso <= p["end"]:
+            return p
+    return None
+
+
+def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None, now_min=None,
+                         detail_days=None, outline_out=None):
     today = today or date.today().isoformat()
     deadline = goal["deadline"]
     # Cover every day from today THROUGH the deadline (inclusive). Using only
@@ -1033,8 +1280,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
                 busy.append((0, e - 24 * 60))
             else:
                 busy.append((s, e))
-        if busy_by_date and day_date:
-            busy.extend(busy_by_date.get(day_date, []))
         busy.sort()
         merged = []
         for (s, e) in busy:
@@ -1059,9 +1304,9 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             return None
         return (cur, cur + span)
 
-    # --- deadline-aware backwards packing -------------------------------
-    # Parse the user's own "hours per day I can commit" answer so slot
-    # duration follows THEIR life, not a fixed 90-min guess.
+    # --- how much, and when: the human-nature engine (core/planner.py) -----
+    # Parse the user's own "hours per day I can commit" answer so the load
+    # follows THEIR life, not a fixed guess.
     commit_min = 120
     tp = (details.get("time_per_day") or "").strip().lower()
     m = re.search(r"(\d+)", tp)
@@ -1075,60 +1320,41 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         elif 1 <= n <= 16:
             commit_min = n * 60
 
-    # How many minutes does this person actually have free, per day, summed
-    # over the whole horizon? That caps how much we ever plan — we do NOT
-    # invent work beyond the time that exists.
-    def _free_minutes(day_date=None):
-        busy = _day_bounds(day_date)
-        cur = 8 * 60
-        free = 0
-        for (bs, be) in busy:
-            if be <= cur:
-                continue
-            if bs > cur:
-                free += bs - cur
-            cur = max(cur, be)
-        if cur < 23 * 60:
-            free += 23 * 60 - cur
-        return free
-
-    total_days = span_days
-    day_list = [(date.fromisoformat(today) + timedelta(days=i)).isoformat()
-                for i in range(total_days)]
-
-    # Budget: never exceed what the user said they can give per day, and
-    # never exceed the free time that actually exists on that day.
-    day_free = {d: min(_free_minutes(d), commit_min) for d in day_list}
-
-    # Slot length: split the daily commitment into whole sessions, minimum 45
-    # minutes (or the whole commitment if it is smaller) so every block is real
-    # work. No fixed per-day cap — sessions follow the hours actually committed.
-    min_sess = 45 if commit_min >= 45 else max(15, commit_min)
-    sessions_per_day = max(1, min(commit_min // min_sess, 16))
-    slot_len = max(min_sess, (commit_min // sessions_per_day) // 15 * 15)
-
-    def slots_in_day(day_date):
-        busy = _day_bounds(day_date)
-        chosen = []
-        cur = 8 * 60
-        budget_left = day_free.get(day_date, 0)
-        min_req = min_sess
-        while len(chosen) < sessions_per_day and budget_left >= min_req:
-            span = min(slot_len, budget_left)
-            if span < min_req:
-                break
-            cand = _free_from(busy, cur, chosen, span=span)
-            if not cand:
-                span = min(min_req, budget_left)
-                if span < min_req:
-                    break
-                cand = _free_from(busy, cur, chosen, span=span)
-                if not cand:
-                    break
-            chosen.append(cand)
-            budget_left -= (cand[1] - cand[0])
-            cur = cand[1]
-        return chosen
+    wake, bed = 7 * 60, 23 * 60
+    sleep_times = parse_clock_list(details.get("sleep_schedule") or "")
+    if len(sleep_times) >= 2:
+        b0, w0 = sleep_times[0], sleep_times[1]
+        if w0 > 13 * 60 and b0 < w0:      # typed backwards ("7am to 11pm")
+            b0, w0 = w0, b0
+        nb = planner.normalize_sleep(b0, w0)
+        if nb is not None:
+            bed, wake = nb, w0
+    prefs = planner.Prefs(
+        wake=wake, bed=bed, commit_min=commit_min,
+        chronotype=planner.infer_chronotype(details.get("peak_energy"), wake, bed),
+    )
+    others_for = (lambda d: list((busy_by_date or {}).get(d, [])))
+    profile = effort_profile(goal, max(days_remaining(deadline, today), 0))
+    wins = workout_windows()
+    if profile["kind"] == "habit" and wins:
+        meals = [w for w in (human_windows or []) if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60]
+        # meal windows are the short ones in the routine (sleep is long); take their END
+        meals = [w for w in meals if w not in wins]
+        horizon = _habit_horizon(today, deadline, wins, now_min, others_for, meals, detail_days)
+    else:
+        horizon = planner.plan_horizon(
+            today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
+        )
+        if profile["kind"] == "event":
+            horizon = _apply_event_shape(horizon, today, deadline, profile["budget_min"], profile["active_days"])
+    _state.profile = profile
+    if outline_out is not None:
+        outline_out["slot_minutes"] = {d: sum(e - s0 for s0, e in sl) for d, sl in horizon}
+    if detail_days:
+        cut = (date.fromisoformat(today) + timedelta(days=detail_days - 1)).isoformat()
+        horizon = [(d, sl) for d, sl in horizon if d <= cut]
+    day_list = [d for d, _ in horizon]
+    day_slots_map = {d: s for d, s in horizon}
 
     # Backwards packing: fill the LAST day first, walking back to today. If we
     # run out of slots (blocked days, tiny windows), the EARLY days get left
@@ -1157,8 +1383,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
 
     packed = []
     for d in reversed(day_list):
-        day_slots = slots_in_day(d)
-        for (s, e) in reversed(day_slots):
+        for (s, e) in reversed(day_slots_map.get(d, [])):
             packed.append((d, s, e))
     if is_event and split_topics and len(packed) >= len(split_topics):
         # An event is a short list of one-off jobs, not a syllabus you repeat.
@@ -1232,8 +1457,10 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
     endd = date.fromisoformat(deadline)
     if endd < day0:
         endd = day0
-    n = min(endd.toordinal() - day0.toordinal() + 1, 15)
-    dates = [day0 + timedelta(days=i) for i in range(n)]
+    # An intimate night is a 2-3 day arc (prep, the night, morning after), not a
+    # 20-day grind: only the final days are planned.
+    n = min(endd.toordinal() - day0.toordinal() + 1, 3)
+    dates = [endd - timedelta(days=n - 1 - i) for i in range(n)]
 
     # Event evening = the night before a free day if one exists so she stays
     # over and the user returns home the following morning. Favors the LAST
@@ -1282,14 +1509,10 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
                 if m:
                     taken.append(m)
                     add(day, m, "event", 0, i)
-            ev = fit(b, taken, 18 * 60, 240) or fit(b, taken, 19 * 60, 240)
-            if ev:
-                taken.append(ev)
-                add(day, ev, "event", 1, i)
-            else:
-                tail = b[-1][1] if b else 18 * 60
-                tail = max(tail, 18 * 60)
-                add(day, (tail, min(tail + 240, 22 * 60)), "event", 1, i)
+            # the evening includes dinner: short meal windows must not break it up
+            b_ev = [w for w in b if not (w[1] - w[0] <= 90 and 12 * 60 <= w[0] < 22 * 60)]
+            ev = fit(b_ev, taken, 18 * 60, 240) or fit(b_ev, taken, 18 * 60, 180) or fit(b_ev, taken, 19 * 60, 150)
+            add(day, ev or (19 * 60, 22 * 60), "event", 1, i)
         else:
             m = fit(b, taken, 9 * 60, 60) or fit(b, taken, 8 * 60, 60)
             if m:
@@ -1332,6 +1555,17 @@ def _overlaps(s, e, blocked):
     return False
 
 
+def _local_now(db, goal, user=None):
+    """The goal owner's wall-clock 'now' (their timezone, not the server's)."""
+    from core.clock import now_for
+    if user is None and db is not None and goal and goal.get("user_id"):
+        try:
+            user = db.execute("SELECT timezone FROM users WHERE id=?", (goal["user_id"],)).fetchone()
+        except Exception:
+            user = None
+    return now_for(user)
+
+
 def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False, busy_by_date=None):
     """Generate a real schedule for a goal. Returns a list of action dicts from the LLM,
     or None when no LLM can serve one. NEVER fabricates a hardcoded fill-in plan — the
@@ -1343,7 +1577,7 @@ def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False, b
     # returns None; the caller keeps the old plan.
     try:
         return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
-                              busy_by_date=busy_by_date)
+                              busy_by_date=busy_by_date, user=user)
     except Exception:
         return None
 
@@ -1355,8 +1589,9 @@ def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=
     same deterministic fallback. Used for background schedule upgrades."""
     try:
         return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
-                              busy_by_date=busy_by_date)
-    except Exception:
+                              busy_by_date=busy_by_date, user=user)
+    except Exception as exc:
+        logger.warning("plan call failed: %r", exc)
         return None
 
 
@@ -1452,8 +1687,8 @@ def _extract_links(text):
     return out[:8]
 
 
-def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False, busy_by_date=None):
-    global _plan_blocked_reason
+def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False, busy_by_date=None,
+                   user=None):
     sys = BASE_SYSTEM_PROMPT
     deadline = goal["deadline"]
     title = (goal.get("title") or goal["display_title"]).strip()
@@ -1557,7 +1792,9 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             "Use these exact links where the plan needs a resource, tool, form, or page: "
             "link the real thing the user already shared. Do not invent different resources."
         )
-    today = date.today().isoformat()
+    local_now = _local_now(db, goal, user)
+    today = local_now.date().isoformat()
+    now_min = local_now.hour * 60 + local_now.minute
     days_left = max(days_remaining(deadline, today), 0)
     if days_left <= 2:
         pace = "deadline in the next few days — this is a GRIND: every task must directly finish the goal, and the day has room for many sessions, so pack them."
@@ -1576,20 +1813,28 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         "unless the user's own notes literally call for it. Every task stays a real, physical "
         "action a normal person can do in that slot, that exact day."
     )
+    scope = scope_for(days_left)
+    ol = {}
     fallback = _build_fallback_plan(goal, today=today, extra_blocked=extra_blocked,
-                                    busy_by_date=busy_by_date) or []
+                                    busy_by_date=busy_by_date, now_min=now_min,
+                                    detail_days=detail_days_for(days_left), outline_out=ol) or []
+    _state.outline = None
+    if fallback and scope != "daily":
+        periods = build_outline_periods(today, deadline, scope, ol.get("slot_minutes", {}))
+        periods = generate_outline_objectives(goal, periods, db)
+        _state.outline = {"scope": scope, "periods": periods, "built": today}
     if not fallback:
         # Zero usable slots, not a model failure. Say WHY, so the user fixes
         # the cause (their blocked windows eat every usable hour) instead of
         # the app retrying a model that was never the problem.
-        _plan_blocked_reason = (
+        _state.plan_blocked_reason = (
             "your available windows leave no usable free time between 8am and 11pm on any "
             "day before the deadline — set or relax the Always-Busy Windows once (Settings "
             "panel) and redraw. Ignoring whoever told me what you do at those hours would "
             "mean lying to you, and I don't lie to you."
         )
         return None
-    _plan_blocked_reason = None
+    _state.plan_blocked_reason = None
 
     # One request can't carry the whole horizon: a month-long goal is 40-60+
     # slots, the title budget blows past _MAX_PLAN_TOKENS, the model truncates
@@ -1612,7 +1857,7 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         )
 
     base_head = (
-        f"Build the day-by-day plan from {date.today().isoformat()} to {deadline} for: {title}\n"
+        f"Build the day-by-day plan from {today} to {deadline} for: {title}\n"
         f"THE GOAL IS: {title}\n"
         f"Constraints: {cons}"
         f"{blocked_line}"
@@ -1624,18 +1869,37 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         f"{detail_line}"
         f"{guidance_line}"
         f"{size_line}\n"
-        "Together, the separate requests for this window Cover EVERY day from today to the "
-        "deadline — never drop, merge, shift, or cut the slots you were given, and never add "
+        "Together, the separate requests for this window cover every day in the detailed "
+        "window — never drop, merge, shift, or cut the slots you were given, and never add "
         "slots that were not listed.\n"
+        + _kind_rules(getattr(_state, "profile", None)) +
+        "TASK WORDING STANDARD (this is what makes a plan usable): every title must name "
+        "(1) the exact material or deliverable, (2) a quantity or size, and (3) the "
+        "finish-test that proves it is done. Good: 'Solve 10 subnetting problems from "
+        "Professor Messer's sheet; redo every miss until 10/10'. Good: 'Build the pricing "
+        "page in Figma: 3 tiers, mobile + desktop, export 2 PNGs'. Bad: 'Study networking', "
+        "'Work on the project', 'Continue practice'. Each task builds on the previous ones: "
+        "later days go deeper or harder, never repeat an earlier title.\n"
     )
-    global _last_provider
     out = []
     for i in range(0, len(fallback), slice_size):
         chunk = fallback[i:i + slice_size]
         first, last = chunk[0]["date"], chunk[-1]["date"]
         slots_json = "[\n" + ",\n".join(_slot_json(e) for e in chunk) + "\n]"
+        ctx = ""
+        per = period_for(getattr(_state, "outline", None), first)
+        if per:
+            ctx += (f"ROADMAP: this stretch is the \"{per['phase']}\" phase "
+                    f"({per['start']}..{per['end']}, {per['hours']}h available)."
+                    + (f" Target for it: {per['objective']}." if per['objective'] else "") + "\n")
+        else:
+            total = max(days_remaining(deadline, today), 1)
+            ctx += f"PHASE: {_phase_at(max(0, days_between(today, first)) / total)}.\n"
+        if out:
+            ctx += "ALREADY PLANNED EARLIER (go deeper, do not repeat): " + " | ".join(e["title"] for e in out[-6:]) + "\n"
+        base_head_slice = base_head + ctx
         user_prompt = (
-            f"{base_head}This request covers ONLY {first} .. {last}. Other requests fill the rest of "
+            f"{base_head_slice}This request covers ONLY {first} .. {last}. Other requests fill the rest of "
             "the calendar — do NOT plan any day outside this range, and do NOT move any "        
             "slot to a different date, start_time, or end_time than the ones below.\n"
             "Below are the EXACT day/time slots in THIS range the plan must fill (each slot "
@@ -1652,7 +1916,7 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             "Each title tells the user EXACTLY WHAT TO DO in that exact slot, that exact "
             "day: a verb + the real thing (what to buy, what to set up, what to text, what "
             "time, what to say). "
-            "UP TO TWO SHORT LINES per title (at most ~16 words total) — it must fit the "
+            "UP TO TWO SHORT LINES per title (at most ~24 words / 150 characters total) — it must fit the "
             "slot's own timeframe and it is still a complete, concrete instruction. E.g. "
             "instead of 'Ensure a smooth evening' write 'Pick the three-piece, text her, "
             "agree 8pm. Candles, slow music, door at 8.' Pull "
@@ -1688,7 +1952,7 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         if not res.ok:
             logger.warning("plan slice %s-%s: model unavailable, skipping", first, last)
             continue
-        _last_provider = res.provider or "llm"
+        _state.last_provider = res.provider or "llm"
         title_map = _parse_title_map(res.text)
         for e in chunk:
             t = title_map.get((e["date"], e["start_time"]))
@@ -1842,13 +2106,13 @@ def completion_detected(message):
 # ---------------------------------------------------------------------------
 # Progress / stats
 # ---------------------------------------------------------------------------
-def progress_stats(goal, actions):
+def progress_stats(goal, actions, today=None):
     total_planned = sum((a.get("duration_min") or 60) for a in actions) / 60.0
     completed = sum((a.get("duration_min") or 60) for a in actions if a.get("status") == "done") / 60.0
     missed = sum((a.get("duration_min") or 60) for a in actions if a.get("status") == "missed") / 60.0
     total_days = 1
-    today = date.today()
-    ddiff = days_remaining(goal.get("deadline", today.isoformat()))
+    today = today if isinstance(today, date) else date.today()
+    ddiff = days_remaining(goal.get("deadline", today.isoformat()), today.isoformat())
     status = "safe"
     if ddiff < 0:
         status = "overdue"
@@ -1871,10 +2135,11 @@ def progress_stats(goal, actions):
     }
 
 
-def pressure_rating(goal, actions, open_blockers=0, missed_days=0):
+def pressure_rating(goal, actions, open_blockers=0, missed_days=0, today=None):
     """A 1-10 'how much should you be panicking' score. Past 7 and Eloise starts shouting.
     Driven by days-left vs remaining workload, slippage, blockers, and missed days."""
-    dl = days_remaining(goal.get("deadline", date.today().isoformat()))
+    today_iso = (today.isoformat() if isinstance(today, date) else date.today().isoformat())
+    dl = days_remaining(goal.get("deadline", today_iso), today_iso)
     remaining = sum((a.get("duration_min") or 60) for a in actions if a.get("status") not in ("done", "missed")) / 60.0
     total = sum((a.get("duration_min") or 60) for a in actions) / 60.0
     if total <= 0:
@@ -1901,12 +2166,17 @@ def pressure_rating(goal, actions, open_blockers=0, missed_days=0):
     return {"score": score, "label": label, "days_left": dl, "remaining_hours": round(remaining, 1)}
 
 
-def momentum_stats(user_id, db=None):
+def momentum_stats(user_id, db=None, today=None):
     """Streaks + burn rate derived from actual done work. Returns best streak, current
     streak, today's completed hours, and a 0-100 momentum meter."""
     from core.database import get_connection
+    from core.clock import today_for
     conn = db or get_connection()
-    today = date.today()
+    if not isinstance(today, date):
+        try:
+            today = today_for(conn.execute("SELECT timezone FROM users WHERE id=?", (user_id,)).fetchone())
+        except Exception:
+            today = date.today()
     done_days = set()
     rows = conn.execute(
         "SELECT date FROM actions WHERE user_id=? AND status='done'", (user_id,)

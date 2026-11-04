@@ -7,7 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from core.llm.base import GenerationResult, ProviderState
 from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
 from core.llm.ollama_provider import OllamaProvider
-from core.llm.openai_provider import DEFAULT_BASE_URL, DEFAULT_CLOUD_MODEL, OpenAICompatProvider
+from core.llm.anthropic_provider import AnthropicProvider
+from core.llm.openai_provider import (
+    DEFAULT_BASE_URL, DEFAULT_CLOUD_MODEL, PRESET_BY_ID, OpenAICompatProvider, preset_for_api_key,
+    preset_for_base_url,
+)
 
 DEFAULT_OPENROUTER_MODEL = DEFAULT_CLOUD_MODEL
 
@@ -186,6 +190,12 @@ def _infer_label(base_url):
         ("mistral", "mistral"),
         ("xai", "x.ai"),
         ("anthropic", "anthropic"),
+        ("gemini", "generativelanguage"),
+        ("cerebras", "cerebras"),
+        ("fireworks", "fireworks"),
+        ("perplexity", "perplexity"),
+        ("nvidia", "nvidia"),
+        ("huggingface", "huggingface"),
     ):
         if needle in base_url:
             return label
@@ -212,7 +222,15 @@ def build_providers(db=None, config=None):
     model = (config.get("model") or os.environ.get("OPENAI_MODEL")
              or os.environ.get("OPENROUTER_MODEL") or DEFAULT_CLOUD_MODEL)
     label = (config.get("provider") or "").strip() or _infer_label(base_url)
-    providers = [OpenAICompatProvider(api_key=api_key, model=model, base_url=base_url, name=label)]
+    protocol = (config.get("protocol") or "").strip()
+    if not protocol:
+        pid = preset_for_base_url(base_url)
+        protocol = (PRESET_BY_ID.get(pid) or {}).get("protocol", "openai") if pid else "openai"
+    if protocol == "anthropic":
+        cloud = AnthropicProvider(api_key=api_key, model=model, base_url=base_url, name=label or "anthropic")
+    else:
+        cloud = OpenAICompatProvider(api_key=api_key, model=model, base_url=base_url, name=label)
+    providers = [cloud]
 
     enable_local = config.get("enable_local") if ("enable_local" in config) else _local_enabled()
     if enable_local:
@@ -224,35 +242,39 @@ def build_providers(db=None, config=None):
     return providers
 
 
-def provider_config(db):
+def provider_config(db=None):
+    """Saved LLM settings. Always read through the CALLING thread's own connection:
+    the manager is a process-wide singleton, so it must never hold on to (or have
+    swapped under it) another request's connection."""
     merged = {}
-    if db is not None:
-        try:
-            cur = db.execute("SELECT value FROM app_settings WHERE key='llm'")
-            row = cur.fetchone()
-            if row and row[0]:
-                import json
-                merged.update(json.loads(row[0]))
-        except Exception:
-            pass
+    try:
+        from core.database import get_connection
+        import json
+        row = get_connection().execute("SELECT value FROM app_settings WHERE key='llm'").fetchone()
+        if row and row[0]:
+            merged.update(json.loads(row[0]))
+    except Exception as exc:
+        logging.getLogger("eloise.llm").warning("could not read LLM settings: %s", exc)
     return merged
+
+
+# One shared pool for every provider call in the process. Per-instance pools
+# (the old design) leaked threads on every settings request and capped the whole
+# app at 2 concurrent model calls.
+_LLM_POOL_SIZE = int(os.environ.get("ELOISE_LLM_CONCURRENCY", "8") or 8)
+_SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=_LLM_POOL_SIZE, thread_name_prefix="llm")
 
 
 class LLMManager:
     def __init__(self, db=None):
-        self._db = db
-        self._executor = ThreadPoolExecutor(max_workers=2)
-        self._by_name = {}
-        self._lock = threading.Lock()
+        self._db = None            # kept for API compatibility; intentionally unused
+        self._executor = _SHARED_EXECUTOR
 
     def _providers(self):
-        cfg = provider_config(self._db if self._db is not None else None)
-        with self._lock:
-            by_name = {}
-            for p in build_providers(config=cfg):
-                by_name[p.name] = p
-            self._by_name = by_name
-            return by_name
+        by_name = {}
+        for p in build_providers(config=provider_config()):
+            by_name[p.name] = p
+        return by_name
 
     def _ordered(self, prefer_cloud=False):
         """Provider attempt order:

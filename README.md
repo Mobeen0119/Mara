@@ -37,35 +37,32 @@ Open http://localhost:8000.
 
 ## Model configuration
 
-In the app:
+Paste **any** API key in Settings → LLM Provider (admin only — the first account created is the admin, or set `ELOISE_ADMIN_EMAIL`). The provider is recognised from the key prefix, otherwise probed in parallel; the endpoint and a sensible model are chosen and verified with a real request. Anthropic keys use the native Messages API; everything else uses OpenAI-compatible chat. Eloise's persona prompt is the same for every provider; only the transport adapts (token-limit parameter, system-role handling).
 
-1. Settings → LLM Provider
-2. Pick a provider preset, or leave Custom for OpenAI-compatible.
-3. Paste your API key (common formats auto-detected).
-4. Save & Test, or Test connection to probe without saving.
+The saved key is only ever sent to the host it was saved for, and private/metadata addresses are refused unless `ELOISE_ALLOW_PRIVATE_LLM=1` (for local servers).
 
-Keys never echo. Failures show the provider's actual error.
+`.env` fallback: `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`. Optional local Ollama via `ELOISE_ENABLE_LOCAL=1`. See `.env.example`.
 
-### .env fallback
+## How scheduling works
 
-Settings override .env. When unsaved:
+The engine decides **when**, the model decides **what** goes in each slot. Days are built around a human routine: wake/sleep, meals, your always-busy windows and each goal's own constraints are carved out first; work goes into your energy windows (morning/evening person is inferred), in 40–120 minute focus blocks with breaks, never more than 6 focused hours a day across all goals, heavier as a deadline closes in, and today only gets hours still ahead of you. Everything uses your own timezone (synced from the browser).
+
+### Long horizons
+
+How the plan is drawn depends on how far away the deadline is: up to 8 weeks it is day-by-day; over 8 weeks it is a **weekly** roadmap; over about 2.5 months it is a **monthly** roadmap. Each roadmap period gets a phase (Foundations, Build, Pressure test, Final push), a real hours budget (the free time that period actually has) and a measurable objective. Hour-by-hour tasks are only drawn for the next 14 days and roll forward automatically (the scheduler tops the window up when fewer than 7 days remain). A redraw never touches done or missed history.
+
+### Priorities (triage)
+
+`GET /api/triage` ranks every goal by pressure, days left, remaining hours, slippage and stakes (exam/interview/visa > proposal/startup/launch > the rest). When one goal is on fire, it names the soft commitments that should give way (gym, hobbies, social) and never the hard ones (class, work, sleep, meals, family). The same call is placed in Eloise's chat context, so she can say it plainly: _"Fuck the gym this week - the exam is 5 days out and 11 hours are still open."_
+
+## Docker
 
 ```bash
-OPENAI_API_KEY=
-OPENAI_BASE_URL=https://openrouter.ai/api/v1
-OPENAI_MODEL=meta-llama/llama-3.1-8b-instruct:free
+docker build -t eloise .
+docker run -p 8000:8000 -v eloise-data:/data --env-file .env eloise
 ```
 
-Legacy aliases: `OPENROUTER_API_KEY/URL/MODEL`, `DEEPSEEK_*`, `GROQ_*`, `CEREBRAS_*`.
-
-Local (optional):
-```bash
-ELOISE_ENABLE_LOCAL=1
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=llama-3.1:8b
-```
-
-Restart after editing .env.
+Keep it to one worker (the scheduler is in-process).
 
 ## Email (optional)
 
@@ -89,7 +86,7 @@ Note: Gmail requires a 16-char App Password. The Settings → Email screen shows
 
 ```bash
 python3 -m pip install pytest  # if not present
-ELOISE_STORAGE_DIR=/tmp/pytest_storage python3 -m pytest tests/test_logic.py -q
+ELOISE_STORAGE_DIR=/tmp/pytest_storage python3 -m pytest -q
 ```
 
 ## Architecture
@@ -101,7 +98,9 @@ ELOISE_STORAGE_DIR=/tmp/pytest_storage python3 -m pytest tests/test_logic.py -q
 - `core/persona.py` — tone and policy
 - `core/scheduler.py` — background jobs
 - `core/database.py` — schema/migrations
-- `static/` — SPA
+- `core/planner.py` — human-rhythm day planner
+- `core/security.py`, `core/ratelimit.py`, `core/clock.py` — sessions/hashing/SSRF guard, rate limits, per-user time
+- `static/` — SPA (Dusk Dial UI)
 - `tests/` — unit tests
 
 ## Deployment notes
@@ -119,4 +118,3 @@ ELOISE_STORAGE_DIR=/tmp/pytest_storage python3 -m pytest tests/test_logic.py -q
 - **Overdue not toggling** — actions marked `missed` still have the DONE button in Schedule and Goal detail.
 
 The drill is simple: file it, do it, close it. No pep talks.
-

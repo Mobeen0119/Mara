@@ -28,8 +28,9 @@
     <section id="app-screen" class="hidden">
       <!-- Dock: a slim vertical rail on desktop, a floating pill on phones -->
       <nav id="dock" class="dock" aria-label="Sections">
-        <div class="dock-brand" title="Eloise">E</div>
+        <div class="dock-brand"><b>E</b><em>Eloise</em></div>
         <div class="dock-items">
+          <div class="dock-group">Daily</div>
           <button
             class="dock-item"
             data-screen="today"
@@ -42,6 +43,16 @@
           </button>
           <button
             class="dock-item"
+            data-screen="schedule"
+            onclick="navigate('schedule')"
+          >
+            <svg viewBox="0 0 24 24">
+              <rect x="3" y="5" width="18" height="16" rx="3" />
+              <path d="M3 10h18M8 3v4M16 3v4" /></svg
+            ><span>Schedule</span>
+          </button>
+          <button
+            class="dock-item"
             data-screen="board"
             onclick="navigate('board')"
           >
@@ -49,6 +60,7 @@
               <path d="M4 20V10M10 20V4M16 20v-8M22 20H2" /></svg
             ><span>Board</span>
           </button>
+          <div class="dock-group">Goals</div>
           <button
             class="dock-item"
             data-screen="goals"
@@ -58,7 +70,7 @@
               <circle cx="12" cy="12" r="9" />
               <circle cx="12" cy="12" r="4.5" />
               <circle cx="12" cy="12" r=".8" /></svg
-            ><span>Goals</span>
+            ><span><b class="lf">All goals</b><b class="ls">Goals</b></span>
           </button>
           <button
             class="dock-item dock-add"
@@ -66,18 +78,9 @@
             onclick="navigate('new-goal')"
           >
             <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg
-            ><span>File goal</span>
+            ><span><b class="lf">File a goal</b><b class="ls">File</b></span>
           </button>
-          <button
-            class="dock-item"
-            data-screen="schedule"
-            onclick="navigate('schedule')"
-          >
-            <svg viewBox="0 0 24 24">
-              <rect x="3" y="5" width="18" height="16" rx="3" />
-              <path d="M3 10h18M8 3v4M16 3v4" /></svg
-            ><span>Schedule</span>
-          </button>
+          <div class="dock-group">You</div>
           <button
             class="dock-item"
             data-screen="settings"
@@ -101,9 +104,13 @@
               <path
                 d="M21 12a8 8 0 0 1-11.6 7.1L3 21l1.9-5.4A8 8 0 1 1 21 12z"
               /></svg
-            ><span>Chat</span><i id="orbit-dot" class="orbit-chat-dot"></i>
+            ><span><b class="lf">Talk to Eloise</b><b class="ls">Chat</b></span
+            ><i id="orbit-dot" class="orbit-chat-dot"></i>
           </button>
-          <div class="orbit-user" id="orbit-user" title="Signed in">?</div>
+          <div class="dock-user">
+            <div class="orbit-user" id="orbit-user" title="Signed in">?</div>
+            <div class="dock-user-name" id="dock-name"></div>
+          </div>
         </div>
       </nav>
 

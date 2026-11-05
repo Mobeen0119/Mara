@@ -265,3 +265,14 @@ def test_constraint_in_one_goal_redraws_the_others(client, monkeypatch):
     calls.clear()
     client.post(f"/api/goals/{a}/constraints", headers=h, json={"removeIndex": 0})
     assert set(calls) == {a, b}
+
+
+def test_clock_never_crashes_without_a_timezone_database(monkeypatch):
+    """Windows without `tzdata`: ZoneInfo() raises for every name, even UTC."""
+    from core import clock
+    def boom(name):
+        raise clock.ZoneInfoNotFoundError(name)
+    monkeypatch.setattr(clock, "ZoneInfo", boom)
+    assert clock.now_for({"timezone": "Asia/Karachi"}).year >= 2026
+    assert clock.today_for(None)
+    assert clock.valid_tz("Asia/Karachi") is False

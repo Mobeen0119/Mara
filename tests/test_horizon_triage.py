@@ -127,3 +127,72 @@ def test_chat_board_snapshot_carries_the_priority_call(client, monkeypatch):
     uid = conn.execute("SELECT id FROM users").fetchone()[0]
     snap = _active_board_snapshot(conn, uid, date.today().isoformat())
     assert "PRIORITY CALL" in snap and "gym 5-7pm" in snap
+
+
+# ---------------------------------------------------------------------------
+# Effort model: events are short, habits live in the user's own window
+# ---------------------------------------------------------------------------
+def _goal(title, days, constraints=()):
+    return {"id": 1, "user_id": 1, "title": title, "display_title": title, "deadline": _d(days),
+            "constraints": json.dumps(list(constraints)), "details": "{}"}
+
+
+def _mins(e):
+    h0, m0 = map(int, e["start_time"].split(":")); h1, m1 = map(int, e["end_time"].split(":"))
+    return (h1 * 60 + m1) - (h0 * 60 + m0)
+
+
+def test_romantic_event_is_a_few_hours_in_the_last_days_not_twenty_days():
+    generation.set_workout_windows([])
+    plan = generation._build_fallback_plan(_goal("Plan a romantic date night for my wife", 20), today=_d(0), now_min=0)
+    days = sorted({e["date"] for e in plan})
+    assert days and days[-1] <= _d(20)
+    assert len(days) <= 4                                    # lead slot + last 3 days
+    assert sum(_mins(e) for e in plan) <= 300
+    late = [e for e in plan if e["date"] >= _d(18)]
+    assert late                                              # the real work is in the last days
+    early = [e for e in plan if e["date"] < _d(15)]
+    assert len(early) <= 1 and (not early or _mins(early[0]) <= 60)   # one lead-time slot only
+
+
+def test_intimate_night_arc_only_plans_the_final_days():
+    generation.set_workout_windows([])
+    plan = generation._build_fallback_plan(_goal("Intimate night with my girlfriend", 20), today=_d(0), now_min=0)
+    days = sorted({e["date"] for e in plan})
+    assert days[0] >= _d(18) and days[-1] == _d(20)
+
+
+def test_event_inside_three_days_still_plans_every_day():
+    generation.set_workout_windows([])
+    plan = generation._build_fallback_plan(_goal("Surprise anniversary dinner", 2), today=_d(0), now_min=0)
+    assert {e["date"] for e in plan} >= {_d(1), _d(2)}
+
+
+def test_habit_goal_uses_the_gym_window_and_movement_snacks_after_meals():
+    generation.set_workout_windows([(17 * 60, 18 * 60)])
+    plan = generation._build_fallback_plan(_goal("Get a six pack", 14, ["gym 5 to 6 pm"]), today=_d(0), now_min=0)
+    gym = [e for e in plan if e["start_time"] == "17:00" and e["end_time"] == "18:00"]
+    snacks = [e for e in plan if _mins(e) <= 10]
+    assert len(gym) >= 10                                     # ~6 of every 7 days
+    assert len(snacks) >= 14 * 2                              # after most meals, every day
+    assert not [e for e in plan if 17 * 60 < int(e["start_time"][:2]) * 60 + int(e["start_time"][3:]) < 18 * 60]
+    assert {e["date"] for e in gym}.__len__() == len(gym)     # one session a day
+    generation.set_workout_windows([])
+
+
+def test_habit_goal_is_not_flagged_for_sitting_in_its_own_gym_window(client):
+    from core.routes import goal_routes
+    u = signup(client)
+    conn = get_connection()
+    uid = conn.execute("SELECT id FROM users").fetchone()[0]
+    cons = json.dumps(["gym 5 to 6 pm"])
+    conn.execute("INSERT INTO goals (user_id,title,display_title,deadline,constraints) VALUES (?,?,?,?,?)",
+                 (uid, "Get a six pack", "Get a six pack", _d(5), cons))
+    gid = conn.execute("SELECT MAX(id) FROM goals").fetchone()[0]
+    conn.execute("INSERT INTO actions (goal_id,user_id,date,title,start_time,end_time,duration_min,status,order_idx)"
+                 " VALUES (?,?,?,?,?,?,60,'pending',0)", (gid, uid, _d(1), "Push day: bench 4x8, rows 4x8", "17:00", "18:00"))
+    conn.commit()
+    habit = {"id": gid, "constraints": cons, "title": "Get a six pack", "display_title": "Get a six pack"}
+    assert goal_routes._action_violates_goal_windows(habit) is False
+    other = dict(habit, title="Ship the launch", display_title="Ship the launch")
+    assert goal_routes._action_violates_goal_windows(other) is True       # normal goals must still avoid the gym

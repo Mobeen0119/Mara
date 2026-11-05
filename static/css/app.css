@@ -1,3 +1,8 @@
+/* ==========================================================================
+   Eloise — "Dusk Dial" design
+   Night-plum canvas, one hot apricot→rose accent, a 24-hour dial as the hero,
+   a slim vertical dock instead of a top bar. System fonts only (CSP-friendly).
+   ========================================================================== */
 :root {
   --bg: #120e1a;
   --bg-2: #181324;
@@ -31,6 +36,7 @@
     sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --spring: cubic-bezier(0.22, 1.2, 0.36, 1);
+  /* aliases for inline styles written against the previous palette */
   --bone: var(--text);
   --bone-dim: var(--text-dim);
   --bone-mute: var(--text-mute);
@@ -95,6 +101,7 @@ a {
   border: 2px solid var(--bg);
 }
 
+/* ---------- type ---------- */
 h1,
 h2,
 h3 {
@@ -137,6 +144,7 @@ p {
   margin-top: 20px;
 }
 
+/* ---------- app shell ---------- */
 #app-screen {
   min-height: 100vh;
 }
@@ -168,6 +176,7 @@ body.chat-open #main-content {
   min-height: calc(100vh - 150px);
 }
 
+/* ---------- dock ---------- */
 .dock {
   position: fixed;
   z-index: 40;
@@ -290,6 +299,7 @@ body.chat-open #main-content {
   border: 2px solid var(--line-strong);
 }
 
+/* ---------- cards / surfaces ---------- */
 .card,
 .goal-card,
 .stat-tile,
@@ -379,6 +389,7 @@ body.chat-open #main-content {
   flex: 1;
 }
 
+/* ---------- chips / buttons ---------- */
 .chip {
   display: inline-flex;
   align-items: center;
@@ -480,6 +491,7 @@ button.chip:hover {
   box-shadow: none;
 }
 
+/* ---------- forms ---------- */
 .field {
   margin-bottom: 18px;
 }
@@ -526,6 +538,7 @@ button.chip:hover {
   margin-top: 6px;
 }
 
+/* ---------- tabs ---------- */
 .tabs {
   display: flex;
   gap: 6px;
@@ -558,6 +571,7 @@ button.chip:hover {
   box-shadow: inset 0 -2px 0 var(--apricot);
 }
 
+/* ---------- banners / stats ---------- */
 .banner {
   padding: 14px 18px;
   border-radius: var(--radius-sm);
@@ -587,6 +601,7 @@ button.chip:hover {
   margin-top: 6px;
 }
 
+/* ---------- progress / meters ---------- */
 .prog-bar {
   display: block;
   width: 80px;
@@ -626,6 +641,7 @@ button.chip:hover {
   color: var(--apricot);
 }
 
+/* momentum ring (Board) */
 .dial {
   --p: 0;
   flex: none;
@@ -659,6 +675,7 @@ button.chip:hover {
   color: var(--text-mute);
 }
 
+/* ---------- THE DAY DIAL (hero of Today) ---------- */
 .day-hero {
   display: grid;
   grid-template-columns: minmax(280px, 460px) 1fr;
@@ -782,6 +799,7 @@ button.chip:hover {
   vertical-align: -1px;
 }
 
+/* ---------- timeline rows (Today list + Schedule) ---------- */
 .schedule-grid {
   display: grid;
   gap: 14px;
@@ -953,6 +971,7 @@ button.chip:hover {
   color: var(--mint);
 }
 
+/* ---------- settings ---------- */
 .settings-section {
   margin-bottom: 18px;
 }
@@ -1045,6 +1064,7 @@ button.chip:hover {
   }
 }
 
+/* ---------- chat ---------- */
 .chat-panel {
   position: fixed;
   z-index: 50;
@@ -1256,6 +1276,7 @@ button.chip:hover {
   stroke-linejoin: round;
 }
 
+/* ---------- modals / toasts / onboarding ---------- */
 .modal-overlay,
 .onboarding-overlay {
   position: fixed;
@@ -1349,6 +1370,7 @@ button.chip:hover {
   color: var(--mint);
 }
 
+/* ---------- auth ---------- */
 .auth-stage {
   min-height: 100vh;
   display: grid;
@@ -1445,6 +1467,7 @@ button.chip:hover {
 .v {
 }
 
+/* ---------- responsive ---------- */
 @media (max-width: 1100px) {
   body.chat-open #main-content {
     margin-right: 0;
@@ -1526,6 +1549,7 @@ button.chip:hover {
   }
 }
 
+/* a card inside a settings section is just a grouping, not a second surface */
 .settings-section > .card {
   background: none;
   border: 0;
@@ -1537,6 +1561,7 @@ button.chip:hover {
   accent-color: var(--apricot);
 }
 
+/* ---------- roadmap + Eloise's call ---------- */
 .road-row {
   display: grid;
   grid-template-columns: 150px 1fr;
@@ -1582,5 +1607,247 @@ button.chip:hover {
   .road-row {
     grid-template-columns: 1fr;
     gap: 4px;
+  }
+}
+
+/* ---------- navigation v2: labelled rail ---------- */
+:root {
+  --dock-w: 232px;
+}
+.dock {
+  width: 204px;
+  align-items: stretch;
+  padding: 16px 12px;
+  gap: 14px;
+  border-radius: 28px;
+}
+.dock-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: auto;
+  height: auto;
+  background: none;
+  box-shadow: none;
+  padding: 2px 6px 8px;
+  border-radius: 0;
+}
+.dock-brand b {
+  width: 40px;
+  height: 40px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  font: italic 700 22px var(--serif);
+  color: #1b1020;
+  background: var(--grad);
+  box-shadow: var(--glow);
+}
+.dock-brand em {
+  font: italic 600 22px var(--serif);
+  letter-spacing: -0.01em;
+}
+.dock-items,
+.dock-foot {
+  align-items: stretch;
+  gap: 3px;
+}
+.dock-items {
+  justify-content: flex-start;
+  overflow-y: auto;
+}
+.dock-group {
+  font: 600 10px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  color: var(--text-mute);
+  padding: 14px 12px 6px;
+}
+.dock-group:first-child {
+  padding-top: 4px;
+}
+.dock-item {
+  width: auto;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  justify-content: flex-start;
+  border-radius: 14px;
+  text-align: left;
+  font: 600 14px var(--sans);
+}
+.dock-item:hover {
+  transform: translateX(3px);
+}
+.dock-item span {
+  position: static;
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  background: none;
+  padding: 0;
+  font: 600 14px var(--sans);
+  color: inherit;
+  white-space: nowrap;
+}
+.dock-item.active span {
+  color: #1b1020;
+}
+.dock-add {
+  margin: 4px 0;
+  border: 1px dashed var(--line-strong);
+  color: var(--apricot);
+}
+.dock-add:hover {
+  background: rgba(255, 178, 91, 0.1);
+}
+.dock-add.active {
+  border-style: solid;
+}
+.dock-chat {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.dock-chat .orbit-chat-dot {
+  top: 50%;
+  right: 14px;
+  transform: translateY(-50%);
+}
+.dock-user {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 8px 2px;
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+}
+.dock-user-name {
+  font: 600 13px/1.25 var(--sans);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dock-user-name small {
+  display: block;
+  font: 500 11px var(--mono);
+  color: var(--text-mute);
+}
+.orbit-user {
+  flex: none;
+}
+#main-content {
+  margin-left: var(--dock-w);
+}
+
+@media (max-width: 1000px) {
+  :root {
+    --dock-w: 96px;
+  }
+  .dock {
+    width: 66px;
+    padding: 14px 8px;
+  }
+  .dock-brand em,
+  .dock-group,
+  .dock-user-name {
+    display: none;
+  }
+  .dock-brand {
+    justify-content: center;
+    padding: 2px 0 8px;
+  }
+  .dock-item {
+    justify-content: center;
+    padding: 0;
+  }
+  .dock-item span {
+    display: none;
+  }
+  .dock-user {
+    justify-content: center;
+    padding: 10px 0 0;
+  }
+}
+@media (max-width: 760px) {
+  :root {
+    --dock-w: 0px;
+  }
+  #main-content {
+    margin-left: 0;
+  }
+  .dock {
+    width: min(460px, calc(100vw - 16px));
+    height: 68px;
+    padding: 6px 8px;
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+  }
+  .dock-brand,
+  .dock-group,
+  .dock-user {
+    display: none;
+  }
+  .dock-items {
+    flex-direction: row;
+    flex: 1;
+    justify-content: space-between;
+    overflow: visible;
+    gap: 0;
+  }
+  .dock-foot {
+    flex-direction: row;
+  }
+  .dock-item {
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    height: 54px;
+    min-width: 50px;
+    padding: 0 4px;
+    border-radius: 16px;
+  }
+  .dock-item span {
+    display: block;
+    font: 600 10px var(--sans);
+  }
+  .dock-item:hover {
+    transform: none;
+  }
+  .dock-add {
+    margin: 0;
+    border: 0;
+  }
+  .dock-chat {
+    background: transparent;
+  }
+  .dock-chat .orbit-chat-dot {
+    top: 6px;
+    right: 12px;
+    transform: none;
+  }
+}
+
+.dock-brand {
+  color: var(--text);
+}
+.dock-item span b {
+  font-weight: inherit;
+}
+.dock-item .ls {
+  display: none;
+}
+@media (max-width: 760px) {
+  .dock-item .lf {
+    display: none;
+  }
+  .dock-item .ls {
+    display: inline;
+  }
+  .dock-item {
+    min-width: 44px;
   }
 }

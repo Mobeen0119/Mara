@@ -199,8 +199,7 @@ def get_connection():
     if parent:
         os.makedirs(parent, exist_ok=True)
     conn = getattr(_thread_local, "conn", None)
-    # A cached connection is only valid for the database file it was opened on
-    # (the storage dir can change: tests, reset_db).
+    # Reopen cached connections when the configured database file changes
     if conn is not None and getattr(_thread_local, "path", None) != path:
         try:
             conn.close()
@@ -212,10 +211,7 @@ def get_connection():
         _thread_local.path = path
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        # Serialize concurrent writers/readers (plan bg threads, scheduler,
-        # HTTP workers all open their own thread-local connection). Without a
-        # busy timeout, a writer can get "database is locked" and readers can
-        # see transient stale/empty rows. 8s is plenty for local writes.
+        # Serialize access across request, scheduler, and planning threads
         conn.execute("PRAGMA busy_timeout=8000")
         conn.execute("PRAGMA synchronous=NORMAL")
         try:
@@ -244,11 +240,8 @@ MIGRATIONS = [
     "ALTER TABLE goals ADD COLUMN outline TEXT DEFAULT ''",
 ]
 
-# One-shot data migrations, keyed by PRAGMA user_version.
-#   v1: every pre-existing session token was a permanent bearer secret (and the
-#       old repo shipped a database full of them) -> invalidate them all, and
-#       promote the oldest real (non-guest) account to admin so a deployment is
-#       never left with nobody able to configure the LLM.
+
+# v1 invalidates legacy session tokens and ensures a real account remains admin
 def _data_migration_v1(conn):
     conn.execute("UPDATE users SET token=NULL")
     has_admin = conn.execute("SELECT 1 FROM users WHERE is_admin=1 LIMIT 1").fetchone()
@@ -274,8 +267,7 @@ def _migrate(conn):
             conn.execute(stmt)
             conn.commit()
         except sqlite3.OperationalError as exc:
-            # A concurrent process may have added it between our check and the
-            # ALTER; anything else is a real failure and must be loud.
+            # Ignore a concurrent duplicate-column migration; surface other errors
             if "duplicate column" not in str(exc).lower():
                 raise
     version = conn.execute("PRAGMA user_version").fetchone()[0]

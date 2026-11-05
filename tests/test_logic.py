@@ -31,7 +31,6 @@ def test_fallback_plan_shape():
     assert all(e["date"] and e["title"] for e in entries)
 
 
-# --- Provider presets: "paste a key and go" ---------------------------------
 
 def test_provider_presets_are_complete():
     from core.llm.openai_provider import PROVIDER_PRESETS, PRESET_BY_ID
@@ -175,7 +174,6 @@ def test_llm_settings_roundtrip_provider_switch_and_test(tmp_path, monkeypatch):
     assert any(p["id"] == "gemini" for p in out["presets"])
 
 
-# --- Guardrail: precise, word-boundary, partner-friendly ---------------------
 
 def test_guardrail_word_boundaries_no_false_positives():
     h = generation._is_truly_harmful
@@ -218,7 +216,6 @@ def test_persona_anti_leak_and_intimacy_policy():
     assert "LOCATION:" in p
 
 
-# --- Location awareness ------------------------------------------------------
 
 def test_location_settings_and_prompt_wiring(tmp_path):
     from core.models import LocationRequest
@@ -242,7 +239,6 @@ def test_location_settings_and_prompt_wiring(tmp_path):
     assert "Karachi" in sys2
 
 
-# --- Clarifying questions: model-written, honest fallback --------------------
 
 def test_clarify_questions_fallback_and_model_path(monkeypatch):
     class _Dead:
@@ -267,7 +263,6 @@ def test_clarify_questions_fallback_and_model_path(monkeypatch):
     assert "done look like" in qs[0]["q"]
 
 
-# --- Repetition guard --------------------------------------------------------
 
 def test_sentence_dedupe_in_prompt_echo_strip():
     from core.llm.manager import _strip_prompt_echo
@@ -276,7 +271,6 @@ def test_sentence_dedupe_in_prompt_echo_strip():
     assert "Stop planning" in t
 
 
-# --- Overdue tasks are marked failed and still toggleable --------------------
 
 def test_overdue_swept_to_missed_and_still_toggleable(tmp_path):
     from datetime import date, timedelta

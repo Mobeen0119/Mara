@@ -1,7 +1,3 @@
-/* ============================================================
-   ELOISE — control desk
-   ============================================================ */
-
 let token = localStorage.getItem("eloise_token") || "";
 let userName = localStorage.getItem("eloise_name") || "";
 let currentScreen = "today";
@@ -17,6 +13,7 @@ const api = async (path, opts = {}) => {
     logout();
     throw new Error("unauthorized");
   }
+
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -37,10 +34,8 @@ const api = async (path, opts = {}) => {
   return ct.includes("json") ? res.json() : {};
 };
 
-/* ---------------- helpers ---------------- */
 function linkify(text) {
-  /* Model/user text goes into innerHTML. Escape EVERYTHING, and only turn real
-     http(s) URLs into links (attribute values escaped too). */
+  // Escape text and URL attributes before inserting model or user content.
   if (typeof text !== "string") return escHtml(text);
   const URL_RE = /https?:\/\/[^\s<>()]+(?:[^\s<().,!?;:'"\]])?/gi;
   let out = "",
@@ -113,9 +108,6 @@ function safeLink(url) {
   return s;
 }
 
-/* ============================================================
-   Modals
-   ============================================================ */
 function closeModal() {
   const m = document.getElementById("app-modal");
   if (m) m.remove();
@@ -183,9 +175,6 @@ function askModal(title, placeholder) {
   });
 }
 
-/* ============================================================
-   24h check-in dialog
-   ============================================================ */
 let _checkinShown = false;
 async function pollCheckIn() {
   if (!token || _checkinShown) return;
@@ -227,9 +216,6 @@ async function respondCheckIn(done) {
   } catch (e) {}
 }
 
-/* ============================================================
-   Auth
-   ============================================================ */
 function renderAuth() {
   const form = document.getElementById("auth-form");
   form.innerHTML = `
@@ -324,9 +310,7 @@ async function syncTimezone() {
         method: "PUT",
         body: JSON.stringify({ timezone: tz }),
       });
-  } catch (e) {
-    /* the server falls back to UTC — harmless */
-  }
+  } catch (e) {}
 }
 function enterApp() {
   document.getElementById("auth-screen").classList.add("hidden");
@@ -352,23 +336,16 @@ async function refreshFootMomentum() {
     if (dn)
       dn.innerHTML = `${escHtml(userName || "")}<small>momentum ${escHtml(m.momentum)}</small>`;
     el.dataset.momentum = m.momentum;
-  } catch (e) {
-    /* silent */
-  }
+  } catch (e) {}
 }
 
-/* ============================================================
-   Cinematic onboarding — first-run seat & demo files
-   ============================================================ */
 async function maybeOnboarding() {
   if (!token) return;
   try {
     const goals = await api("/goals");
     if (goals.length > 0) return; // already has real files
     showOnboarding(onboardSeed);
-  } catch (e) {
-    /* board may be loading; skip */
-  }
+  } catch (e) {}
 }
 function showOnboarding(onDone) {
   closeModal();
@@ -440,10 +417,6 @@ async function onboardSeedGo() {
 }
 const onboardSeed = onboardSeedGo;
 
-/* ============================================================
-   Navigation & router — hash-backed so refresh keeps the page and
-   the browser back button works.
-   ============================================================ */
 const KNOWN_SCREENS = [
   "today",
   "board",
@@ -457,8 +430,6 @@ const KNOWN_SCREENS = [
 let _hashLock = false;
 
 function navigate(screen, param, fromHash) {
-  // The chat is a persistent side panel now, not a screen. Legacy #global-chat
-  // links and the rail button open it over whatever page you're on.
   if (screen === "global-chat") {
     openChatPanel();
     screen = "today";
@@ -490,24 +461,31 @@ function navigate(screen, param, fromHash) {
     case "today":
       renderToday(main);
       break;
+
     case "board":
       renderBoard(main);
       break;
+
     case "goals":
       renderGoals(main);
       break;
+
     case "new-goal":
       renderNewGoal(main);
       break;
+
     case "goal":
       renderGoalDetail(main, param);
       break;
+
     case "schedule":
       renderSchedule(main);
       break;
+
     case "settings":
       renderSettings(main);
       break;
+
     default:
       renderToday(main);
   }
@@ -518,6 +496,7 @@ function routeFromHash() {
   const raw = (location.hash || "").replace(/^#/, "");
   if (!raw) return false;
   const [screen, param] = raw.split("/");
+
   const s = screen || "today";
   if (!KNOWN_SCREENS.includes(s)) return false;
   navigate(s, param ? decodeURIComponent(param) : undefined, true);
@@ -528,9 +507,6 @@ window.addEventListener("hashchange", () => {
   routeFromHash();
 });
 
-/* ============================================================
-   Today
-   ============================================================ */
 async function renderToday(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Today —</div><h1>…</h1></div>`;
   try {
@@ -574,14 +550,10 @@ async function renderToday(el) {
             .join("")}</div>
         </div>`;
       }
-    } catch (e) {
-      /* triage is optional */
-    }
+    } catch (e) {}
     try {
       html += await renderDayHero();
-    } catch (e) {
-      /* dial is optional */
-    }
+    } catch (e) {}
     html += `<div class="schedule-grid">`;
     if (today.items.length === 0) {
       html += `<div class="empty-state compose"><div class="big">&#x2737;</div><h3>Nothing booked today.</h3><p>File a goal and Eloise draws the lines.</p></div>`;
@@ -604,7 +576,6 @@ async function renderToday(el) {
     }
     html += `</div>`;
 
-    // Risk board
     try {
       const sb = await api("/scoreboard");
       if (sb.goals && sb.goals.length) {
@@ -619,7 +590,6 @@ async function renderToday(el) {
       }
     } catch (e) {}
 
-    // model status footer
     html += `<div style="margin-top:auto;padding-top:40px;display:flex;align-items:center;gap:10px;color:var(--bone-mute);font-size:12px;flex-wrap:wrap;">
       <span class="ember-dot"></span>
       ${
@@ -638,10 +608,6 @@ async function renderToday(el) {
   }
 }
 
-/* ============================================================
-   Day Dial — the whole 24h as a ring: sleep/meals/busy on the outer
-   rail, planned tasks on the main track, a needle for "now".
-   ============================================================ */
 const _DIAL_COLORS = [
   "#ffb25b",
   "#ff6b86",
@@ -763,9 +729,6 @@ async function ackIntervention(interventionId, goalId) {
   navigate("today");
 }
 
-/* ============================================================
-   Board — momentum, pressure, stakes (the "how'd they do that" view)
-   ============================================================ */
 async function renderBoard(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Board</div><h1>…</h1></div>`;
   try {
@@ -776,7 +739,6 @@ async function renderBoard(el) {
       <div class="header-rule"></div>
     </div>`;
 
-    // momentum dial
     const m = mom;
     const momCls = m.momentum >= 70 ? "ok" : m.momentum >= 40 ? "hot" : "bad";
     html += `<div class="card momentum-card">
@@ -797,7 +759,6 @@ async function renderBoard(el) {
       </div>
     </div>`;
 
-    // pressure ranked list
     html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">Pressure ranking</div>
       <h1>Who's sliding.</h1><div class="header-rule"></div></div>`;
     const withP = goals
@@ -827,22 +788,7 @@ async function renderBoard(el) {
       html += `</div>`;
     }
 
-    // — stakes removed per user request — //
-    /* if (m.stakes && m.stakes.length > 0) {
-      html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">On the line</div>
-        <h1>Debt.</h1><div class="header-rule"></div></div>`;
-      m.stakes.forEach(s => {
-        html += `<div class="card stake-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-            <div style="flex:1;"><span class="chip bad">STAKED</span> <strong style="color:var(--bone);">${escHtml(s.punishment)}</strong>
-              <span class="sub" style="margin:6px 0 0;display:block;color:var(--bone-dim);">if <strong style="color:var(--bone);">${escHtml(s.display_title)}</strong> slips, this comes due.</span></div>
-            <button class="btn btn-sm btn-danger" style="color:#fff;" onclick="callInDebt(${escHtml(s.goal_id)})">Call it in</button>
-          </div>
-        </div>`;
-      });
-    } */
-
-    html += `</div>`; // close .screen-fill
+    html += `</div>`;
     el.innerHTML = html;
   } catch (e) {
     el.innerHTML = `<div class="page-header"><div class="kicker">Board</div><h1>Nothing loads.</h1><p class="sub">${escHtml(e.message)}</p></div>`;
@@ -858,9 +804,6 @@ async function callInDebt(goalId) {
   }
 }
 
-/* ============================================================
-   Goals
-   ============================================================ */
 async function renderGoals(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Goals</div><h1>…</h1></div>`;
   try {
@@ -911,9 +854,6 @@ async function renderGoals(el) {
   }
 }
 
-/* ============================================================
-   Goal detail
-   ============================================================ */
 async function renderGoalDetail(el, id) {
   el.innerHTML = `<div class="page-header"><div class="kicker">On file</div><h1>…</h1></div>`;
   try {
@@ -925,14 +865,12 @@ async function renderGoalDetail(el, id) {
       <div class="header-rule"></div>
     </div>`;
 
-    // actions
     html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;">
       <button class="btn btn-sm btn-ghost" onclick="regenPlan(${g.id})">Redraw schedule</button>
       <button class="btn btn-sm btn-ghost" onclick="completeGoalFlow(${g.id})">Mark done</button>
       <button class="btn btn-sm btn-ghost" onclick="cancelGoalFlow(${g.id})">Cancel / Delay</button>
     </div>`;
 
-    // pressure meter header strip
     if (g.pressure) {
       const pc = g.pressure.score;
       const pcl = pc >= 8 ? "bad" : pc >= 6 ? "hot" : pc >= 4 ? "warn" : "ok";
@@ -949,7 +887,6 @@ async function renderGoalDetail(el, id) {
       </div>`;
     }
 
-    // roadmap: monthly/weekly outline for far-off goals
     try {
       const ro = await api(`/outline/${g.id}`);
       if (ro.outline && ro.outline.periods && ro.outline.periods.length) {
@@ -966,14 +903,10 @@ async function renderGoalDetail(el, id) {
         });
         html += `</div>`;
       }
-    } catch (e) {
-      /* roadmap is optional */
-    }
+    } catch (e) {}
 
-    // tabs
     html += `<div class="tabs"><span class="tab active" onclick="switchTab('schedule','${g.id}')">Schedule</span><span class="tab" onclick="switchTab('progress','${g.id}')">Progress</span><span class="tab" onclick="switchTab('constraints','${g.id}')">Constraints</span></div>`;
 
-    // schedule
     html += `<div id="detail-schedule"><div class="schedule-grid">`;
     const byDate = {};
     (g.plan || []).forEach((a) => {
@@ -1009,7 +942,6 @@ async function renderGoalDetail(el, id) {
     }
     html += `</div></div>`;
 
-    // progress (hidden)
     const p = g.progress;
     html += `<div id="detail-progress" style="display:none;">
       <div class="card" style="margin-bottom:16px;"><p style="font-size:14px;line-height:1.7;color:var(--bone-dim);">${escHtml(p.narrative)}</p></div>
@@ -1021,7 +953,6 @@ async function renderGoalDetail(el, id) {
       </div>
     </div>`;
 
-    // constraints (hidden)
     html += `<div id="detail-constraints" style="display:none;">`;
     const cons = g.constraints || [];
     if (cons.length === 0) {
@@ -1170,9 +1101,7 @@ async function regenPlan(id) {
   } catch (e) {
     showToast(e.message, "error");
   }
-  // Keep showing the current schedule while the model works. When the redraw
-  // settles, render the result: the NEW schedule on success, or the OLD one if
-  // the model couldn't be reached (the server keeps it and queues a retry).
+  // Keep the current schedule visible until the background redraw settles.
   let settled = null;
   if (posted) settled = await waitPlanSettles(id);
   const nx = document.getElementById("plan-generating-note");
@@ -1211,8 +1140,7 @@ async function regenPlan(id) {
 }
 
 async function waitPlanSettles(id, attempts = 36) {
-  // Poll the goal until the background draw is no longer 'generating'
-  // (it flips back to 'active' on success OR failure — old plan kept).
+  // The draw returns to active on success or failure.
   for (let i = 0; i < attempts; i++) {
     try {
       const g = await api(`/goals/${id}`);
@@ -1240,9 +1168,6 @@ async function deleteGoal(id) {
   } catch (e) {}
 }
 
-/* ============================================================
-   New goal
-   ============================================================ */
 function renderNewGoal(el) {
   let html = `<div class="page-header"><div class="kicker">New file</div><h1>What's on the table.</h1><p class="sub">Give it a name, a date, and what's off-limits.</p><div class="header-rule"></div></div>
     <div class="card">
@@ -1301,18 +1226,14 @@ async function createGoal() {
         constraints: window._constraints || [],
       }),
     });
-    // The MODEL writes the clarifying questions for this specific goal (not a
-    // hardcoded category set). If the model is unreachable, skip straight to
-    // the board — creation never blocks on it.
+    // Generate questions per goal, but never block goal creation on the model.
     try {
       const c = await api(`/goals/${r.id}/clarify`, { method: "POST" });
       if (c.questions && c.questions.length > 0) {
         showQuestionnaire(r.id, title, c.questions);
         return;
       }
-    } catch (qe) {
-      /* model down: file without questions */
-    }
+    } catch (qe) {}
     showToast("Filed. Eloise draws the lines.", "success");
     navigate("goals");
   } catch (e) {
@@ -1359,9 +1280,6 @@ async function submitQuestionnaire(e, goalId) {
   navigate("goal", goalId);
 }
 
-/* ============================================================
-   Schedule
-   ============================================================ */
 async function renderSchedule(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Schedule</div><h1>…</h1></div>`;
   try {
@@ -1382,7 +1300,7 @@ async function renderSchedule(el) {
         );
       }
     }
-    // Past-due first (most recent miss on top), today, then the future.
+    // Show missed check-ins first, followed by today and future dates.
     const sorted = Object.keys(dates).sort((a, b) => {
       const ap = a < today,
         bp = b < today;
@@ -1484,7 +1402,6 @@ async function toggleTask(id, btn) {
     const head = day && day.querySelector(".sdh-right");
     if (!head) return;
     const bar = head.querySelector(".prog-bar>span");
-    // refetch to recompute counters
     const items = Array.from(
       row.parentElement.querySelectorAll(".schedule-row"),
     );
@@ -1499,9 +1416,6 @@ async function toggleTask(id, btn) {
   }
 }
 
-/* ============================================================
-   Chat side panel — persistent, sits beside whatever page is open.
-   ============================================================ */
 let _chatMounted = false;
 
 function _bindKeys() {
@@ -1579,8 +1493,6 @@ async function mountChatPanel() {
   }
 }
 
-/* Live model/provider line in the panel header — so "is chat even on?" is
-   answerable at a glance instead of guessing from a dead screen. */
 async function refreshPanelModel() {
   const el = document.getElementById("panel-model");
   if (!el) return;
@@ -1618,9 +1530,6 @@ function appendChatMsg(container, role, text, source) {
   return div;
 }
 
-/* Live typing indicator. Instead of static dots that read as "stalled", we show
-   animated equalizer bars + rotating status phrases so the wait feels like motion.
-   People tolerate waits when they see believable progress, not empty bouncing dots. */
 function addTyping(container) {
   const div = document.createElement("div");
   div.className = "chat-msg eloise typing";
@@ -1653,10 +1562,7 @@ function finishTyping(bubble, text, source) {
   const txt = document.createElement("span");
   txt.innerHTML = linkify(text);
   bubble.appendChild(txt);
-  // Show the engine on every real reply — not just ollama/openrouter. The old
-  // filter hid the badge whenever the source resolved to "openai" (which is
-  // what Gemini/OpenAI-compatible endpoints report), so a working chat looked
-  // dead and unconfigured.
+  // Include OpenAI-compatible providers in the source badge.
   if (
     source &&
     source !== "fallback" &&
@@ -1671,8 +1577,6 @@ function finishTyping(bubble, text, source) {
   bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
 }
 
-/* Live text while streaming: swap the typing animation for actual words as they
-   arrive, so the bubble reads as "writing right now" instead of a frozen spinner. */
 function setTypingText(bubble, text) {
   if (!bubble || !bubble.parentNode) return;
   if (bubble._typingTimer) {
@@ -1798,9 +1702,7 @@ async function streamChatReply(goalId, message, onDelta) {
     throw e;
   }
   clearTimeout(idle);
-  // An empty reply with a live source means the cleaner ate everything (or the
-  // model echoed my prompt back). The old check only errored for "offline", so
-  // a live-but-empty reply drew a blank bubble and read as "chat is broken".
+  // Reject empty model replies rather than displaying a blank bubble.
   if (!full) {
     throw new Error(
       "The model returned nothing usable — it may have echoed my prompt back or come out blank. Try rephrasing; if every reply is empty, open Settings and hit Test connection.",
@@ -1840,9 +1742,6 @@ async function sendGlobalChat() {
   }
 }
 
-/* ============================================================
-   Goal chat — inline section (no popup)
-   ============================================================ */
 async function mountGoalChat(goalId) {
   const cc = document.getElementById("goalchat-container");
   if (!cc) return;
@@ -1885,9 +1784,6 @@ async function sendGoalChat(goalId) {
   }
 }
 
-/* ============================================================
-   Settings
-   ============================================================ */
 async function renderSettings(el) {
   let html = `<div class="page-header"><div class="kicker">Settings</div><h1>Tuning the rig.</h1><div class="header-rule"></div></div>`;
   try {
@@ -2001,13 +1897,11 @@ async function renderSettings(el) {
       const inp = document.getElementById("set-checkin-time");
       if (me.checkin_time && inp) inp.value = me.checkin_time;
     } catch (e) {}
-    // Always-busy windows list
     window._busyWindows = [];
     try {
       const bw = await api("/settings/blocked-windows");
       window._busyWindows = bw.blocked_windows || [];
     } catch (e) {}
-    // Email channel section + on-demand digest
     let em = null;
     try {
       em = await api("/email/status");
@@ -2042,7 +1936,6 @@ async function renderSettings(el) {
     html += `<p style="color:#ff8b7a;">Failed to load settings.</p>`;
   }
   el.innerHTML = html;
-  // populate LLM provider fields
   const llmState = window._lastLlm;
   if (llmState) {
     const sel = document.getElementById("set-provider");
@@ -2058,8 +1951,7 @@ async function renderSettings(el) {
     const elc = document.getElementById("set-enable-local");
     if (elc) elc.checked = !!llmState.enable_local;
   }
-  // Pasting a key snaps the provider to match it, so a Gemini key never
-  // silently lands on an OpenRouter endpoint (the old way nothing changed).
+  // Infer provider settings from the pasted key.
   const keyInput = document.getElementById("set-api-key");
   if (keyInput) keyInput.addEventListener("input", _detectProviderFromKey);
   renderBusyWindows();
@@ -2076,7 +1968,7 @@ function _detectProviderFromKey() {
   ).trim();
   const sel = document.getElementById("set-provider");
   if (!key || !sel) return;
-  // Longest prefixes first: sk-or- must win over the generic sk- of OpenAI.
+  // Check specific key prefixes before generic ones.
   const probes = ["sk-or-", "AIza", "gsk_", "csk-", "sk-"];
   const ids = ["openrouter", "gemini", "groq", "cerebras", "openai"];
   const idx = probes.findIndex((p) => key.startsWith(p));
@@ -2097,8 +1989,7 @@ function applyProviderPreset() {
   if (!preset) return; // custom endpoint: the operator owns both fields
   const bl = document.getElementById("set-base-url");
   const ml = document.getElementById("set-model");
-  // Always overwrite: a provider switch must never inherit the previous
-  // provider's endpoint or model.
+  // Do not carry endpoint or model settings across providers.
   if (bl) bl.value = preset.url;
   if (ml) ml.value = preset.model;
 }
@@ -2262,16 +2153,13 @@ async function sendDigest() {
   }
 }
 
-/* ============================================================
-   Boot
-   ============================================================ */
 window.addEventListener("DOMContentLoaded", () => {
   _bindKeys();
   if (token) {
     const ru = document.getElementById("orbit-user");
     if (ru) ru.textContent = (userName || "?").slice(0, 1).toUpperCase();
     enterApp();
-    // Restore the page from the URL hash (refresh keeps your place).
+    // Restore the current page after a refresh.
     if (!routeFromHash()) navigate("today");
   } else {
     document.getElementById("auth-screen").classList.remove("hidden");

@@ -17,7 +17,6 @@ SESSION_DAYS = 30
 MAX_SESSIONS_PER_USER = 10
 
 
-# --------------------------------------------------------------- passwords
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     dk = hashlib.scrypt(password.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=32)
@@ -57,7 +56,6 @@ def burn_password_time(password: str):
     verify_password(password, _DUMMY_HASH)
 
 
-# ---------------------------------------------------------------- sessions
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 

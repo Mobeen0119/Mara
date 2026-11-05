@@ -45,7 +45,6 @@ class EloiseScheduler:
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
 
-    # ------------------------------------------------------------------
     def tick(self, now_fn=None):
         conn = get_connection()
         for user in conn.execute("SELECT * FROM users").fetchall():
@@ -70,7 +69,6 @@ class EloiseScheduler:
         if now_min >= _hhmm(user.get("checkin_time"), "08:00"):
             self._checkin_and_digest(conn, user, goals, today)
 
-    # ------------------------------------------------------------------
     def _extend_horizon(self, conn, user, today):
         """Roll the detailed window forward for goals planned weekly/monthly."""
         from core import generation

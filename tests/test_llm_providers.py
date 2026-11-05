@@ -68,7 +68,6 @@ def mock(monkeypatch):
     m.stop()
 
 
-# ---------------------------------------------------------------- detection
 @pytest.mark.parametrize("key,expected", [
     ("sk-ant-api03-abc", "anthropic"), ("sk-or-v1-abc", "openrouter"), ("AIzaSyABC", "gemini"),
     ("gsk_abc", "groq"), ("csk-abc", "cerebras"), ("xai-abc", "xai"), ("pplx-abc", "perplexity"),
@@ -117,7 +116,6 @@ def test_anthropic_protocol_selected_and_native_headers_used(mock):
     assert sent["body"]["system"] == BASE_SYSTEM_PROMPT and sent["body"]["max_tokens"] == 50
 
 
-# ------------------------------------------------- one persona, every provider
 def _system_text_sent(req):
     body = req["body"]
     if "system" in body:
@@ -168,7 +166,6 @@ def test_models_that_want_max_completion_tokens_are_adapted(monkeypatch):
         m.stop()
 
 
-# ----------------------------------------- end to end: paste key -> chat uses persona
 @pytest.mark.parametrize("provider", [None, "anthropic"])
 def test_paste_only_a_key_then_chat_with_full_persona(client, mock, provider):
     admin = signup(client, "admin@example.com", "Admin")

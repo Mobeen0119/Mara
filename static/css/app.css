@@ -1,8 +1,3 @@
-/* ==========================================================================
-   Eloise — "Dusk Dial" design
-   Night-plum canvas, one hot apricot→rose accent, a 24-hour dial as the hero,
-   a slim vertical dock instead of a top bar. System fonts only (CSP-friendly).
-   ========================================================================== */
 :root {
   --bg: #120e1a;
   --bg-2: #181324;
@@ -21,6 +16,7 @@
   --violet: #a58bff;
   --warn: #ffcf5c;
   --bad: #ff6b6b;
+
   --ok: #64e0b4;
   --grad: linear-gradient(120deg, var(--apricot), var(--rose));
   --glow:
@@ -30,13 +26,14 @@
   --radius-sm: 11px;
   --dock-w: 84px;
   --panel-w: 410px;
+
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   --sans:
     ui-rounded, "SF Pro Rounded", system-ui, -apple-system, "Segoe UI", Roboto,
     sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --spring: cubic-bezier(0.22, 1.2, 0.36, 1);
-  /* aliases for inline styles written against the previous palette */
+
   --bone: var(--text);
   --bone-dim: var(--text-dim);
   --bone-mute: var(--text-mute);
@@ -101,7 +98,6 @@ a {
   border: 2px solid var(--bg);
 }
 
-/* ---------- type ---------- */
 h1,
 h2,
 h3 {
@@ -144,7 +140,6 @@ p {
   margin-top: 20px;
 }
 
-/* ---------- app shell ---------- */
 #app-screen {
   min-height: 100vh;
 }
@@ -176,7 +171,6 @@ body.chat-open #main-content {
   min-height: calc(100vh - 150px);
 }
 
-/* ---------- dock ---------- */
 .dock {
   position: fixed;
   z-index: 40;
@@ -195,6 +189,7 @@ body.chat-open #main-content {
   border: 1px solid var(--line);
   border-radius: 26px;
 }
+
 .dock-brand {
   width: 40px;
   height: 40px;
@@ -206,6 +201,7 @@ body.chat-open #main-content {
   background: var(--grad);
   box-shadow: var(--glow);
 }
+
 .dock-items,
 .dock-foot {
   display: flex;
@@ -217,6 +213,7 @@ body.chat-open #main-content {
   flex: 1;
   justify-content: center;
 }
+
 .dock-item {
   position: relative;
   width: 44px;
@@ -233,6 +230,7 @@ body.chat-open #main-content {
     background 0.2s,
     transform 0.25s var(--spring);
 }
+
 .dock-item svg {
   width: 22px;
   height: 22px;
@@ -260,6 +258,7 @@ body.chat-open #main-content {
   opacity: 0;
   pointer-events: none;
   background: var(--surface-3);
+
   color: var(--text);
   font: 600 12px var(--sans);
   padding: 6px 10px;
@@ -299,7 +298,6 @@ body.chat-open #main-content {
   border: 2px solid var(--line-strong);
 }
 
-/* ---------- cards / surfaces ---------- */
 .card,
 .goal-card,
 .stat-tile,
@@ -389,7 +387,6 @@ body.chat-open #main-content {
   flex: 1;
 }
 
-/* ---------- chips / buttons ---------- */
 .chip {
   display: inline-flex;
   align-items: center;
@@ -491,7 +488,6 @@ button.chip:hover {
   box-shadow: none;
 }
 
-/* ---------- forms ---------- */
 .field {
   margin-bottom: 18px;
 }
@@ -538,7 +534,6 @@ button.chip:hover {
   margin-top: 6px;
 }
 
-/* ---------- tabs ---------- */
 .tabs {
   display: flex;
   gap: 6px;
@@ -571,7 +566,6 @@ button.chip:hover {
   box-shadow: inset 0 -2px 0 var(--apricot);
 }
 
-/* ---------- banners / stats ---------- */
 .banner {
   padding: 14px 18px;
   border-radius: var(--radius-sm);
@@ -601,7 +595,6 @@ button.chip:hover {
   margin-top: 6px;
 }
 
-/* ---------- progress / meters ---------- */
 .prog-bar {
   display: block;
   width: 80px;
@@ -641,7 +634,6 @@ button.chip:hover {
   color: var(--apricot);
 }
 
-/* momentum ring (Board) */
 .dial {
   --p: 0;
   flex: none;
@@ -675,7 +667,6 @@ button.chip:hover {
   color: var(--text-mute);
 }
 
-/* ---------- THE DAY DIAL (hero of Today) ---------- */
 .day-hero {
   display: grid;
   grid-template-columns: minmax(280px, 460px) 1fr;
@@ -799,7 +790,6 @@ button.chip:hover {
   vertical-align: -1px;
 }
 
-/* ---------- timeline rows (Today list + Schedule) ---------- */
 .schedule-grid {
   display: grid;
   gap: 14px;
@@ -971,7 +961,6 @@ button.chip:hover {
   color: var(--mint);
 }
 
-/* ---------- settings ---------- */
 .settings-section {
   margin-bottom: 18px;
 }
@@ -1064,7 +1053,6 @@ button.chip:hover {
   }
 }
 
-/* ---------- chat ---------- */
 .chat-panel {
   position: fixed;
   z-index: 50;
@@ -1276,7 +1264,6 @@ button.chip:hover {
   stroke-linejoin: round;
 }
 
-/* ---------- modals / toasts / onboarding ---------- */
 .modal-overlay,
 .onboarding-overlay {
   position: fixed;
@@ -1370,7 +1357,6 @@ button.chip:hover {
   color: var(--mint);
 }
 
-/* ---------- auth ---------- */
 .auth-stage {
   min-height: 100vh;
   display: grid;
@@ -1462,12 +1448,7 @@ button.chip:hover {
 .dead {
   color: var(--bad);
 }
-.k {
-}
-.v {
-}
 
-/* ---------- responsive ---------- */
 @media (max-width: 1100px) {
   body.chat-open #main-content {
     margin-right: 0;
@@ -1549,7 +1530,6 @@ button.chip:hover {
   }
 }
 
-/* a card inside a settings section is just a grouping, not a second surface */
 .settings-section > .card {
   background: none;
   border: 0;
@@ -1561,7 +1541,6 @@ button.chip:hover {
   accent-color: var(--apricot);
 }
 
-/* ---------- roadmap + Eloise's call ---------- */
 .road-row {
   display: grid;
   grid-template-columns: 150px 1fr;
@@ -1610,7 +1589,6 @@ button.chip:hover {
   }
 }
 
-/* ---------- navigation v2: labelled rail ---------- */
 :root {
   --dock-w: 232px;
 }
@@ -1627,6 +1605,7 @@ button.chip:hover {
   gap: 12px;
   width: auto;
   height: auto;
+
   background: none;
   box-shadow: none;
   padding: 2px 6px 8px;
@@ -1771,6 +1750,7 @@ button.chip:hover {
     padding: 10px 0 0;
   }
 }
+
 @media (max-width: 760px) {
   :root {
     --dock-w: 0px;

@@ -1,4 +1,3 @@
-"""Horizon-aware planning, history-safe redraws, global constraints, triage."""
 import json
 from datetime import date, timedelta
 
@@ -129,9 +128,6 @@ def test_chat_board_snapshot_carries_the_priority_call(client, monkeypatch):
     assert "PRIORITY CALL" in snap and "gym 5-7pm" in snap
 
 
-# ---------------------------------------------------------------------------
-# Effort model: events are short, habits live in the user's own window
-# ---------------------------------------------------------------------------
 def _goal(title, days, constraints=()):
     return {"id": 1, "user_id": 1, "title": title, "display_title": title, "deadline": _d(days),
             "constraints": json.dumps(list(constraints)), "details": "{}"}

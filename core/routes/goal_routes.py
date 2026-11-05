@@ -31,7 +31,6 @@ logger = logging.getLogger("eloise")
 
 
 def _get_today(user=None):
-    """'Today' in the user's own timezone (honours ELOISE_TEST_TODAY for tests)."""
     from core.clock import today_for
     return today_for(user)
 
@@ -42,10 +41,6 @@ _plan_locks = {}
 _user_plan_locks = {}   # one draw at a time per user, so goal B sees goal A's finished blocks
 _user_locks_guard = threading.Lock()
 
-# One bounded pool for every background plan draw (the old code spawned a fresh
-# Thread per request, unbounded). A goal that is already queued/running is not
-# queued twice; a request that arrives mid-draw sets a flag so the draw runs
-# once more afterwards with the newest inputs, instead of being silently dropped.
 _PLAN_WORKERS = int(os.environ.get("ELOISE_PLAN_WORKERS", "3") or 3)
 _pool = None
 _queue_lock = threading.Lock()
@@ -98,19 +93,13 @@ def shutdown_workers():
         pool.shutdown(wait=False, cancel_futures=True)
 
 
-# Retry bookkeeping per goal. A failed model call used to spawn "another
-# thread in 60s" forever — a single bad CPU spike could stack unbounded
-# dueling threads. Now each goal gets at most _PLAN_RETRY_MAX scheduled
-# retries with exponential backoff, and only ONE pending retry can exist for a
-# goal at a time.
 _PLAN_RETRY_MAX = 3
 _plan_retry_state = {}  # goal_id -> {"attempts": int, "scheduled": bool}
 _retry_state_lock = threading.Lock()
 
 
 def _replan_siblings(user, goal_id):
-    """A constraint typed into ANY goal guards every goal ('uni 9 to 1' is true for the
-    whole person), so when constraints change the user's OTHER live goals are redrawn."""
+
     conn = get_connection()
     for row in conn.execute(
         "SELECT id FROM goals WHERE user_id=? AND status='active' AND id!=?", (user["id"], goal_id)
@@ -207,8 +196,7 @@ def active_goal_blocked_windows(conn, user):
 
 
 def _routine_windows(goal):
-    """Sleep / meals / movement as plain (start, end) windows with overnight spans
-    expressed past midnight, so the conflict resolver never slides a block into them."""
+
     try:
         details = json.loads(goal.get("details") or "{}")
     except Exception:
@@ -248,11 +236,7 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         fresh = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if fresh:
             user = dict(fresh)        # blocked windows / timezone may have changed since queued
-        # ELOISE IS THE SINGLE CONTROL UNIT: the user does not declare a
-        # routine per goal. If they blocked gym 5-7am in ANY goal, every goal
-        # knows. So each draw respects the union of the user's global blocked
-        # windows AND every ACTIVE goal's own constraint windows
-        # (gym/uni/sleep/whatever), parsed once here.
+
         blocked = active_goal_blocked_windows(conn, user)
         blocked = blocked + _routine_windows(goal)
         try:
@@ -266,19 +250,12 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         except Exception as exc:
             logger.warning("workout window lookup failed: %r", exc)
             generation.set_workout_windows([])
-        # The slot grid must avoid the user's REAL calendar, not just declared
-        # busy windows: other goals already occupy specific time on specific
-        # days, and an LLM slot that lands on a booked block gets dropped
-        # wholesale by conflict resolution (the whole plan silently collapsing
-        # to "0 tasks").
+
         today_iso = _get_today(user).isoformat()
         busy_by_date = generation.user_calendar_busy(
             conn, user["id"], goal_id, today_iso, goal.get("deadline") or today_iso
         )
-        # NO hardcoded fallback schedule. Only a real LLM plan is written. We
-        # try the model; if it is down or times out, we KEEP whatever plan
-        # already exists and retry in a minute. A hardcoded fill-in is never
-        # shown to the user.
+
         written = None
         try:
             better = generation.generate_plan_or_none(
@@ -374,13 +351,7 @@ def _action_violates_goal_windows(goal):
 
 
 def heal_stale_plans():
-    """Startup repair for plans that never materialized:
-    - goals stranded in 'generating' (a redraw thread died mid-draw, e.g. on a process
-      kill — the 0.5s lead-in sleep means it can die before ever writing its status),
-    - goals 'active' but with ZERO tasks (an old empty-write badged them 'active' with a
-      confidently wrong '0 tasks across 0 days' summary and nothing ever re-drew them).
-    Both get reset to 'active' and, if they still have no tasks, a fresh LOCAL-first
-    generation is kicked at boot so the board and chat have something real to work with."""
+
     today = (_get_today() - timedelta(days=1)).isoformat()
     try:
         conn = get_connection()
@@ -421,12 +392,7 @@ def heal_stale_plans():
                     submit_plan(dict(user), gid)
         except Exception as exc:
             logger.warning("plan bg: heal goal %s failed: %r", gid, exc)
-    # Hardcoded-title purge: the grid placeholder '— day N part 1' used to
-    # leak into the DB via the old substitution path. Those goals contain only
-    # canned filler titles that violate the user's hard rule. Delete ONLY the
-    # junk rows (concrete tasks survive) and let the no-hardcoded regen path
-    # try once (keeps the goal honest and empty-if-unfilled and retries if the
-    # model still fails).
+  
     try:
         act_rows = conn.execute(
             """

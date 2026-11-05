@@ -90,15 +90,7 @@ def get_manager(db=None):
     return _manager
 
 
-# ---------------------------------------------------------------------------
-# Personality contract
-# ---------------------------------------------------------------------------
-# The user can teach Eloise her personality in plain chat ("be sarcastic",
-# "don't be a motivational speaker", "act like you'd abuse me if you could").
-# Whoever says it ONCE expects it to stick forever, but a weak model forgets
-# it next turn. So we sniff these directives out of chat messages, store them
-# on the user, and inject them into EVERY system prompt as a standing
-# override.
+# Preserve explicit persona preferences in every system prompt
 _PERSONA_TRIGGERS = {
     "motivational": "NEVER be a motivational speaker, cheerleader, or hype-person. No 'you can do it!', no pumping-up, no empty positivity. Be dry and real instead.",
     "sarcast": "Be wry, dry and sarcastic by default — make it obvious you are not impressed.",
@@ -164,14 +156,7 @@ def chat_system_prompt(db, user_id):
     )
 
 
-# ---------------------------------------------------------------------------
-# Step completion vs goal completion
-# ---------------------------------------------------------------------------
-# The user reports finishing the CURRENT STEP ("done", "finished the layout")
-# far more often than the WHOLE goal. The plan chat must treat those as
-# different: a step-done means "name the NEXT task from the plan, do not
-# re-instruct the one just finished". Closing the entire goal must stay rare
-# and require real evidence.
+# Keep step completion separate from whole-goal completion.
 _STEP_DONE_RE = re.compile(
     r"^\s*(done|did it|did that|finished|finished it|done with it|done with that|"
     r"got it done|wrapped( up)?|moved on|next|next step|what('| i)?s next|what do i do now|"
@@ -247,16 +232,7 @@ def _pick(items):
     return items[(datetime.now().microsecond // 100) % len(items)]
 
 
-# --- Content-safety guardrail
-# ------------------------------------------------- Precise, not paranoid:
-# Eloise plans REAL goals — including romantic / intimate ones with a partner
-# (gf / wife / partner), and she answers sexual-wellness questions plainly.
-# She refuses only sexual content involving a family member or a minor, and
-# coercion / violence. Word-BOUNDARY matching only: substring scanning used to
-# refuse "document my progress" ('cum' in document), "every person" ('son' in
-# person), "choose between" ('teen' in between) and "grow grapes" ('rape' in
-# grapes). Thread-aware so follow-ups like "sister" after an incest message are
-# still refused.
+# Use whole-word, thread-aware matches to avoid benign substring false positives
 
 def _word_re(words):
     return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
@@ -357,10 +333,6 @@ def days_remaining(deadline, today=None):
     today = today or date.today().isoformat()
     return days_between(today, deadline)
 
-
-# ---------------------------------------------------------------------------
-# Chat
-# ---------------------------------------------------------------------------
 
 def _global_chat_prompt(summary, history, user_name, message):
     return (
@@ -587,9 +559,6 @@ def generate_nudge(user_name, goal_summary, nearest, db=None):
     return text, source
 
 
-# ---------------------------------------------------------------------------
-# Check-in
-# ---------------------------------------------------------------------------
 def generate_check_in_prompt(user_name, goals_summary, db=None):
     sys = CHECK_IN_SYSTEM_PROMPT
     user_prompt = f"User: {user_name}\nActive goals: {'; '.join(goals_summary) or 'none'}\nAsk the check-in question."
@@ -615,9 +584,6 @@ def generate_check_in_response(user_name, done, db=None):
     return text, source
 
 
-# ---------------------------------------------------------------------------
-# Plan generation
-# ---------------------------------------------------------------------------
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
@@ -981,16 +947,7 @@ def _is_event_goal(text):
 
 
 
-# ---------------------------------------------------------------------------
-# Effort model. A goal is not "fill every free hour until the deadline".
-#   event   - one-off with a date (date night, party, proposal): the work is a few
-#             hours, done in the LAST days; perishables (flowers, food) land on the
-#             day; one early slot handles anything with lead time (bookings, orders).
-#   habit   - a practice (gym, six-pack, run, diet): sessions live INSIDE the
-#             user's own window for it (their 'gym 5-6'), plus short movement
-#             snacks after meals - so the routine they already have is the plan.
-#   project - everything else: the horizon planner above.
-# ---------------------------------------------------------------------------
+# Estimate effort differently for event, habit, and project goals
 _HABIT_WORDS = ("gym", "workout", "work out", "six pack", "six-pack", "6 pack", "6-pack", "abs",
                 "fitness", "get fit", "lose weight", "weight loss", "fat loss", "muscle", "bulk",
                 "cut ", "run ", "running", "marathon", "yoga", "diet", "walk daily", "stretch",
@@ -1098,11 +1055,7 @@ def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, 
 
 LEAD_TODAY_MIN = 30
 
-# ---------------------------------------------------------------------------
-# Horizon-aware planning. Nobody plans day-by-day 4 months out: far goals get a
-# monthly roadmap, mid-range goals a weekly one, and only the near days are
-# drawn hour-by-hour. The detailed window rolls forward every day.
-# ---------------------------------------------------------------------------
+# Keep detailed plans near-term and use roadmaps for distant goals
 WEEKLY_AT = 56        # > 8 weeks out  -> weekly outline
 MONTHLY_AT = 75       # > ~2.5 months  -> monthly outline
 DETAIL_DAYS = 14      # hour-by-hour days kept ahead in weekly/monthly mode
@@ -1304,9 +1257,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             return None
         return (cur, cur + span)
 
-    # --- how much, and when: the human-nature engine (core/planner.py) -----
-    # Parse the user's own "hours per day I can commit" answer so the load
-    # follows THEIR life, not a fixed guess.
+    # Use the user's stated availability instead of a fixed estimate
     commit_min = 120
     tp = (details.get("time_per_day") or "").strip().lower()
     m = re.search(r"(\d+)", tp)
@@ -2075,9 +2026,6 @@ def _parse_title_map(text):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Goal completion detection
-# ---------------------------------------------------------------------------
 def completion_detected(message):
     """Detect a genuine 'I finished the task' claim, guarding against questions
     and vague statements like 'what do I have to do today' or 'I'm done with...'."""
@@ -2103,9 +2051,6 @@ def completion_detected(message):
     return any(p in lowered for p in success)
 
 
-# ---------------------------------------------------------------------------
-# Progress / stats
-# ---------------------------------------------------------------------------
 def progress_stats(goal, actions, today=None):
     total_planned = sum((a.get("duration_min") or 60) for a in actions) / 60.0
     completed = sum((a.get("duration_min") or 60) for a in actions if a.get("status") == "done") / 60.0

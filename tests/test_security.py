@@ -6,7 +6,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from tests.conftest import auth, signup
 
 
-# --- 1. guest endpoint must never hand out an existing account's session ----------
 def test_guest_with_registered_email_cannot_take_over_account(client):
     victim = signup(client, "victim@example.com", "Victim")
     r = client.post("/api/guest", json={"name": "Attacker", "email": "victim@example.com"})
@@ -16,7 +15,6 @@ def test_guest_with_registered_email_cannot_take_over_account(client):
     assert me["email"] is None and me["name"] == "Attacker" and not me["is_admin"]
 
 
-# --- 2. path traversal in the SPA catch-all ---------------------------------------
 def test_static_catch_all_cannot_escape_static_dir(client, app_env):
     secret = app_env.BASE_DIR / ".env"
     existed = secret.exists()
@@ -35,7 +33,6 @@ def test_unknown_api_route_is_404_not_the_spa(client):
     assert client.get("/api/nope").status_code == 404
 
 
-# --- 3. app-wide LLM settings are admin-only ---------------------------------------
 def test_llm_settings_admin_only(client):
     admin = signup(client, "admin@example.com", "Admin")
     assert admin["is_admin"] is True
@@ -51,7 +48,6 @@ def test_llm_settings_admin_only(client):
         assert "base_url" not in view and "presets" not in view and "key_source" not in view
 
 
-# --- 3b. the saved key is never sent to a caller-supplied endpoint -----------------
 def test_test_endpoint_never_sends_saved_key_to_another_url(client, monkeypatch):
     seen = []
 
@@ -97,7 +93,6 @@ def test_llm_endpoint_must_not_be_internal_or_metadata(client):
         assert r.status_code == 400, url
 
 
-# --- 4. stored XSS: model/user text must be escaped before innerHTML ---------------
 def test_frontend_linkify_escapes_html():
     import re
     import shutil
@@ -121,7 +116,6 @@ def test_frontend_linkify_escapes_html():
     assert "<img" not in out and "<script" not in out and '"onmouseover' not in out.replace("%22onmouseover", "")
 
 
-# --- 5. repo hygiene ----------------------------------------------------------------
 def test_gitignore_is_utf8_and_covers_secrets_and_data():
     import pathlib
     raw = (pathlib.Path(__file__).resolve().parent.parent / ".gitignore").read_bytes()
@@ -131,7 +125,6 @@ def test_gitignore_is_utf8_and_covers_secrets_and_data():
         assert needle in text
 
 
-# --- 6. credentials and sessions -------------------------------------------------------
 def test_passwords_are_salted_scrypt_and_legacy_hashes_upgrade(client):
     import hashlib
     from core.database import get_connection

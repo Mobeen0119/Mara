@@ -1,4 +1,3 @@
-"""Bugs and half-wired features from the audit: each fails on the original code."""
 import json
 from datetime import date, timedelta
 
@@ -27,7 +26,6 @@ def mk(client, user, title="learn guitar", days=5):
     return r.json()["id"]
 
 
-# ----- validation: 'banana' deadlines used to poison /scoreboard with a 500 ---------
 @pytest.mark.parametrize("bad", ["banana", "2026-13-45", "", "26-10-2026", "1999-01-01"])
 def test_invalid_deadline_rejected(client, user, bad):
     r = client.post("/api/goals", headers=user["h"], json={"title": "x", "deadline": bad})
@@ -63,7 +61,6 @@ def test_reminder_time_validated(client, user):
     assert client.post(f"/api/goals/{gid}/reminder", headers=user["h"], json={"reminder_time": "soon"}).status_code == 422
 
 
-# ----- the content guardrail applies on EVERY path, not just create ------------------
 def test_guardrail_applies_on_edit_and_on_questionnaire_answers(client, user):
     gid = mk(client, user)
     bad = "force her to have sex"
@@ -81,7 +78,6 @@ def test_goal_details_are_bounded_and_flat(client, user):
     assert client.post(f"/api/goals/{gid}/details", headers=user["h"], json={"time_per_day": "2 hours"}).status_code == 200
 
 
-# ----- ownership ------------------------------------------------------------------------
 def test_users_cannot_touch_each_others_goals(client, user):
     gid = mk(client, user)
     other = signup(client, "other@example.com", "Other")
@@ -93,14 +89,12 @@ def test_users_cannot_touch_each_others_goals(client, user):
     assert client.get(f"/api/chat/goals/{gid}", headers=h).status_code == 404
 
 
-# ----- the missing `import os` made ELOISE_TEST_TODAY silently ignored ------------------
 def test_test_today_override_works(monkeypatch):
     monkeypatch.setenv("ELOISE_TEST_TODAY", "2031-02-03")
     from core.routes import goal_routes
     assert goal_routes._get_today().isoformat() == "2031-02-03"
 
 
-# ----- timezones: 'today' is the USER's today --------------------------------------------
 def test_today_follows_the_users_timezone(client, user):
     r = client.put("/api/settings/timezone", headers=user["h"], json={"timezone": "Pacific/Kiritimati"})   # UTC+14
     assert r.status_code == 200
@@ -114,7 +108,6 @@ def test_today_follows_the_users_timezone(client, user):
     assert client.get("/api/day", headers=user["h"]).json()["timezone"] == "Etc/GMT+12"
 
 
-# ----- check-ins: once per local day, from the check-in time ------------------------------
 def test_checkin_due_once_a_day(client, user, monkeypatch):
     mk(client, user)
     monkeypatch.setenv("ELOISE_TEST_TODAY", date.today().isoformat())
@@ -131,7 +124,6 @@ def test_no_goals_means_no_checkin(client, user):
     assert client.get("/api/checkin", headers=user["h"]).json()["due"] is False
 
 
-# ----- scheduler: reminders, sweep, digest fire once per local day -------------------------
 def test_scheduler_sweeps_reminds_and_never_double_fires(client, user):
     from datetime import datetime
     from core.database import get_connection
@@ -180,7 +172,6 @@ def test_digest_is_mailed_once_a_day_and_only_to_confirmed_addresses(client, use
     assert "<b>x</b>" not in sent[0][1] and "&lt;b&gt;x" in sent[0][1]      # email HTML is escaped
 
 
-# ----- stakes can't be collected on a goal that isn't actually lost ------------------------
 def test_stake_enforcement_requires_a_missed_deadline(client, user):
     gid = mk(client, user)
     assert client.post(f"/api/goals/{gid}/stake", headers=user["h"], json={"goal_id": gid, "punishment": "no coffee"}).status_code == 200
@@ -213,7 +204,6 @@ def test_reschedule_quick_command_never_pushes_past_deadline(client, user):
     assert conn.execute("SELECT date FROM actions").fetchone()[0] == dl
 
 
-# ----- plan jobs: bounded and de-duplicated ----------------------------------------------------
 def test_plan_submission_dedupes_and_reruns_once(monkeypatch):
     import threading
     from core.routes import goal_routes as g

@@ -15,22 +15,11 @@ from core.llm.openai_provider import (
 
 DEFAULT_OPENROUTER_MODEL = DEFAULT_CLOUD_MODEL
 
-# OpenRouter free-tier can echo a moderation verdict instead of a reply. Never
-# treat that as a win.
+# Reject moderation verdicts echoed as OpenRouter replies.
 _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 
-# Ollama (the local model) is a SINGLE CPU-bound process: it can only run one
-# generation per loaded model at a time. Every chat request and every plan
-# draw shares ONE lock per MODEL so a busy box becomes a clean queue instead
-# of a stampede of competing calls that slow each other down and then time
-# out. Crucially, chat and plans can run on DIFFERENT local models
-# (OLLAMA_CHAT_MODEL=1.7b vs the 4b used for plans), and Ollama serves them
-# concurrently — so a slow plan draw on the big model must NOT starve an
-# interactive chat into OpenRouter. Callers wait on their model's lock with a
-# cap (lock_wait): a plan draw knows its own job is background work and can
-# queue longer, but an interactive CHAT must never stare at a spinner for a
-# minute+ behind a plan — past its wait cap it falls back to OpenRouter and
-# answers now.
+# Serialize local generation per model while allowing distinct models to run concurrently.
+# Bound interactive waits so chat can fall back to the cloud instead of blocking.
 OLLAMA_LOCK = threading.Lock()
 _ollama_model_locks = {}
 _ollama_locks_guard = threading.Lock()

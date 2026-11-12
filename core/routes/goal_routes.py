@@ -31,6 +31,7 @@ logger = logging.getLogger("eloise")
 
 
 def _get_today(user=None):
+    """'Today' in the user's own timezone (honours ELOISE_TEST_TODAY for tests)."""
     from core.clock import today_for
     return today_for(user)
 
@@ -41,6 +42,10 @@ _plan_locks = {}
 _user_plan_locks = {}   # one draw at a time per user, so goal B sees goal A's finished blocks
 _user_locks_guard = threading.Lock()
 
+# One bounded pool for every background plan draw (the old code spawned a fresh
+# Thread per request, unbounded). A goal that is already queued/running is not
+# queued twice; a request that arrives mid-draw sets a flag so the draw runs
+# once more afterwards with the newest inputs, instead of being silently dropped.
 _PLAN_WORKERS = int(os.environ.get("ELOISE_PLAN_WORKERS", "3") or 3)
 _pool = None
 _queue_lock = threading.Lock()
@@ -93,13 +98,19 @@ def shutdown_workers():
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+# Retry bookkeeping per goal. A failed model call used to spawn "another
+# thread in 60s" forever — a single bad CPU spike could stack unbounded
+# dueling threads. Now each goal gets at most _PLAN_RETRY_MAX scheduled
+# retries with exponential backoff, and only ONE pending retry can exist for a
+# goal at a time.
 _PLAN_RETRY_MAX = 3
 _plan_retry_state = {}  # goal_id -> {"attempts": int, "scheduled": bool}
 _retry_state_lock = threading.Lock()
 
 
 def _replan_siblings(user, goal_id):
-
+    """A constraint typed into ANY goal guards every goal ('uni 9 to 1' is true for the
+    whole person), so when constraints change the user's OTHER live goals are redrawn."""
     conn = get_connection()
     for row in conn.execute(
         "SELECT id FROM goals WHERE user_id=? AND status='active' AND id!=?", (user["id"], goal_id)
@@ -174,41 +185,53 @@ def _insert_actions(conn, goal, entries):
 
 
 def active_goal_blocked_windows(conn, user):
-    """Union of the user's global blocked windows and EVERY active goal's constraint
-    windows (gym 5-7am typed once in any goal guards every goal). Eloise is the
-    single control unit — the user states a routine once, not per goal."""
-    blocked = list(generation.user_blocked_windows(user))
-    try:
-        for g in conn.execute(
-            "SELECT constraints FROM goals WHERE user_id=? AND status='active'",
-            (user["id"],),
-        ).fetchall():
-            try:
-                for c in json.loads(g["constraints"] or "[]"):
-                    w = generation.parse_time_window(c)
-                    if w and w not in blocked:
-                        blocked.append(w)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return blocked
+    """Busy windows shared by every goal: the one merged routine's workout time plus
+    every other always-busy window (class, work...) typed anywhere, newest wins."""
+    from core import routine
+    return routine.blocked_windows(routine.merged(conn, user))
 
 
-def _routine_windows(goal):
-
-    try:
-        details = json.loads(goal.get("details") or "{}")
-    except Exception:
-        details = {}
+def _routine_windows(goal, conn=None, user=None):
+    """Sleep and meals as (start, end) windows, overnight spans split at midnight so
+    the conflict resolver never slides a block into them."""
+    from core import routine
+    if conn is not None and user is not None:
+        wins = routine.human_windows(routine.merged(conn, user))
+    else:
+        try:
+            details = json.loads(goal.get("details") or "{}")
+        except Exception:
+            details = {}
+        wins = generation.parse_routine_windows(details) or generation._DEFAULT_HUMAN_WINDOWS
     out = []
-    for s, e in (generation.parse_routine_windows(details) or generation._DEFAULT_HUMAN_WINDOWS):
+    for s, e in wins:
         if e <= s:
             out.append((s, 24 * 60))
             out.append((0, e))
         else:
             out.append((s, e))
     return out
+
+
+PLAN_STEPS = [
+    "Read your routine and other goals",
+    "Placed sleep, meals and fixed windows",
+    "Checked free time against your calendar",
+    "Asked the model to write the days",
+    "Fitted the draft into real slots",
+    "Saved the schedule",
+]
+_plan_progress = {}
+
+
+def _mark(goal_id, idx):
+    _plan_progress[goal_id] = idx
+
+
+@router.get("/goals/{goal_id}/plan-progress")
+def plan_progress(goal_id: int, user: dict = Depends(require_user)):
+    _goal_or_404(user, goal_id)
+    return {"steps": PLAN_STEPS, "at": _plan_progress.get(goal_id, -1)}
 
 
 def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
@@ -236,27 +259,45 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         fresh = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
         if fresh:
             user = dict(fresh)        # blocked windows / timezone may have changed since queued
-
-        blocked = active_goal_blocked_windows(conn, user)
-        blocked = blocked + _routine_windows(goal)
-        try:
-            from core import triage as _triage
-            kind = generation.effort_profile(goal, 30)["kind"]
-            wins = [(w["start"], w["end"]) for w in _triage._windows(conn, user) if generation.is_workout_label(w["label"])]
-            generation.set_workout_windows(wins if kind == "habit" else [])
-            if kind == "habit" and wins:
-                # the gym window is this goal's own resource, not an obstacle
-                blocked = [b for b in blocked if tuple(b) not in set(wins)]
-        except Exception as exc:
-            logger.warning("workout window lookup failed: %r", exc)
-            generation.set_workout_windows([])
-
+        # ELOISE IS THE SINGLE CONTROL UNIT: the user does not declare a
+        # routine per goal. If they blocked gym 5-7am in ANY goal, every goal
+        # knows. So each draw respects the union of the user's global blocked
+        # windows AND every ACTIVE goal's own constraint windows
+        # (gym/uni/sleep/whatever), parsed once here.
+        _mark(goal_id, 0)
+        from core import routine as _routine
+        rt = _routine.merged(conn, user)
+        generation.set_routine(rt)
+        blocked = _routine.blocked_windows(rt) + _routine_windows(goal, conn, user)
+        generation.set_brief(generation.goal_brief(goal["title"], conn, goal["deadline"]))
+        kind = generation.effort_profile(goal, 30)["kind"]
+        wins = [tuple(rt["workout"])] if rt["workout"] else []
+        if kind == "habit" and not wins:
+            wake = rt["sleep"][1] % 1440
+            ws = wake + 60 if rt.get("peak") == "morning" else 18 * 60
+            wins = [(ws, ws + 60)]
+            rt = dict(rt, assumed=list(rt.get("assumed", [])) + [f"you work out {generation.fmt_min(ws)}-{generation.fmt_min(ws + 60)}"])
+            generation.set_routine(rt)
+        generation.set_workout_windows(wins if kind == "habit" else [])
+        _mark(goal_id, 1)
+        if kind == "habit" and wins:
+            blocked = [b for b in blocked if tuple(b) not in set(wins)]
+        # The slot grid must avoid the user's REAL calendar, not just declared
+        # busy windows: other goals already occupy specific time on specific
+        # days, and an LLM slot that lands on a booked block gets dropped
+        # wholesale by conflict resolution (the whole plan silently collapsing
+        # to "0 tasks").
+        _mark(goal_id, 2)
         today_iso = _get_today(user).isoformat()
         busy_by_date = generation.user_calendar_busy(
             conn, user["id"], goal_id, today_iso, goal.get("deadline") or today_iso
         )
-
+        # NO hardcoded fallback schedule. Only a real LLM plan is written. We
+        # try the model; if it is down or times out, we KEEP whatever plan
+        # already exists and retry in a minute. A hardcoded fill-in is never
+        # shown to the user.
         written = None
+        _mark(goal_id, 3)
         try:
             better = generation.generate_plan_or_none(
                 goal, user, db=conn, extra_blocked=blocked, prefer_cloud=prefer_cloud,
@@ -270,11 +311,14 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
             if generation.effort_profile(goal, 30)["kind"] == "event":
                 # dinner is part of the event evening, so meal windows don't push it around
                 resolve_blocked = [b for b in blocked if not ((b[1] - b[0]) % 1440 <= 90 and 12 * 60 <= b[0] % 1440 < 22 * 60)]
+            _mark(goal_id, 4)
             written = _write_plan(conn, goal, better, blocked_min=resolve_blocked,
                                   provider=generation.last_provider())
             if written:
+                _mark(goal_id, 5)
                 _reset_plan_retries(goal_id)
                 logger.warning("plan bg: goal %s wrote %s LLM entries", goal_id, len(written))
+                _first_day_mail(conn, user, goal_id)
         if not written:
             # LLM produced nothing usable, or the model never ran. Distinguish
             # the two HONESTLY: if the failure was the user's own windows
@@ -351,7 +395,13 @@ def _action_violates_goal_windows(goal):
 
 
 def heal_stale_plans():
-
+    """Startup repair for plans that never materialized:
+    - goals stranded in 'generating' (a redraw thread died mid-draw, e.g. on a process
+      kill — the 0.5s lead-in sleep means it can die before ever writing its status),
+    - goals 'active' but with ZERO tasks (an old empty-write badged them 'active' with a
+      confidently wrong '0 tasks across 0 days' summary and nothing ever re-drew them).
+    Both get reset to 'active' and, if they still have no tasks, a fresh LOCAL-first
+    generation is kicked at boot so the board and chat have something real to work with."""
     today = (_get_today() - timedelta(days=1)).isoformat()
     try:
         conn = get_connection()
@@ -392,7 +442,12 @@ def heal_stale_plans():
                     submit_plan(dict(user), gid)
         except Exception as exc:
             logger.warning("plan bg: heal goal %s failed: %r", gid, exc)
-  
+    # Hardcoded-title purge: the grid placeholder '— day N part 1' used to
+    # leak into the DB via the old substitution path. Those goals contain only
+    # canned filler titles that violate the user's hard rule. Delete ONLY the
+    # junk rows (concrete tasks survive) and let the no-hardcoded regen path
+    # try once (keeps the goal honest and empty-if-unfilled and retries if the
+    # model still fails).
     try:
         act_rows = conn.execute(
             """
@@ -498,6 +553,16 @@ def _schedule_plan_retry(user, goal_id, delay=None):
     t = threading.Timer(wait, _retry)
     t.daemon = True
     t.start()
+
+
+def _first_day_mail(conn, user, goal_id):
+    try:
+        from core import emails
+        u = dict(conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone())
+        g = dict(conn.execute("SELECT * FROM goals WHERE id=?", (goal_id,)).fetchone())
+        emails.send_first_day(conn, u, g)
+    except Exception as exc:
+        logger.warning("first-day mail failed for goal %s: %r", goal_id, exc)
 
 
 def _write_plan(conn, goal, entries, blocked_min=None, provider=None):
@@ -726,16 +791,31 @@ def create_goal(body: GoalCreateRequest, user: dict = Depends(require_user)):
 
 @router.post("/goals/{goal_id}/clarify")
 def clarify_goal(goal_id: int, user: dict = Depends(require_user)):
-    """Model-written clarifying questions for THIS goal (2-3 sharp ones), so
-    the frontend can ask them instead of a hardcoded category set. Falls back
-    to the built-in sets when the model is unreachable."""
+    """Short model-written questions for this goal, minus anything already known.
+    If the model is unreachable there are no questions and the response lists what
+    the plan will assume instead."""
+    from core import routine
     goal = _goal_or_404(user, goal_id)
     ratelimit.enforce(f"llm:{user['id']}", 30, 60)
     conn = get_connection()
+    rt = routine.merged(conn, user)
+    unknown = []
+    if any(a.startswith("you sleep") for a in rt["assumed"]):
+        unknown.append("when they sleep and wake")
+    if any(a.startswith("meals") for a in rt["assumed"]):
+        unknown.append("when they eat")
     questions = generation.generate_clarify_questions(
-        goal.get("title") or goal.get("display_title") or "", db=conn,
+        goal.get("title") or goal.get("display_title") or "", db=conn, deadline=goal.get("deadline") or "",
+        known=routine.describe(rt) if not rt["assumed"] else "", unknown=unknown,
     )
-    return {"questions": questions}
+    return {"questions": questions, "assumed": rt["assumed"], "routine": routine.describe(rt)}
+
+
+@router.get("/routine")
+def get_routine(user: dict = Depends(require_user)):
+    from core import routine
+    rt = routine.merged(get_connection(), user)
+    return {"routine": routine.describe(rt), "assumed": rt["assumed"], "sources": rt["src"]}
 
 
 @router.post("/goals/{goal_id}/details")
@@ -892,7 +972,7 @@ def complete_goal(goal_id: int, body: CompleteGoalRequest, user: dict = Depends(
             "UPDATE goals SET status='cancelled', plan_status=?, display_title=? WHERE id=?",
             (f"cancelled: {reason}", goal["display_title"], goal_id),
         )
-        conn.execute("DELETE FROM actions WHERE goal_id=?", (goal_id,))
+        conn.execute("DELETE FROM actions WHERE goal_id=? AND status!='done'", (goal_id,))
         conn.commit()
         roast = (
             f"File closed. Reason: \"{reason}\". "

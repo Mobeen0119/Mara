@@ -13,7 +13,6 @@ const api = async (path, opts = {}) => {
     logout();
     throw new Error("unauthorized");
   }
-
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -34,48 +33,66 @@ const api = async (path, opts = {}) => {
   return ct.includes("json") ? res.json() : {};
 };
 
-function linkify(text) {
-  // Escape text and URL attributes before inserting model or user content.
-  if (typeof text !== "string") return escHtml(text);
-  const URL_RE = /https?:\/\/[^\s<>()]+(?:[^\s<().,!?;:'"\]])?/gi;
-  let out = "",
-    last = 0,
-    m;
-  while ((m = URL_RE.exec(text)) !== null) {
-    out += escHtml(text.slice(last, m.index));
-    last = m.index + m[0].length;
-    let url = null;
-    try {
-      url = new URL(m[0]);
-    } catch (e) {
-      url = null;
-    }
-    if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) {
-      out += escHtml(m[0]);
-      continue;
-    }
-    let label = "link";
-    const host = url.hostname.toLowerCase();
-    if (
-      host.includes("youtube") ||
-      host.includes("youtu.be") ||
-      host.includes("vimeo")
-    )
-      label = "video";
-    else if (/\.(mp4|webm|mov|avi)(\?|#|$)/i.test(url.pathname))
-      label = "video";
-    else if (
-      host.includes("drive.google") ||
-      host.includes("docs.google") ||
-      host.includes("notion")
-    )
-      label = "doc";
-    else if (/\.(pdf)(\?|#|$)/i.test(url.pathname)) label = "pdf";
-    else if (/\.(jpg|jpeg|png|webp|gif|svg)(\?|#|$)/i.test(url.pathname))
-      label = "image";
-    out += `<a class="chat-link" href="${escHtml(url.href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+const _EXT_ICON =
+  '<svg class="lk-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17L17 7M9 7h8v8"/></svg>';
+const _TOKEN_RE =
+  /(\[[^\]\n]{1,120}\]\(https?:\/\/[^\s)]+\))|(https?:\/\/[^\s<>()]*[^\s<>().,!?;:'"\]])|(\*\*[^*\n]{1,200}\*\*)|(\n+)|([ \t]+)|([^\s]+)/g;
+
+function _linkChip(href, label) {
+  let u;
+  try {
+    u = new URL(href);
+  } catch (e) {
+    return null;
   }
-  return out + escHtml(text.slice(last));
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  const host = u.hostname.replace(/^www\./, "");
+  let path = (u.pathname === "/" ? "" : u.pathname) + (u.search ? "?…" : "");
+  if (path.length > 22) path = path.slice(0, 21) + "…";
+  const inner = label
+    ? `<span class="lk-label">${escHtml(label)}</span>`
+    : `<span class="lk-host">${escHtml(host)}</span><span class="lk-path">${escHtml(path)}</span>`;
+  return `<a class="chat-link" href="${escHtml(u.href)}" target="_blank" rel="noopener noreferrer" title="${escHtml(u.href)}">${inner}${_EXT_ICON}</a>`;
+}
+
+function chatTokens(text) {
+  const out = [];
+  if (typeof text !== "string") return out;
+  let m;
+  _TOKEN_RE.lastIndex = 0;
+  while ((m = _TOKEN_RE.exec(text)) !== null) {
+    if (m[1]) {
+      const mm = /^\[([^\]]+)\]\((.+)\)$/.exec(m[1]);
+      const chip = mm && _linkChip(mm[2], mm[1]);
+      out.push(
+        chip
+          ? { kind: "link", html: chip }
+          : { kind: "word", html: escHtml(m[1]) },
+      );
+    } else if (m[2]) {
+      const chip = _linkChip(m[2], "");
+      out.push(
+        chip
+          ? { kind: "link", html: chip }
+          : { kind: "word", html: escHtml(m[2]) },
+      );
+    } else if (m[3])
+      out.push({
+        kind: "word",
+        html: `<strong>${escHtml(m[3].slice(2, -2))}</strong>`,
+      });
+    else if (m[4])
+      out.push({ kind: "br", html: m[4].length > 1 ? "<br><br>" : "<br>" });
+    else if (m[5]) out.push({ kind: "space", html: " " });
+    else out.push({ kind: "word", html: escHtml(m[6]), raw: m[6] });
+  }
+  return out;
+}
+
+function linkify(text) {
+  return chatTokens(text)
+    .map((t) => t.html)
+    .join("");
 }
 function fmtTime(t) {
   if (!t) return "";
@@ -108,6 +125,9 @@ function safeLink(url) {
   return s;
 }
 
+/* ============================================================
+   Modals
+   ============================================================ */
 function closeModal() {
   const m = document.getElementById("app-modal");
   if (m) m.remove();
@@ -194,7 +214,7 @@ async function showCheckInDialog() {
   } catch (e) {}
   openModal(
     "Check-in",
-    escHtml(promptMsg),
+    linkify(promptMsg),
     `
     <button class="btn btn-ghost" onclick="respondCheckIn(false)">No — didn't do it</button>
     <button class="btn" onclick="respondCheckIn(true)">Yes — done</button>
@@ -310,7 +330,9 @@ async function syncTimezone() {
         method: "PUT",
         body: JSON.stringify({ timezone: tz }),
       });
-  } catch (e) {}
+  } catch (e) {
+    /* the server falls back to UTC — harmless */
+  }
 }
 function enterApp() {
   document.getElementById("auth-screen").classList.add("hidden");
@@ -336,16 +358,23 @@ async function refreshFootMomentum() {
     if (dn)
       dn.innerHTML = `${escHtml(userName || "")}<small>momentum ${escHtml(m.momentum)}</small>`;
     el.dataset.momentum = m.momentum;
-  } catch (e) {}
+  } catch (e) {
+    /* silent */
+  }
 }
 
+/* ============================================================
+   Cinematic onboarding — first-run seat & demo files
+   ============================================================ */
 async function maybeOnboarding() {
   if (!token) return;
   try {
     const goals = await api("/goals");
     if (goals.length > 0) return; // already has real files
     showOnboarding(onboardSeed);
-  } catch (e) {}
+  } catch (e) {
+    /* board may be loading; skip */
+  }
 }
 function showOnboarding(onDone) {
   closeModal();
@@ -417,6 +446,10 @@ async function onboardSeedGo() {
 }
 const onboardSeed = onboardSeedGo;
 
+/* ============================================================
+   Navigation & router — hash-backed so refresh keeps the page and
+   the browser back button works.
+   ============================================================ */
 const KNOWN_SCREENS = [
   "today",
   "board",
@@ -430,6 +463,8 @@ const KNOWN_SCREENS = [
 let _hashLock = false;
 
 function navigate(screen, param, fromHash) {
+  // The chat is a persistent side panel now, not a screen. Legacy #global-chat
+  // links and the rail button open it over whatever page you're on.
   if (screen === "global-chat") {
     openChatPanel();
     screen = "today";
@@ -451,7 +486,7 @@ function navigate(screen, param, fromHash) {
   }
   currentScreen = screen;
   document
-    .querySelectorAll(".dock-item[data-screen]")
+    .querySelectorAll(".itab[data-screen]")
     .forEach((n) => n.classList.toggle("active", n.dataset.screen === screen));
   const main = document.getElementById("main-content");
   main.classList.remove("scene-in");
@@ -461,31 +496,24 @@ function navigate(screen, param, fromHash) {
     case "today":
       renderToday(main);
       break;
-
     case "board":
       renderBoard(main);
       break;
-
     case "goals":
       renderGoals(main);
       break;
-
     case "new-goal":
       renderNewGoal(main);
       break;
-
     case "goal":
       renderGoalDetail(main, param);
       break;
-
     case "schedule":
       renderSchedule(main);
       break;
-
     case "settings":
       renderSettings(main);
       break;
-
     default:
       renderToday(main);
   }
@@ -496,7 +524,6 @@ function routeFromHash() {
   const raw = (location.hash || "").replace(/^#/, "");
   if (!raw) return false;
   const [screen, param] = raw.split("/");
-
   const s = screen || "today";
   if (!KNOWN_SCREENS.includes(s)) return false;
   navigate(s, param ? decodeURIComponent(param) : undefined, true);
@@ -507,6 +534,9 @@ window.addEventListener("hashchange", () => {
   routeFromHash();
 });
 
+/* ============================================================
+   Today
+   ============================================================ */
 async function renderToday(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Today —</div><h1>…</h1></div>`;
   try {
@@ -550,10 +580,14 @@ async function renderToday(el) {
             .join("")}</div>
         </div>`;
       }
-    } catch (e) {}
+    } catch (e) {
+      /* triage is optional */
+    }
     try {
       html += await renderDayHero();
-    } catch (e) {}
+    } catch (e) {
+      /* dial is optional */
+    }
     html += `<div class="schedule-grid">`;
     if (today.items.length === 0) {
       html += `<div class="empty-state compose"><div class="big">&#x2737;</div><h3>Nothing booked today.</h3><p>File a goal and Eloise draws the lines.</p></div>`;
@@ -576,6 +610,7 @@ async function renderToday(el) {
     }
     html += `</div>`;
 
+    // Risk board
     try {
       const sb = await api("/scoreboard");
       if (sb.goals && sb.goals.length) {
@@ -590,6 +625,7 @@ async function renderToday(el) {
       }
     } catch (e) {}
 
+    // model status footer
     html += `<div style="margin-top:auto;padding-top:40px;display:flex;align-items:center;gap:10px;color:var(--bone-mute);font-size:12px;flex-wrap:wrap;">
       <span class="ember-dot"></span>
       ${
@@ -603,11 +639,16 @@ async function renderToday(el) {
     </div>`; // close .screen-fill
 
     el.innerHTML = html;
+    staggerIn(el, ".schedule-day");
   } catch (e) {
     el.innerHTML = `<div class="page-header"><div class="kicker">Today</div><h1>Nothing loads.</h1><p class="sub">${escHtml(e.message)}</p></div>`;
   }
 }
 
+/* ============================================================
+   Day Dial — the whole 24h as a ring: sleep/meals/busy on the outer
+   rail, planned tasks on the main track, a needle for "now".
+   ============================================================ */
 const _DIAL_COLORS = [
   "#ffb25b",
   "#ff6b86",
@@ -729,6 +770,9 @@ async function ackIntervention(interventionId, goalId) {
   navigate("today");
 }
 
+/* ============================================================
+   Board — momentum, pressure, stakes (the "how'd they do that" view)
+   ============================================================ */
 async function renderBoard(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Board</div><h1>…</h1></div>`;
   try {
@@ -739,6 +783,7 @@ async function renderBoard(el) {
       <div class="header-rule"></div>
     </div>`;
 
+    // momentum dial
     const m = mom;
     const momCls = m.momentum >= 70 ? "ok" : m.momentum >= 40 ? "hot" : "bad";
     html += `<div class="card momentum-card">
@@ -759,6 +804,7 @@ async function renderBoard(el) {
       </div>
     </div>`;
 
+    // pressure ranked list
     html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">Pressure ranking</div>
       <h1>Who's sliding.</h1><div class="header-rule"></div></div>`;
     const withP = goals
@@ -788,7 +834,22 @@ async function renderBoard(el) {
       html += `</div>`;
     }
 
-    html += `</div>`;
+    // — stakes removed per user request — //
+    /* if (m.stakes && m.stakes.length > 0) {
+      html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">On the line</div>
+        <h1>Debt.</h1><div class="header-rule"></div></div>`;
+      m.stakes.forEach(s => {
+        html += `<div class="card stake-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div style="flex:1;"><span class="chip bad">STAKED</span> <strong style="color:var(--bone);">${escHtml(s.punishment)}</strong>
+              <span class="sub" style="margin:6px 0 0;display:block;color:var(--bone-dim);">if <strong style="color:var(--bone);">${escHtml(s.display_title)}</strong> slips, this comes due.</span></div>
+            <button class="btn btn-sm btn-danger" style="color:#fff;" onclick="callInDebt(${escHtml(s.goal_id)})">Call it in</button>
+          </div>
+        </div>`;
+      });
+    } */
+
+    html += `</div>`; // close .screen-fill
     el.innerHTML = html;
   } catch (e) {
     el.innerHTML = `<div class="page-header"><div class="kicker">Board</div><h1>Nothing loads.</h1><p class="sub">${escHtml(e.message)}</p></div>`;
@@ -804,6 +865,9 @@ async function callInDebt(goalId) {
   }
 }
 
+/* ============================================================
+   Goals
+   ============================================================ */
 async function renderGoals(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Goals</div><h1>…</h1></div>`;
   try {
@@ -854,6 +918,9 @@ async function renderGoals(el) {
   }
 }
 
+/* ============================================================
+   Goal detail
+   ============================================================ */
 async function renderGoalDetail(el, id) {
   el.innerHTML = `<div class="page-header"><div class="kicker">On file</div><h1>…</h1></div>`;
   try {
@@ -865,12 +932,14 @@ async function renderGoalDetail(el, id) {
       <div class="header-rule"></div>
     </div>`;
 
+    // actions
     html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;">
       <button class="btn btn-sm btn-ghost" onclick="regenPlan(${g.id})">Redraw schedule</button>
       <button class="btn btn-sm btn-ghost" onclick="completeGoalFlow(${g.id})">Mark done</button>
       <button class="btn btn-sm btn-ghost" onclick="cancelGoalFlow(${g.id})">Cancel / Delay</button>
     </div>`;
 
+    // pressure meter header strip
     if (g.pressure) {
       const pc = g.pressure.score;
       const pcl = pc >= 8 ? "bad" : pc >= 6 ? "hot" : pc >= 4 ? "warn" : "ok";
@@ -888,6 +957,17 @@ async function renderGoalDetail(el, id) {
     }
 
     try {
+      const rt = await api("/routine");
+      if (rt.assumed && rt.assumed.length) {
+        html += `<div class="card call-card"><div class="kicker">Assuming</div>
+          <p style="margin:0">${escHtml(rt.assumed.join("; "))}. Wrong? Tell Eloise in chat, e.g. "I sleep 1am to 9am" or "gym is 7 to 8am", and every plan redraws.</p></div>`;
+      }
+    } catch (e) {
+      /* optional */
+    }
+
+    // roadmap: monthly/weekly outline for far-off goals
+    try {
       const ro = await api(`/outline/${g.id}`);
       if (ro.outline && ro.outline.periods && ro.outline.periods.length) {
         const t0 = localISO(new Date());
@@ -903,10 +983,14 @@ async function renderGoalDetail(el, id) {
         });
         html += `</div>`;
       }
-    } catch (e) {}
+    } catch (e) {
+      /* roadmap is optional */
+    }
 
+    // tabs
     html += `<div class="tabs"><span class="tab active" onclick="switchTab('schedule','${g.id}')">Schedule</span><span class="tab" onclick="switchTab('progress','${g.id}')">Progress</span><span class="tab" onclick="switchTab('constraints','${g.id}')">Constraints</span></div>`;
 
+    // schedule
     html += `<div id="detail-schedule"><div class="schedule-grid">`;
     const byDate = {};
     (g.plan || []).forEach((a) => {
@@ -915,7 +999,7 @@ async function renderGoalDetail(el, id) {
     const dates = Object.keys(byDate).sort();
     if (dates.length === 0) {
       if (String(g.plan_status).startsWith("blocked") && g.plan_summary) {
-        html += `<div class="empty-state"><h3>No free time to schedule</h3><p style="max-width:420px;font-size:14px;line-height:1.7;color:var(--bone-dim);">${escHtml(g.plan_summary)}</p><p style="font-size:13px;color:var(--copper);">Eloise plans every goal around the same windows — relax one in Settings &rarr; Always-Busy Windows, then Redraw schedule.</p></div>`;
+        html += `<div class="empty-state"><h3>No free time to schedule</h3><p style="max-width:420px;font-size:14px;line-height:1.7;color:var(--bone-dim);">${escHtml(g.plan_summary)}</p><p style="font-size:13px;color:var(--copper);">Eloise plans every goal around the same windows — tell Eloise in chat which window to free up, then Redraw schedule.</p></div>`;
       } else {
         html += `<div class="empty-state"><h3>No schedule drawn yet</h3></div>`;
       }
@@ -942,6 +1026,7 @@ async function renderGoalDetail(el, id) {
     }
     html += `</div></div>`;
 
+    // progress (hidden)
     const p = g.progress;
     html += `<div id="detail-progress" style="display:none;">
       <div class="card" style="margin-bottom:16px;"><p style="font-size:14px;line-height:1.7;color:var(--bone-dim);">${escHtml(p.narrative)}</p></div>
@@ -953,6 +1038,7 @@ async function renderGoalDetail(el, id) {
       </div>
     </div>`;
 
+    // constraints (hidden)
     html += `<div id="detail-constraints" style="display:none;">`;
     const cons = g.constraints || [];
     if (cons.length === 0) {
@@ -974,6 +1060,23 @@ async function renderGoalDetail(el, id) {
     </div>`;
 
     el.innerHTML = html;
+    staggerIn(el, ".schedule-day");
+    if (g.plan_status === "generating") {
+      const note = document.createElement("div");
+      note.className = "plan-generating";
+      note.innerHTML = planProgressHtml(["Starting"], 0, 0);
+      el.prepend(note);
+      waitPlanSettles(g.id, 150, (prog, sec) => {
+        if (currentScreen !== "goal") return;
+        note.innerHTML = planProgressHtml(
+          prog.steps,
+          prog.at < 0 ? 0 : prog.at,
+          sec,
+        );
+      }).then((r) => {
+        if (r && currentScreen === "goal") renderGoalDetail(el, g.id);
+      });
+    }
     mountGoalChat(g.id);
   } catch (e) {
     el.innerHTML = `<div class="page-header"><div class="kicker">On file</div><h1>Missing file.</h1><p class="sub">${escHtml(e.message)}</p></div>`;
@@ -1083,15 +1186,47 @@ async function refreshGoal(id) {
   if (main && currentScreen === "goal") await renderGoalDetail(main, id);
 }
 
+function planProgressHtml(steps, at, sec, title) {
+  return `<div><strong>${escHtml(title || "Drawing your schedule")}</strong>
+    <ul class="plan-steps">${steps
+      .map((t, i) => {
+        const st = i < at ? "done" : i === at ? "live" : "";
+        return `<li class="${st}"><i></i><span>${escHtml(t)}</span><b>${i === at ? sec + "s" : ""}</b></li>`;
+      })
+      .join("")}</ul></div>`;
+}
+
+async function waitPlanSettles(id, attempts = 150, onTick) {
+  const t0 = Date.now();
+  for (let i = 0; i < attempts; i++) {
+    let prog = null;
+    try {
+      prog = await api(`/goals/${id}/plan-progress`);
+    } catch (e) {}
+    if (prog && onTick) onTick(prog, Math.floor((Date.now() - t0) / 1000));
+    if (i % 2 === 0) {
+      try {
+        const g = await api(`/goals/${id}`);
+        if (g.plan_status !== "generating") return g;
+      } catch (e) {}
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  return null;
+}
+
 async function regenPlan(id) {
   const main = document.getElementById("main-content");
   if (!main) return;
   const note = document.createElement("div");
   note.className = "plan-generating";
   note.id = "plan-generating-note";
-  note.innerHTML = `<span class="typing-bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span>
-    <div><strong>Redraw kicked off.</strong><br>
-    <span style="font-size:13px;color:var(--bone-dim);">The brain is redrawing in the background. Your current schedule stays until the new one lands.</span></div>`;
+  note.innerHTML = planProgressHtml(
+    ["Waiting for a free slot in the queue"],
+    0,
+    0,
+    "Redraw started",
+  );
   main.prepend(note);
   note.scrollIntoView({ behavior: "smooth", block: "center" });
   let posted = false;
@@ -1101,14 +1236,21 @@ async function regenPlan(id) {
   } catch (e) {
     showToast(e.message, "error");
   }
-  // Keep the current schedule visible until the background redraw settles.
   let settled = null;
-  if (posted) settled = await waitPlanSettles(id);
+  if (posted)
+    settled = await waitPlanSettles(id, 150, (prog, sec) => {
+      note.innerHTML = planProgressHtml(
+        prog.steps,
+        prog.at < 0 ? 0 : prog.at,
+        sec,
+        "Your current schedule stays until the new one lands",
+      );
+    });
   const nx = document.getElementById("plan-generating-note");
   if (nx) nx.remove();
   if (posted && settled && String(settled.plan_status).startsWith("blocked")) {
     showToast(
-      "No free time to schedule \u2014 adjust your Always-Busy Windows once and redraw: " +
+      "No free time to schedule. Tell Eloise in chat which window to free up, then redraw: " +
         (settled.plan_summary || ""),
       "error",
     );
@@ -1118,19 +1260,19 @@ async function regenPlan(id) {
     String(settled.plan_summary).startsWith("kept previous")
   ) {
     showToast(
-      "Couldn\u2019t reach the model \u2014 kept your current schedule. Retrying in a minute.",
+      "Couldn’t reach the model — kept your current schedule. Retrying in a minute.",
       "error",
     );
   } else if (posted && settled) {
     showToast(
       "New schedule drawn" +
-        (settled.plan_summary ? " \u2014 " + settled.plan_summary : "") +
+        (settled.plan_summary ? " — " + settled.plan_summary : "") +
         ".",
       "success",
     );
   } else if (posted) {
     showToast(
-      "Still drawing in the background \u2014 it will appear here shortly.",
+      "Still drawing in the background — it will appear here shortly.",
       "info",
     );
   }
@@ -1139,17 +1281,13 @@ async function regenPlan(id) {
   } catch (e) {}
 }
 
-async function waitPlanSettles(id, attempts = 36) {
-  // The draw returns to active on success or failure.
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const g = await api(`/goals/${id}`);
-      if (g.plan_status !== "generating") return g;
-    } catch (e) {}
-    await new Promise((r) => setTimeout(r, 2500));
-  }
-  return null;
+function staggerIn(root, sel) {
+  (root || document).querySelectorAll(sel).forEach((n, i) => {
+    n.style.setProperty("--i", Math.min(i, 24));
+    n.classList.add("stagger-in");
+  });
 }
+
 async function deleteGoal(id) {
   const ok = await confirmModal(
     "Burn the file?",
@@ -1168,6 +1306,9 @@ async function deleteGoal(id) {
   } catch (e) {}
 }
 
+/* ============================================================
+   New goal
+   ============================================================ */
 function renderNewGoal(el) {
   let html = `<div class="page-header"><div class="kicker">New file</div><h1>What's on the table.</h1><p class="sub">Give it a name, a date, and what's off-limits.</p><div class="header-rule"></div></div>
     <div class="card">
@@ -1226,16 +1367,24 @@ async function createGoal() {
         constraints: window._constraints || [],
       }),
     });
-    // Generate questions per goal, but never block goal creation on the model.
+    let assumed = [];
     try {
       const c = await api(`/goals/${r.id}/clarify`, { method: "POST" });
+      assumed = c.assumed || [];
       if (c.questions && c.questions.length > 0) {
         showQuestionnaire(r.id, title, c.questions);
         return;
       }
-    } catch (qe) {}
-    showToast("Filed. Eloise draws the lines.", "success");
-    navigate("goals");
+    } catch (qe) {
+      /* model unreachable: no questions, assumptions below */
+    }
+    showToast(
+      assumed.length
+        ? `Filed. No questions (model offline), so I assumed ${assumed.join("; ")}. Tell Eloise in chat to change it.`
+        : "Filed. Eloise draws the lines.",
+      "success",
+    );
+    navigate("goal", r.id);
   } catch (e) {
     showToast(e.message, "error");
   }
@@ -1244,18 +1393,17 @@ async function createGoal() {
 function showQuestionnaire(goalId, goalTitle, questions) {
   const main = document.getElementById("main-content");
   let html = `<div class="page-header"><div class="kicker">Filing: ${escHtml(goalTitle)}</div>
-    <h1>Answer these.</h1><p class="sub">Eloise needs specifics to build a real schedule. Not vibes.</p>
+    <h1>Quick ones.</h1><p class="sub">Only what I can't work out myself. Skip any you like.</p>
     <div class="header-rule"></div></div>`;
   html += `<form id="questionnaire-form" onsubmit="submitQuestionnaire(event, ${goalId})">`;
   questions.forEach((q, i) => {
     html += `<div class="card" style="margin-bottom:16px;">
       <label style="display:block;font-weight:700;color:var(--bone);margin-bottom:6px;">${escHtml(q.q)}</label>
-      <p style="font-size:12px;color:var(--bone-dim);margin:0 0 8px;">${escHtml(q.hint)}</p>
       <input type="text" name="${escHtml(q.key)}" placeholder="${escHtml(q.hint)}" style="width:100%;padding:10px;background:var(--ink);border:1px solid var(--line);border-radius:4px;color:var(--bone);font-size:14px;">
     </div>`;
   });
   html += `<div style="display:flex;gap:10px;">
-    <button type="submit" class="btn">Save & regenerate schedule</button>
+    <button type="submit" class="btn">Build my schedule</button>
     <button type="button" class="btn btn-ghost" onclick="navigate('goals')">Skip</button>
   </div></form>`;
   main.innerHTML = html;
@@ -1280,6 +1428,9 @@ async function submitQuestionnaire(e, goalId) {
   navigate("goal", goalId);
 }
 
+/* ============================================================
+   Schedule
+   ============================================================ */
 async function renderSchedule(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Schedule</div><h1>…</h1></div>`;
   try {
@@ -1300,7 +1451,7 @@ async function renderSchedule(el) {
         );
       }
     }
-    // Show missed check-ins first, followed by today and future dates.
+    // Past-due first (most recent miss on top), today, then the future.
     const sorted = Object.keys(dates).sort((a, b) => {
       const ap = a < today,
         bp = b < today;
@@ -1366,6 +1517,7 @@ async function renderSchedule(el) {
       html += `</div>`;
     }
     el.innerHTML = html;
+    staggerIn(el, ".schedule-day");
   } catch (e) {
     el.innerHTML = `<div class="page-header"><div class="kicker">Schedule</div><h1>Nothing loads.</h1><p class="sub">${escHtml(e.message)}</p></div>`;
   }
@@ -1402,6 +1554,7 @@ async function toggleTask(id, btn) {
     const head = day && day.querySelector(".sdh-right");
     if (!head) return;
     const bar = head.querySelector(".prog-bar>span");
+    // refetch to recompute counters
     const items = Array.from(
       row.parentElement.querySelectorAll(".schedule-row"),
     );
@@ -1420,6 +1573,12 @@ let _chatMounted = false;
 
 function _bindKeys() {
   document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      const d = document.getElementById("desk-input");
+      if (d) d.focus();
+      return;
+    }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     const tag = (e.target && e.target.tagName) || "";
     if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
@@ -1440,7 +1599,43 @@ function _bindKeys() {
       return;
     }
     if (e.key === "c" || e.key === "C") toggleChatPanel();
+    if (e.key === "/") {
+      e.preventDefault();
+      const d = document.getElementById("desk-input");
+      if (d) d.focus();
+    }
   });
+}
+
+const _DESK_HINTS = [
+  "Tell Eloise what you finished...",
+  "Ask what to cut today...",
+  'Say "show my schedule"...',
+  'Say "I sleep 1am to 9am"...',
+  'Say "cancel the exam goal"...',
+];
+let _deskHint = 0;
+function deskSend(e) {
+  if (e) e.preventDefault();
+  const inp = document.getElementById("desk-input");
+  const v = (inp.value || "").trim();
+  if (!v) {
+    toggleChatPanel();
+    return false;
+  }
+  inp.value = "";
+  sendGlobalChat(v);
+  return false;
+}
+function _deskInit() {
+  const inp = document.getElementById("desk-input");
+  if (!inp || inp._init) return;
+  inp._init = true;
+  setInterval(() => {
+    if (document.activeElement === inp || inp.value) return;
+    _deskHint = (_deskHint + 1) % _DESK_HINTS.length;
+    inp.placeholder = _DESK_HINTS[_deskHint];
+  }, 6000);
 }
 
 function toggleChatPanel(force) {
@@ -1493,6 +1688,8 @@ async function mountChatPanel() {
   }
 }
 
+/* Live model/provider line in the panel header — so "is chat even on?" is
+   answerable at a glance instead of guessing from a dead screen. */
 async function refreshPanelModel() {
   const el = document.getElementById("panel-model");
   if (!el) return;
@@ -1510,85 +1707,227 @@ async function refreshPanelModel() {
     el.className = "panel-model dead";
   }
 }
+function _srcTag(source) {
+  if (
+    !source ||
+    [
+      "fallback",
+      "completion",
+      "guardrail",
+      "proposal",
+      "routine",
+      "quick",
+      "nav",
+    ].includes(source)
+  )
+    return null;
+  const tag = document.createElement("span");
+  tag.className = "chat-src";
+  tag.textContent = source === "ollama" ? "local" : source;
+  return tag;
+}
+
 function appendChatMsg(container, role, text, source) {
   const div = document.createElement("div");
   div.className = "chat-msg " + role;
   div.innerHTML = linkify(text);
-  if (
-    role === "eloise" &&
-    source &&
-    source !== "fallback" &&
-    source !== "completion"
-  ) {
-    const tag = document.createElement("span");
-    tag.className = "chat-src";
-    tag.textContent = source === "ollama" ? "local" : source;
-    div.appendChild(tag);
-  }
+  const tag = role === "eloise" ? _srcTag(source) : null;
+  if (tag) div.appendChild(tag);
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
   return div;
 }
 
-function addTyping(container) {
+/* Progress card: only steps that really happened. Server stage frames tick the
+   board step and name the model; the timer is the real wait. */
+function addTyping(container, opts) {
+  const o = Object.assign({ llm: true }, opts || {});
   const div = document.createElement("div");
-  div.className = "chat-msg eloise typing";
-  const phrases = [
-    "reading your message...",
-    "checking the board...",
-    "thinking...",
-    "writing the reply...",
-    "wrapping up...",
-    "nearly there...",
-  ];
-  div.innerHTML = `<span class="typing-bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span><span class="typing-status">${phrases[0]}</span>`;
+  div.className = "chat-msg eloise working";
+  const steps = o.llm
+    ? [
+        ["got", "Got your message", "done"],
+        ["board", "Reading your board and routine", "live"],
+        ["model", "Waiting on the model", "idle"],
+      ]
+    : [
+        ["got", "Got it", "done"],
+        ["board", "Checking your board", "live"],
+      ];
+  div.innerHTML =
+    '<ul class="steps">' +
+    steps
+      .map(
+        ([k, t, st]) =>
+          `<li data-k="${k}" class="${st}"><i></i><span>${t}</span><b></b></li>`,
+      )
+      .join("") +
+    '</ul><div class="work-note"></div>';
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
-  let i = 0;
-  const statusEl = div.querySelector(".typing-status");
-  div._typingTimer = setInterval(() => {
-    i = (i + 1) % phrases.length;
-    if (statusEl && div.parentNode) statusEl.textContent = phrases[i];
-  }, 2600);
+  const t0 = Date.now();
+  div._label = "the model";
+  div._timer = setInterval(() => {
+    if (!div.parentNode) {
+      clearInterval(div._timer);
+      return;
+    }
+    const sec = Math.floor((Date.now() - t0) / 1000);
+    const live = div.querySelector("li.live b");
+    if (live) live.textContent = sec + "s";
+    const note = div.querySelector(".work-note");
+    if (note) {
+      if (sec >= 45)
+        note.textContent = `Slow answer from ${div._label}. Still waiting. It won't get lost, keep working if you want.`;
+      else if (sec >= 14)
+        note.textContent = "Long one. I am still on it, you can keep working.";
+    }
+  }, 500);
   return div;
+}
+function stageEvent(bubble, ev) {
+  if (!bubble || !bubble.classList.contains("working")) return;
+  const set = (k, st, text) => {
+    const li = bubble.querySelector(`li[data-k="${k}"]`);
+    if (!li) return;
+    li.className = st;
+    if (text) li.querySelector("span").textContent = text;
+    if (st === "done") li.querySelector("b").textContent = "";
+  };
+  if (ev.stage === "board") {
+    set("board", "done");
+  }
+  if (ev.stage === "model") {
+    bubble._label = ev.label || "the model";
+    set("board", "done");
+    set("model", "live", "Waiting on " + bubble._label);
+  }
+}
+function _stopWorking(bubble) {
+  if (bubble._timer) {
+    clearInterval(bubble._timer);
+    bubble._timer = null;
+  }
+  bubble.classList.remove("working");
 }
 function finishTyping(bubble, text, source) {
-  if (bubble._typingTimer) {
-    clearInterval(bubble._typingTimer);
-    bubble._typingTimer = null;
-  }
-  bubble.classList.remove("typing");
+  if (bubble._writer) bubble._writer.stop();
+  _stopWorking(bubble);
   bubble.innerHTML = "";
   const txt = document.createElement("span");
   txt.innerHTML = linkify(text);
   bubble.appendChild(txt);
-  // Include OpenAI-compatible providers in the source badge.
-  if (
-    source &&
-    source !== "fallback" &&
-    source !== "completion" &&
-    source !== "guardrail"
-  ) {
-    const tag = document.createElement("span");
-    tag.className = "chat-src";
-    tag.textContent = source === "ollama" ? "local" : source;
-    bubble.appendChild(tag);
-  }
-  bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
+  const tag = _srcTag(source);
+  if (tag) bubble.appendChild(tag);
+  if (bubble.parentNode)
+    bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
 }
 
-function setTypingText(bubble, text) {
-  if (!bubble || !bubble.parentNode) return;
-  if (bubble._typingTimer) {
-    clearInterval(bubble._typingTimer);
-    bubble._typingTimer = null;
-  }
-  bubble.classList.remove("typing");
-  bubble.innerHTML = "";
-  const txt = document.createElement("span");
-  txt.innerHTML = linkify(text);
-  bubble.appendChild(txt);
-  bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
+function makeWriter(bubble, scrollEl) {
+  const w = {
+    tokens: [],
+    shown: 0,
+    text: "",
+    final: false,
+    timer: null,
+    t0: Date.now(),
+    body: null,
+    caret: null,
+    meta: null,
+    words: 0,
+    done: null,
+    source: null,
+  };
+  const ensure = () => {
+    if (w.body) return;
+    _stopWorking(bubble);
+    bubble.innerHTML = "";
+    w.body = document.createElement("span");
+    w.body.className = "say";
+    w.caret = document.createElement("i");
+    w.caret.className = "say-caret";
+    w.meta = document.createElement("div");
+    w.meta.className = "say-meta";
+    bubble.append(w.body, w.caret, w.meta);
+  };
+  const delayFor = (t) => {
+    const backlog = w.tokens.length - w.shown;
+    const speed = backlog > 80 ? 0.2 : backlog > 40 ? 0.5 : 1;
+    let d = 30;
+    if (t.kind === "link") d = 140;
+    else if (t.kind === "br") d = 420;
+    else if (t.raw) {
+      d = 22 + Math.min(t.raw.length, 12) * 4;
+      if (/[.!?…]["')\]]*$/.test(t.raw)) d += 300;
+      else if (/[,;:—-]$/.test(t.raw)) d += 130;
+    }
+    return d * speed;
+  };
+  const sync = () => {
+    const cut = w.final
+      ? w.text
+      : w.text.slice(
+          0,
+          Math.max(w.text.lastIndexOf(" "), w.text.lastIndexOf("\n")) + 1,
+        );
+    const toks = chatTokens(cut);
+    if (toks.length > w.tokens.length) w.tokens = toks;
+  };
+  const tick = () => {
+    w.timer = null;
+    ensure();
+    while (w.shown < w.tokens.length && w.tokens[w.shown].kind === "space") {
+      w.body.appendChild(document.createTextNode(" "));
+      w.shown++;
+    }
+    if (w.shown < w.tokens.length) {
+      const t = w.tokens[w.shown++];
+      const span = document.createElement("span");
+      span.className = "w";
+      span.innerHTML = t.html;
+      w.body.appendChild(span);
+      if (t.kind === "word" || t.kind === "link") w.words++;
+      const sec = Math.round((Date.now() - w.t0) / 1000);
+      w.meta.textContent = `writing - ${w.words} words - ${sec}s`;
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+      w.timer = setTimeout(tick, delayFor(t));
+    } else if (w.final) {
+      w.caret.remove();
+      w.meta.remove();
+      const tag = _srcTag(w.source);
+      if (tag) bubble.appendChild(tag);
+      if (w.done) w.done();
+    }
+  };
+  w.feed = (full) => {
+    w.text = full;
+    sync();
+    if (!w.timer) w.timer = setTimeout(tick, 0);
+  };
+  w.end = (source) =>
+    new Promise((resolve) => {
+      w.source = source;
+      w.final = true;
+      w.done = resolve;
+      sync();
+      if (!w.timer) w.timer = setTimeout(tick, 0);
+    });
+  w.stop = () => {
+    if (w.timer) clearTimeout(w.timer);
+    w.timer = null;
+    if (w.caret) w.caret.remove();
+    if (w.meta) w.meta.remove();
+  };
+  bubble._writer = w;
+  return w;
+}
+
+function doUi(ui) {
+  if (!ui) return;
+  setTimeout(() => {
+    if (ui.screen === "goal") navigate("goal", ui.id);
+    else navigate(ui.screen);
+  }, 450);
 }
 
 async function quickChat(cmd) {
@@ -1600,13 +1939,16 @@ async function quickChat(cmd) {
     return;
   }
   chatEl._busy = true;
-  const bubble = addTyping(chatEl);
+  const bubble = addTyping(chatEl, { llm: false });
   try {
     const r = await api("/chat/quick", {
       method: "POST",
       body: JSON.stringify({ command: cmd.toLowerCase() }),
     });
-    finishTyping(bubble, r.reply, r.source);
+    const wr = makeWriter(bubble, chatEl);
+    wr.feed(r.reply);
+    await wr.end(r.source);
+    if (r.proposal) addProposal(bubble, r.proposal);
   } catch (e) {
     finishTyping(bubble, e.message, null);
     bubble.classList.add("chat-error");
@@ -1615,7 +1957,47 @@ async function quickChat(cmd) {
   }
 }
 
-async function streamChatReply(goalId, message, onDelta) {
+function addProposal(bubble, prop) {
+  const row = document.createElement("div");
+  row.className = "proposal";
+  const mk = (label, accept, cls) => {
+    const b = document.createElement("button");
+    b.className = cls;
+    b.textContent = label;
+    b.onclick = async () => {
+      row.querySelectorAll("button").forEach((x) => (x.disabled = true));
+      try {
+        const r = await api("/chat/confirm", {
+          method: "POST",
+          body: JSON.stringify({ proposal_id: prop.id, accept }),
+        });
+        row.textContent = r.message;
+        row.className = "proposal done";
+        if (r.applied && r.kind === "create_goal") navigate("goal", r.goal_id);
+        else if (r.applied) {
+          try {
+            navigate(
+              currentScreen,
+              decodeURIComponent(location.hash.split("/")[1] || ""),
+              true,
+            );
+          } catch (e) {}
+        }
+      } catch (e) {
+        row.textContent = e.message;
+        row.className = "proposal done";
+      }
+    };
+    return b;
+  };
+  row.appendChild(mk("Confirm", true, "btn btn-primary"));
+  row.appendChild(mk("Never mind", false, "btn btn-ghost"));
+  bubble.appendChild(row);
+  if (bubble.parentNode)
+    bubble.parentNode.scrollTop = bubble.parentNode.scrollHeight;
+}
+
+async function streamChatReply(goalId, message, onDelta, onEvent) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers["Authorization"] = "Bearer " + token;
   const ctrl = new AbortController();
@@ -1663,6 +2045,8 @@ async function streamChatReply(goalId, message, onDelta) {
   let buf = "";
   let full = "";
   let source = null;
+  let proposal = null;
+  let ui = null;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -1683,12 +2067,15 @@ async function streamChatReply(goalId, message, onDelta) {
           const msg = ev.detail || "model connection dropped";
           throw new Error(msg);
         }
+        if (ev.stage && onEvent) onEvent(ev);
         if (ev.delta) {
           full += ev.delta;
           onDelta(full);
         }
         if (ev.done) {
           source = ev.source || source;
+          if (ev.proposal) proposal = ev.proposal;
+          if (ev.ui) ui = ev.ui;
         }
       }
     }
@@ -1702,43 +2089,50 @@ async function streamChatReply(goalId, message, onDelta) {
     throw e;
   }
   clearTimeout(idle);
-  // Reject empty model replies rather than displaying a blank bubble.
   if (!full) {
     throw new Error(
       "The model returned nothing usable — it may have echoed my prompt back or come out blank. Try rephrasing; if every reply is empty, open Settings and hit Test connection.",
     );
   }
-  return { text: full, source: source || "llm" };
+  return { text: full, source: source || "llm", proposal, ui };
 }
 
-async function sendGlobalChat() {
+async function sendGlobalChat(override) {
   const inp = document.getElementById("global-chat-input");
   const chatEl = document.getElementById("chat-container");
-  if (!inp || !chatEl) return;
+  if (!chatEl) return;
   openChatPanel();
   if (chatEl._busy) {
     showToast("I'm still answering the last one", "error");
     return;
   }
-  const msg = (inp.value || "").trim();
+  const msg = (
+    typeof override === "string" ? override : (inp && inp.value) || ""
+  ).trim();
   if (!msg) return;
-  inp.value = "";
+  if (inp) inp.value = "";
   chatEl._busy = true;
+  document.body.classList.add("eloise-busy");
   appendChatMsg(chatEl, "user", msg);
-  chatEl._lastUserMsg = true;
   const bubble = addTyping(chatEl);
+  const writer = makeWriter(bubble, chatEl);
   try {
-    const r = await streamChatReply(null, msg, (partial) => {
-      setTypingText(bubble, partial);
-      chatEl.scrollTop = chatEl.scrollHeight;
-    });
-    finishTyping(bubble, r.text, r.source);
+    const r = await streamChatReply(
+      null,
+      msg,
+      (p) => writer.feed(p),
+      (ev) => stageEvent(bubble, ev),
+    );
+    await writer.end(r.source);
+    if (r.proposal) addProposal(bubble, r.proposal);
+    doUi(r.ui);
     refreshPanelModel();
   } catch (e) {
     finishTyping(bubble, e.message, null);
     bubble.classList.add("chat-error");
   } finally {
     chatEl._busy = false;
+    document.body.classList.remove("eloise-busy");
   }
 }
 
@@ -1769,12 +2163,17 @@ async function sendGoalChat(goalId) {
   cc._busy = true;
   appendChatMsg(cc, "user", msg);
   const bubble = addTyping(cc);
+  const writer = makeWriter(bubble, cc);
   try {
-    const r = await streamChatReply(goalId, msg, (partial) => {
-      setTypingText(bubble, partial);
-      cc.scrollTop = cc.scrollHeight;
-    });
-    finishTyping(bubble, r.text, r.source);
+    const r = await streamChatReply(
+      goalId,
+      msg,
+      (p) => writer.feed(p),
+      (ev) => stageEvent(bubble, ev),
+    );
+    await writer.end(r.source);
+    if (r.proposal) addProposal(bubble, r.proposal);
+    doUi(r.ui);
     if (r.source === "completion") setTimeout(() => navigate("goals"), 1000);
   } catch (e) {
     finishTyping(bubble, e.message, null);
@@ -1784,6 +2183,9 @@ async function sendGoalChat(goalId) {
   }
 }
 
+/* ============================================================
+   Settings
+   ============================================================ */
 async function renderSettings(el) {
   let html = `<div class="page-header"><div class="kicker">Settings</div><h1>Tuning the rig.</h1><div class="header-rule"></div></div>`;
   try {
@@ -1832,9 +2234,11 @@ async function renderSettings(el) {
           <input type="password" id="set-api-key" placeholder="paste it — the provider snaps to match" autocomplete="off">
           <p class="field-hint">Paste any key — OpenAI, Anthropic, Gemini, OpenRouter, Groq, Mistral, DeepSeek, xAI, Together and more. The endpoint and model are worked out and verified for you. Same persona on every provider. Blank keeps the saved key.</p>
         </div>
+        <details class="adv"><summary>Advanced: endpoint, model, local engine</summary>
         <div class="field"><label>API Base URL</label><input type="text" id="set-base-url" placeholder="https://openrouter.ai/api/v1"></div>
         <div class="field"><label>Model</label><input type="text" id="set-model" placeholder="e.g. meta-llama/llama-3.1-8b-instruct:free"></div>
         <div class="field"><label><input type="checkbox" id="set-enable-local" style="width:auto;margin-right:8px;">Also use a local Ollama engine (optional)</label></div>
+        </details>
         <div class="llm-actions">
           <button class="btn" style="width:auto;" onclick="saveLLMSettings()">Save &amp; Test</button>
           <button class="btn btn-ghost" style="width:auto;" onclick="testLLMSettings()">Test connection</button>
@@ -1843,47 +2247,24 @@ async function renderSettings(el) {
         <div id="llm-test-result" class="llm-test"></div>
       </div>
     </div>`;
-    html += `<div class="settings-section"><h3>Daily Check-in</h3>
-      <div class="card">
-        <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">Pick the hour Eloise checks in and emails your day at you.</p>
-        <div class="field"><label>Check-in time</label><input type="time" id="set-checkin-time"></div>
-        <button class="btn btn-ghost" style="width:auto;" onclick="saveCheckinTime()">Save Time</button>
-      </div>
-    </div>`;
-    html += `<div class="settings-section"><h3>Always-Busy Windows</h3>
-      <div class="card">
-        <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">Windows Eloise never schedules anything in — set once, respected by every goal. E.g. <strong>gym 5pm-7pm</strong>, <strong>class 9-11am</strong>.</p>
-        <div id="busy-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;"></div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <input type="text" id="busy-new" placeholder="gym 5-7pm" style="flex:1;min-width:180px;">
-          <button class="btn btn-ghost" style="width:auto;" onclick="addBusyWindow()">Add</button>
-          <button class="btn" style="width:auto;" onclick="saveBusyWindows()">Save</button>
-        </div>
-      </div>
-    </div>`;
-    html += `<div class="settings-section"><h3>Account</h3>
-      <div class="card">
-        <p style="font-size:13px;margin-bottom:12px;color:var(--bone-dim);">On the board as <strong style="color:var(--bone);">${escHtml(userName || "")}</strong></p>
-        <button class="btn btn-danger" style="width:auto;color:#fff;" onclick="logout()">Sign Out</button>
-      </div>
-    </div>`;
-    let persona = "";
-    try {
-      const ps = await api("/settings/persona");
-      persona = ps.persona || "";
-    } catch (e) {}
-    html += `<div class="settings-section"><h3>Persona</h3>
-      <div class="card">
-        <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">How Eloise talks to you. Set it here or in any chat ("be sarcastic", "never a motivational speaker") — it sticks and overrides the default tone.</p>
-        <div class="field"><textarea id="set-persona" rows="4" style="width:100%;min-height:88px;">${escHtml(persona)}</textarea></div>
-        <button class="btn" style="width:auto;" onclick="savePersona()">Save Persona</button>
-      </div>
-    </div>`;
     let locVal = "";
     try {
       const lc = await api("/settings/location");
       locVal = lc.location || "";
     } catch (e) {}
+    let rt = null;
+    try {
+      rt = await api("/routine");
+    } catch (e) {}
+    if (rt) {
+      html += `<div class="settings-section"><h3>Your routine</h3>
+      <div class="card">
+        <p style="font-size:15px;line-height:1.6;margin:0 0 10px;">${escHtml(rt.routine)}</p>
+        ${(rt.assumed || []).length ? `<p class="field-hint">Assumed, not told: ${escHtml(rt.assumed.join("; "))}.</p>` : ""}
+        <p class="field-hint">Every goal follows this one routine. To change it, tell Eloise: "I sleep 1am to 9am", "gym at 7am".</p>
+        <button class="btn btn-ghost" style="width:auto;" onclick="toggleChatPanel(true)">Tell Eloise</button>
+      </div></div>`;
+    }
     html += `<div class="settings-section"><h3>Location</h3>
       <div class="card">
         <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">Where you actually live. Chat and schedules only suggest services, shops and apps that exist here — no DoorDash in Lahore.</p>
@@ -1897,11 +2278,13 @@ async function renderSettings(el) {
       const inp = document.getElementById("set-checkin-time");
       if (me.checkin_time && inp) inp.value = me.checkin_time;
     } catch (e) {}
+    // Always-busy windows list
     window._busyWindows = [];
     try {
       const bw = await api("/settings/blocked-windows");
       window._busyWindows = bw.blocked_windows || [];
     } catch (e) {}
+    // Email channel section + on-demand digest
     let em = null;
     try {
       em = await api("/email/status");
@@ -1917,7 +2300,7 @@ async function renderSettings(el) {
       em && em.problems && em.problems.length
         ? `<ul class="problem-list">${em.problems.map((p) => `<li>${escHtml(p)}</li>`).join("")}</ul>`
         : "";
-    html += `<div class="settings-section"><h3>Email / Digests</h3>
+    html += `<div class="settings-section"><h3>Check-in and email</h3>
       <div class="card">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
           <span class="chip ${emCls}">${emLabel}</span>
@@ -1926,7 +2309,9 @@ async function renderSettings(el) {
         </div>
         ${emProblems}
         ${em && em.hint && !emLive ? `<p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">${escHtml(em.hint)}</p>` : ""}
+        <div class="field"><label>Daily check-in and email time</label><input type="time" id="set-checkin-time"></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+          <button class="btn btn-ghost" style="width:auto;" onclick="saveCheckinTime()">Save time</button>
           <button class="btn" style="width:auto;" onclick="sendDigest()">Email me the week</button>
           <span class="chip ${em && em.user_has_email ? "ok" : "off"}">${em && em.user_has_email ? escHtml(userName || "you") : "add an email to get mail"}</span>
         </div>
@@ -1935,7 +2320,9 @@ async function renderSettings(el) {
   } catch (e) {
     html += `<p style="color:#ff8b7a;">Failed to load settings.</p>`;
   }
+  html += `<div class="settings-section"><div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;"><span style="font-size:14px;color:var(--bone-dim);">Signed in as <strong style="color:var(--bone);">${escHtml(userName || "")}</strong></span><button class="btn btn-danger" style="width:auto;color:#fff;" onclick="logout()">Sign out</button></div></div>`;
   el.innerHTML = html;
+  // populate LLM provider fields
   const llmState = window._lastLlm;
   if (llmState) {
     const sel = document.getElementById("set-provider");
@@ -1951,7 +2338,8 @@ async function renderSettings(el) {
     const elc = document.getElementById("set-enable-local");
     if (elc) elc.checked = !!llmState.enable_local;
   }
-  // Infer provider settings from the pasted key.
+  // Pasting a key snaps the provider to match it, so a Gemini key never
+  // silently lands on an OpenRouter endpoint (the old way nothing changed).
   const keyInput = document.getElementById("set-api-key");
   if (keyInput) keyInput.addEventListener("input", _detectProviderFromKey);
   renderBusyWindows();
@@ -1968,7 +2356,7 @@ function _detectProviderFromKey() {
   ).trim();
   const sel = document.getElementById("set-provider");
   if (!key || !sel) return;
-  // Check specific key prefixes before generic ones.
+  // Longest prefixes first: sk-or- must win over the generic sk- of OpenAI.
   const probes = ["sk-or-", "AIza", "gsk_", "csk-", "sk-"];
   const ids = ["openrouter", "gemini", "groq", "cerebras", "openai"];
   const idx = probes.findIndex((p) => key.startsWith(p));
@@ -1989,7 +2377,8 @@ function applyProviderPreset() {
   if (!preset) return; // custom endpoint: the operator owns both fields
   const bl = document.getElementById("set-base-url");
   const ml = document.getElementById("set-model");
-  // Do not carry endpoint or model settings across providers.
+  // Always overwrite: a provider switch must never inherit the previous
+  // provider's endpoint or model.
   if (bl) bl.value = preset.url;
   if (ml) ml.value = preset.model;
 }
@@ -2155,11 +2544,12 @@ async function sendDigest() {
 
 window.addEventListener("DOMContentLoaded", () => {
   _bindKeys();
+  _deskInit();
   if (token) {
     const ru = document.getElementById("orbit-user");
     if (ru) ru.textContent = (userName || "?").slice(0, 1).toUpperCase();
     enterApp();
-    // Restore the current page after a refresh.
+
     if (!routeFromHash()) navigate("today");
   } else {
     document.getElementById("auth-screen").classList.remove("hidden");

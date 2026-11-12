@@ -2,13 +2,14 @@ import json
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from core import ratelimit
 from core.clock import today_for
 from core.database import get_connection
 from core.deps import require_user
-from core import generation
+from core import generation, intents, routine
 from core.models import ChatRequest, LinkRequest, NudgeRequest, QuickCommandRequest
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -16,8 +17,7 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 @router.get("/eloise")
 def eloise_state(user: dict = Depends(require_user)):
-    """Feed for the console panel: live telemetry + Eloise's current mood, derived
-    from the real board (pressure of the hottest goal, momentum, stakes, uptime)."""
+
     conn = get_connection()
     today_d = today_for(user)
     today = today_d.isoformat()
@@ -176,17 +176,69 @@ def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
         lines.append(f"{r['role']}: {content}")
     while sum(len(l) for l in lines) > _MAX_TOTAL_CHARS and len(lines) > 1:
         lines.pop(0)
-    # Structural anti-repeat: ALWAYS drop the most recent Eloise reply from
-    # the LLM's context. Weak models parrot the immediately-previous Eloise
-    # line verbatim when it is in context — that is exactly the "spamming the
-    # same answer" the user hit. Without it in front of them, they cannot copy
-    # it. The latest user message stays in so the model answers the question
-    # actually asked. (drop_reply_to kept for backwards compatibility.)
+
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip().startswith("eloise:"):
             lines.pop(i)
             break
     return lines
+
+
+class ConfirmRequest(BaseModel):
+    proposal_id: int
+    accept: bool = True
+
+
+def _act_before_llm(conn, user, goal_id, message):
+    patch = routine.parse_statement(message)
+    if patch:
+        routine.save_override(conn, user["id"], patch)
+        from core.routes.goal_routes import submit_plan
+        for g in conn.execute("SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall():
+            submit_plan(user, g["id"])
+        bits = []
+    
+        if patch.get("sleep"):
+            bits.append(f"sleep {generation.fmt_min(patch['sleep'][0])}-{generation.fmt_min(patch['sleep'][1])}")
+       
+        for k, v in (patch.get("meals") or {}).items():
+            bits.append(f"{k} {generation.fmt_min(v[0])}")
+      
+        if patch.get("workout"):
+            bits.append(f"workout {generation.fmt_min(patch['workout'][0])}-{generation.fmt_min(patch['workout'][1])}")
+        return {"reply": "Noted for every goal, not just this one: " + ", ".join(bits) + ". Redrawing your plans around it.",
+                "source": "routine"}
+    nav = intents.navigate(conn, user["id"], message)
+    if nav:
+        return {"reply": nav["reply"], "ui": nav["ui"], "source": "nav"}
+    prop = intents.detect(conn, user["id"], message, today_for(user).isoformat(), goal_id)
+    if not prop:
+        from core import actions
+        prop = actions.propose(conn, user["id"], message, today_for(user).isoformat(), goal_id)
+    if prop:
+        return {"reply": prop["label"], "proposal": prop, "source": "proposal"}
+    return None
+
+
+def _model_label(conn):
+    try:
+        from core.llm.manager import LLMManager
+        cloud = next((p for n, p in LLMManager()._providers().items() if n != "ollama"), None)
+        return f"{cloud.name} - {cloud.model}" if cloud else "the model"
+    except Exception:
+        return "the model"
+
+
+@router.post("/chat/confirm")
+def chat_confirm(body: ConfirmRequest, user: dict = Depends(require_user)):
+    conn = get_connection()
+    res = intents.resolve(conn, user["id"], body.proposal_id, body.accept)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("detail", "failed"))
+    gid = res.get("goal_id")
+    _add_message(conn, user["id"], gid if res.get("kind") in ("complete_goal", "cancel_goal", "complete_task", "delete_task", "replan", "set_deadline", "add_constraint", "move_task") else None,
+                 "eloise", res["message"])
+    return res
 
 
 @router.post("/chat")
@@ -219,16 +271,10 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
     # to every reply.
     generation.absorb_persona_directive(conn, user["id"], message)
 
-    if goal_id and goal and generation.goal_completion_detected(message):
-        conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=?", (goal_id,))
-        conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (goal_id,))
-        conn.commit()
-        reply = (
-            "Claimed and closed. You said it's done, so the file reads done. If you're lying, "
-            "the next check-in will find out. Don't insult my ledger with a fake 'done'."
-        )
-        _add_message(conn, user["id"], goal_id, "eloise", reply)
-        return {"reply": reply, "goal_status": "succeeded", "source": "completion"}
+    acted = _act_before_llm(conn, user, goal_id, message)
+    if acted:
+        _add_message(conn, user["id"], goal_id, "eloise", acted["reply"])
+        return acted
 
     history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
     goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
@@ -346,19 +392,15 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
     # reply.
     generation.absorb_persona_directive(conn, user["id"], message)
 
-    if goal_id and goal and generation.goal_completion_detected(message):
-        conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=?", (goal_id,))
-        conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (goal_id,))
-        conn.commit()
-        reply = (
-            "Claimed and closed. You said it's done, so the file reads done. If you're lying, "
-            "the next check-in will find out. Don't insult my ledger with a fake 'done'."
-        )
-        _add_message(conn, user["id"], goal_id, "eloise", reply)
-        return StreamingResponse(
-            iter([send({"delta": reply}), send({"done": True, "goal_status": "succeeded", "source": "completion"})]),
-            media_type="text/event-stream",
-        )
+    acted = _act_before_llm(conn, user, goal_id, message)
+    if acted:
+        _add_message(conn, user["id"], goal_id, "eloise", acted["reply"])
+        done = {"done": True, "source": acted["source"]}
+        if acted.get("proposal"):
+            done["proposal"] = acted["proposal"]
+        if acted.get("ui"):
+            done["ui"] = acted["ui"]
+        return StreamingResponse(iter([send({"delta": acted["reply"]}), send(done)]), media_type="text/event-stream")
 
     history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
     goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
@@ -402,6 +444,8 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
                 location=location,
             )
         source = None
+        yield _json.dumps({"stage": "board"})
+        yield _json.dumps({"stage": "model", "label": _model_label(gconn)})
         try:
             for chunk, src in stream:
                 if not chunk:
@@ -527,18 +571,13 @@ def quick_command(body: QuickCommandRequest, user: dict = Depends(require_user))
             "source": "quick"}
 
     if cmd in ("reschedule", "fuckit", "fuck it", "f-it", "f*ckit", "shove it"):
-        goals = conn.execute("SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall()
-        if not goals:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT a.id FROM actions a JOIN goals g ON g.id=a.goal_id WHERE a.user_id=? AND g.status='active' AND a.status='pending'",
+            (user["id"],)).fetchall()]
+        if not ids:
             return {"reply": "Nothing to reschedule. 'Fuck it' only counts when there's work to dodge.", "source": "quick"}
-        # push all pending actions one day out
-        for g in goals:
-            # a day later - but never past the deadline itself
-            conn.execute(
-                "UPDATE actions SET date=date(date,'+1 day') "
-                "WHERE goal_id=? AND status='pending' AND date<?", (g["id"], g["deadline"])
-            )
-        conn.commit()
-        return {"reply": "Done. Everything pending just slid a day. Nice one — you paid for it tomorrow.", "source": "quick"}
+        prop = intents._store(conn, user["id"], "slide_all", None, ids, "Push every pending task one day later?")
+        return {"reply": prop["label"], "proposal": prop, "source": "quick"}
 
     if cmd in ("stakes", "debt"):
         stakes = conn.execute(

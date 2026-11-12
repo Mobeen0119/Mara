@@ -15,21 +15,17 @@ from core.llm.openai_provider import (
 
 DEFAULT_OPENROUTER_MODEL = DEFAULT_CLOUD_MODEL
 
-# Reject moderation verdicts echoed as OpenRouter replies.
+
 _VERDICT_ECHO = re.compile(r"user safety\s*[:.\-]", re.I)
 
-# Serialize local generation per model while allowing distinct models to run concurrently.
-# Bound interactive waits so chat can fall back to the cloud instead of blocking.
+
 OLLAMA_LOCK = threading.Lock()
 _ollama_model_locks = {}
 _ollama_locks_guard = threading.Lock()
 
 
 def ollama_lock_for(effective_model=None):
-    """The app-wide lock for the given local model name. Models key on their own lock, so
-    a chat on the small fast model is served in parallel with a plan draw on the big
-    model (Ollama keeps one runner per loaded model). Falls back to the legacy shared
-    lock when the model is unknown."""
+   
     if not effective_model:
         return OLLAMA_LOCK
     with _ollama_locks_guard:
@@ -37,19 +33,11 @@ def ollama_lock_for(effective_model=None):
 
 
 def _strip_prompt_echo(text, user_message=None, user_lines=None):
-    """Post-process LLM output: remove any prompt boilerplate the model echoed back,
-    drop a leading role label it parroted from history ('Eloise: ...'), refuse a
-    verbatim echo of the user's own question, delete verbatim re-quotes of the
-    user's earlier lines, and strip sycophancy openers ('You're right—', 'I
-    understand...') that weak models sprinkle in pretending to agree. Weak local
-    models do all of these; without this the UI shows the user their own words
-    played back at them with a smiley agree-first wrapper ('echoing')."""
+   
     if not text:
         return ""
     t = text
-    # Cut everything up to the LAST prompt/echo marker and keep only the tail
-    # — that's where the actual reply lives after the model re-prints the
-    # instructions/history.
+ 
     markers = [
         "Reply as Eloise.", "Respond as Eloise.", "Only output your reply.",
         "do NOT echo this prompt", "Do NOT echo this prompt",
@@ -119,7 +107,7 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
         r"you\s+said\s+it|that['’]?s\s+(?:a\s+)?fair)\s*[^\w]*\s*",
         re.I,
     )
-    t2 = _SYC_OPENER.sub("", t, count=1).strip(" .,:;-—*_\"'\n\t").strip()
+    t2 = _SYC_OPENER.sub("", t, count=1).lstrip(" .,:;-—_\"'\n\t").rstrip()
     if t2:
         t = t2
     if not t:
@@ -127,17 +115,20 @@ def _strip_prompt_echo(text, user_message=None, user_lines=None):
     # Sentence-level repetition guard: weak models loop the same sentence
     # ("Get to work. Get to work. Get to work.") inside one reply. Keep each
     # distinct sentence exactly once, in order.
-    parts = re.split(r"(?<=[.!?])\s+", t)
     seen = set()
-    kept = []
-    for p in parts:
-        key = re.sub(r"[^a-z0-9 ]", "", p.lower()).strip()
-        if len(key) >= 8:
-            if key in seen:
-                continue
-            seen.add(key)
-        kept.append(p)
-    t = " ".join(kept).strip()
+    out_lines = []
+    for line in t.split("\n"):
+        kept = []
+        for p in re.split(r"(?<=[.!?])\s+", line):
+            key = re.sub(r"[^a-z0-9 ]", "", p.lower()).strip()
+            if len(key) >= 8:
+                if key in seen:
+                    continue
+                seen.add(key)
+            kept.append(p)
+        if kept:
+            out_lines.append(" ".join(kept))
+    t = "\n".join(out_lines).strip()
     return t
 
 

@@ -629,3 +629,42 @@ def goal_outline(goal_id: int, user: dict = Depends(require_user)):
         data = None
     left = generation.days_remaining(row["deadline"], today_for(user).isoformat())
     return {"scope": generation.scope_for(left), "outline": data}
+
+
+# ---------------------------------------------------------------------------
+# .env bootstrap: any provider key from the environment is detected and verified
+# once at startup, exactly like pasting it in Settings. A key already saved in
+# Settings always wins (this never overwrites it).
+# ---------------------------------------------------------------------------
+_ENV_KEYS = (
+    ("LLM_API_KEY", None), ("GEMINI_API_KEY", "gemini"), ("GOOGLE_API_KEY", "gemini"),
+    ("ANTHROPIC_API_KEY", "anthropic"), ("OPENROUTER_API_KEY", "openrouter"),
+    ("GROQ_API_KEY", "groq"), ("MISTRAL_API_KEY", "mistral"), ("DEEPSEEK_API_KEY", "deepseek"),
+    ("XAI_API_KEY", "xai"), ("TOGETHER_API_KEY", "together"), ("OPENAI_API_KEY", None),
+)
+
+
+def bootstrap_llm_from_env():
+    import logging
+    log = logging.getLogger("eloise.llm")
+    conn = get_connection()
+    if _load_cfg(conn).get("api_key"):
+        return False
+    for var, preset_id in _ENV_KEYS:
+        key = (os.environ.get(var) or "").strip()
+        if not key:
+            continue
+        provider = (os.environ.get("LLM_PROVIDER") or "").strip() or (preset_id if preset_id in PRESET_BY_ID else None)
+        det = autoconfigure(key, base_url=(os.environ.get("LLM_BASE_URL") or "").strip() or None,
+                            provider=provider, model=(os.environ.get("LLM_MODEL") or "").strip() or None)
+        if not det["ok"]:
+            log.warning("%s is set but could not be verified: %s", var, det["error"])
+            continue
+        cfg = {"api_key": key, "models": det["models"]}
+        cfg.update({k: det[k] for k in ("provider", "protocol", "base_url", "model")})
+        conn.execute("INSERT INTO app_settings (key, value) VALUES ('llm', ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(cfg),))
+        conn.commit()
+        log.info("LLM configured from %s: %s / %s", var, det["provider"], det["model"])
+        return True
+    return False

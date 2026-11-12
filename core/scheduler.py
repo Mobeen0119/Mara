@@ -1,3 +1,16 @@
+"""Background jobs. One tick every 5 minutes walks the users and does, in THEIR
+local time (not the server's):
+
+  * sweep   - pending blocks from earlier days become 'missed' (so every counter is honest)
+  * reminder- at a goal's reminder_time, if it has blocks today, leave a plain factual note
+  * checkin - at the user's checkin_time, once a day, mail a nudge if their address is confirmed
+  * digest  - the day's schedule by email, once a day, at the check-in time
+  * horizon - far-off goals only have the next ~2 weeks drawn hour-by-hour; when
+              fewer than 7 days of pending tasks remain ahead, the next window is drawn
+
+Every once-a-day action is recorded in job_runs(user, goal, kind, local day) with
+INSERT OR IGNORE, so a restart, a second tick, or a slow tick can never send twice.
+"""
 import logging
 from datetime import timedelta
 
@@ -45,6 +58,7 @@ class EloiseScheduler:
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
 
+    # ------------------------------------------------------------------
     def tick(self, now_fn=None):
         conn = get_connection()
         for user in conn.execute("SELECT * FROM users").fetchall():
@@ -69,6 +83,7 @@ class EloiseScheduler:
         if now_min >= _hhmm(user.get("checkin_time"), "08:00"):
             self._checkin_and_digest(conn, user, goals, today)
 
+    # ------------------------------------------------------------------
     def _extend_horizon(self, conn, user, today):
         """Roll the detailed window forward for goals planned weekly/monthly."""
         from core import generation
@@ -121,31 +136,8 @@ class EloiseScheduler:
             self._mail_digest(conn, user, goals, today)
 
     def _mail_digest(self, conn, user, goals, today):
-        tasks, total = [], 0.0
-        for goal in goals:
-            for a in conn.execute("SELECT * FROM actions WHERE goal_id=? AND date=? ORDER BY start_time",
-                                  (goal["id"], today)).fetchall():
-                tasks.append({"date": a["date"], "title": a["title"], "start_time": a["start_time"],
-                              "end_time": a["end_time"], "status": a["status"]})
-                total += (a["duration_min"] or 60) / 60.0
-        if not tasks:
-            return
-        try:
-            from core.mailer import send_email_detailed, smtp_configured
-            from core.persona import build_daily_email_html
-            if not smtp_configured():
-                return
-            html = build_daily_email_html(user["name"], tasks, round(total, 1), 0,
-                                          goal_title=goals[0]["display_title"] if len(goals) == 1 else None)
-            ok, err = send_email_detailed(user["email"], "Eloise - your day", "See your schedule in the app.", html)
-        except Exception as exc:
-            ok, err = False, f"{type(exc).__name__}: {exc}"
-        conn.execute(
-            "INSERT INTO logs (user_id, kind, message) VALUES (?,?,?)",
-            (user["id"], "daily_digest" if ok else "daily_digest_failed",
-             f"digest: {len(tasks)} tasks, {round(total, 1)}h" + ("" if ok else f" (mail failed: {err})")),
-        )
-        conn.commit()
+        from core import emails
+        emails.send_daily(conn, user, [dict(g) for g in goals], today)
 
 
 eloise_scheduler = EloiseScheduler()

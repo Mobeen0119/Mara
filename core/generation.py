@@ -90,7 +90,15 @@ def get_manager(db=None):
     return _manager
 
 
-# Preserve explicit persona preferences in every system prompt
+# ---------------------------------------------------------------------------
+# Personality contract
+# ---------------------------------------------------------------------------
+# The user can teach Eloise her personality in plain chat ("be sarcastic",
+# "don't be a motivational speaker", "act like you'd abuse me if you could").
+# Whoever says it ONCE expects it to stick forever, but a weak model forgets
+# it next turn. So we sniff these directives out of chat messages, store them
+# on the user, and inject them into EVERY system prompt as a standing
+# override.
 _PERSONA_TRIGGERS = {
     "motivational": "NEVER be a motivational speaker, cheerleader, or hype-person. No 'you can do it!', no pumping-up, no empty positivity. Be dry and real instead.",
     "sarcast": "Be wry, dry and sarcastic by default — make it obvious you are not impressed.",
@@ -156,7 +164,14 @@ def chat_system_prompt(db, user_id):
     )
 
 
-# Keep step completion separate from whole-goal completion.
+# ---------------------------------------------------------------------------
+# Step completion vs goal completion
+# ---------------------------------------------------------------------------
+# The user reports finishing the CURRENT STEP ("done", "finished the layout")
+# far more often than the WHOLE goal. The plan chat must treat those as
+# different: a step-done means "name the NEXT task from the plan, do not
+# re-instruct the one just finished". Closing the entire goal must stay rare
+# and require real evidence.
 _STEP_DONE_RE = re.compile(
     r"^\s*(done|did it|did that|finished|finished it|done with it|done with that|"
     r"got it done|wrapped( up)?|moved on|next|next step|what('| i)?s next|what do i do now|"
@@ -232,7 +247,16 @@ def _pick(items):
     return items[(datetime.now().microsecond // 100) % len(items)]
 
 
-# Use whole-word, thread-aware matches to avoid benign substring false positives
+# --- Content-safety guardrail
+# ------------------------------------------------- Precise, not paranoid:
+# Eloise plans REAL goals — including romantic / intimate ones with a partner
+# (gf / wife / partner), and she answers sexual-wellness questions plainly.
+# She refuses only sexual content involving a family member or a minor, and
+# coercion / violence. Word-BOUNDARY matching only: substring scanning used to
+# refuse "document my progress" ('cum' in document), "every person" ('son' in
+# person), "choose between" ('teen' in between) and "grow grapes" ('rape' in
+# grapes). Thread-aware so follow-ups like "sister" after an incest message are
+# still refused.
 
 def _word_re(words):
     return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
@@ -333,6 +357,10 @@ def days_remaining(deadline, today=None):
     today = today or date.today().isoformat()
     return days_between(today, deadline)
 
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
 
 def _global_chat_prompt(summary, history, user_name, message):
     return (
@@ -559,6 +587,9 @@ def generate_nudge(user_name, goal_summary, nearest, db=None):
     return text, source
 
 
+# ---------------------------------------------------------------------------
+# Check-in
+# ---------------------------------------------------------------------------
 def generate_check_in_prompt(user_name, goals_summary, db=None):
     sys = CHECK_IN_SYSTEM_PROMPT
     user_prompt = f"User: {user_name}\nActive goals: {'; '.join(goals_summary) or 'none'}\nAsk the check-in question."
@@ -584,6 +615,9 @@ def generate_check_in_response(user_name, done, db=None):
     return text, source
 
 
+# ---------------------------------------------------------------------------
+# Plan generation
+# ---------------------------------------------------------------------------
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
@@ -674,29 +708,6 @@ def parse_clock_list(text):
     return out
 
 
-_ROUTINE_QUESTIONS = [
-    {"key": "sleep_schedule", "q": "When do you usually sleep, and when do you wake up?",
-     "hint": "e.g. 23:30 – 07:00"},
-    {"key": "meal_times", "q": "When do you usually eat — breakfast, lunch, dinner?",
-     "hint": "e.g. 08:00, 13:00, 20:00"},
-    {"key": "movement_time", "q": "When do you usually move, gym or play?",
-     "hint": "e.g. 18:00 (or type 'none')"},
-    {"key": "peak_energy", "q": "When is your head clearest — morning, afternoon or night?",
-     "hint": "e.g. morning"},
-]
-
-
-def _merge_routine(questions):
-    """Always ask the basics — sleep, meals, movement — so the schedule is built
-    around a real human day instead of 8am-to-11pm straight work."""
-    seen = {q.get("key") for q in questions}
-    out = list(questions)
-    for rq in _ROUTINE_QUESTIONS:
-        if rq["key"] not in seen:
-            out.append(dict(rq))
-    return out[:7]
-
-
 def parse_routine_windows(details):
     """Turn the user's sleep / meal / movement answers into busy windows (minutes)."""
     d = details or {}
@@ -723,114 +734,51 @@ _DEFAULT_HUMAN_WINDOWS = [
 ]
 
 
-def goal_questionnaire(title):
-    """Return 2-3 clarifying questions based on what kind of goal this is.
-    The answers help generate a specific, actionable schedule instead of generic blocks."""
-    t = (title or "").lower()
-    questions = []
-    # Exam / test
-    if any(w in t for w in ("exam", "test", "quiz", "assessment", "certification", "cert")):
-        questions = [
-            {"key": "syllabus", "q": "What's the syllabus / topics covered?", "hint": "e.g. networking fundamentals, subnetting, OSI model"},
-            {"key": "weak_areas", "q": "What topics are you weakest on?", "hint": "e.g. I don't know subnetting at all"},
-            {"key": "study_format", "q": "How do you learn best?", "hint": "videos, reading, practice problems, flashcards"},
-        ]
-    # Startup / business
-    elif any(w in t for w in ("startup", "business", "company", "launch", "mvp", "product")):
-        questions = [
-            {"key": "domain", "q": "What's your domain / industry?", "hint": "e.g. edtech, fintech, saas, ecommerce"},
-            {"key": "stage", "q": "What stage are you at?", "hint": "idea, prototype, mvp, launched, growing"},
-            {"key": "first_step", "q": "What's the first concrete thing you need to build?", "hint": "landing page, backend api, user interviews, pitch deck"},
-        ]
-    # Project / assignment / report
-    elif any(w in t for w in ("project", "assignment", "report", "paper", "essay", "presentation", "deck")):
-        questions = [
-            {"key": "requirements", "q": "What are the requirements / deliverables?", "hint": "e.g. 20-page report, slides, working prototype"},
-            {"key": "topic", "q": "What's the specific topic or subject?", "hint": "e.g. networking security, market analysis, user research"},
-            {"key": "resources", "q": "What resources do you already have?", "hint": "e.g. templates, data, reference documents, prior work"},
-        ]
-    # Learning / skill
-    elif any(w in t for w in ("learn", "study", "skill", "course", "training", "master")):
-        questions = [
-            {"key": "current_level", "q": "What's your current level?", "hint": "complete beginner, some basics, intermediate"},
-            {"key": "goal_level", "q": "What level do you need to reach?", "hint": "pass an exam, build a project, job-ready"},
-            {"key": "time_per_day", "q": "How many hours per day can you commit?", "hint": "1h, 2h, 3h+"},
-        ]
-    # Fitness / health
-    elif any(w in t for w in ("fitness", "gym", "workout", "health", "weight", "run", "marathon")):
-        questions = [
-            {"key": "current_fitness", "q": "What's your current fitness level?", "hint": "sedentary, light activity, active"},
-            {"key": "target", "q": "What's the specific target?", "hint": "lose 5kg, run 5k, bench press 100kg"},
-            {"key": "equipment", "q": "What equipment / facilities do you have?", "hint": "home gym, commercial gym, no equipment"},
-        ]
-    # Romance / date / surprise / memorable night / anniversary
-    elif any(w in t for w in ("romantic", "romance", "date", "anniversary", "valentine", "valentines",
-                              "girlfriend", "gf", "wife", "partner", "husband", "boyfriend", "bf",
-                              "memorable", "surprise her", "surprise him", "proposal", "propose",
-                              "date night", "special night", "gift",
-                              "hookup", "hook up", "sex night", "night together", "sleep with",
-                              "sexual", "sex with", "intimate night", "bedroom")):
-        questions = [
-            {"key": "occasion", "q": "What's the occasion or date?", "hint": "anniversary, valentine, birthday, plain old 'I love you'"},
-            {"key": "person", "q": "Who is this for, and what do they love?", "hint": "e.g. my wife — candles, live music, quiet dinner"},
-            {"key": "budget", "q": "What's your budget ceiling?", "hint": "no cap, under $100, under $300"},
-            {"key": "vibe", "q": "What vibe are you going for?", "hint": "intimate and calm, big and showy, playful and silly"},
-        ]
-    else:
-        # Generic — always ask what "done" looks like
-        questions = [
-            {"key": "done_looks_like", "q": "What does 'done' look like? Describe the specific outcome.", "hint": "e.g. shipped to production, grade A, 10k users"},
-            {"key": "biggest_blocker", "q": "What's the biggest thing blocking you right now?", "hint": "e.g. don't know where to start, missing info, no time"},
-        ]
-    return questions
-
-
-def generate_clarify_questions(title, db=None):
-    """Ask the MODEL for 2-4 clarifying questions written for THIS specific goal
-    (not the hardcoded category sets). Falls back to the built-in sets when no
-    LLM can serve clean JSON in time, so goal creation never blocks on it."""
+def generate_clarify_questions(title, db=None, deadline="", known="", unknown=()):
+    """Questions written by the model for THIS goal. No model, no questions: there is
+    deliberately no canned fallback list, the caller says what it assumed instead."""
+    ask_routine = ""
+    if unknown:
+        ask_routine = (
+            f"NOT KNOWN YET: {', '.join(unknown)}. Ask about these ONLY if they change this plan, "
+            "one short question at most, using key sleep_schedule (hours asleep) or meal_times "
+            "(when they eat).\n"
+        )
     sys = (
-        "You are Eloise, a sharp scheduling chief. The user just filed a goal. Write "
-        "3 short clarifying questions whose answers would let you build a real, "
-        "concrete day-by-day schedule for exactly this goal. Cover: the concrete "
-        "outcome (what 'done' looks like), the biggest constraint or blocker, and "
-        "the specifics only they know (people involved, budget, tools, hours "
-        "available, their country). Be direct and slightly dry — no fluff, no "
-        "therapist voice. One line per question."
+        "You are Eloise. The person just filed a goal. Ask the few questions whose answers "
+        "change the schedule you will build. Plain everyday words, each question 9 words or "
+        "fewer, answerable in a few words. Never ask what is already known."
     )
-    user_prompt = (
-        f"Goal filed: {title}\n"
-        "Return ONLY a JSON array of exactly 3 objects, each like "
-        '{"key": "short_key", "q": "the question", "hint": "tiny example answer"}. '
-        "No markdown, no commentary, nothing outside the array."
+    prompt = (
+        f"Goal: {title}\nDeadline: {deadline}\n"
+        f"ALREADY KNOWN (never ask): {known or 'nothing yet'}\n{ask_routine}"
+        "Ask at most 3 questions, fewer if the goal is simple. Prefer facts only this person "
+        "knows (level, material, budget, who it is for, tools). Return ONLY a JSON array of "
+        '{"key":"short_key","q":"question","hint":"tiny example"} - nothing else.'
     )
     try:
-        result = get_manager(db).generate(sys, user_prompt, timeout=30, max_tokens=250)
+        result = get_manager(db).generate(sys, prompt, timeout=30, max_tokens=300)
     except Exception:
-        result = None
-    if result is not None and getattr(result, "ok", False) and result.text:
-        m = re.search(r"\[.*\]", result.text, re.S)
-        if m:
-            try:
-                raw = json.loads(m.group(0))
-                qs = []
-                for i, item in enumerate(raw[:4]):
-                    if not isinstance(item, dict):
-                        continue
-                    q = str(item.get("q") or "").strip()
-                    if not q:
-                        continue
-                    key = re.sub(r"[^a-z0-9_]", "_", str(item.get("key") or f"q{i + 1}").lower()).strip("_")[:32]
-                    qs.append({
-                        "key": key or f"q{i + 1}",
-                        "q": q[:220],
-                        "hint": str(item.get("hint") or "").strip()[:140],
-                    })
-                if qs:
-                    return _merge_routine(qs)
-            except Exception:
-                pass
-    return _merge_routine(goal_questionnaire(title))
+        return []
+    if not (result is not None and getattr(result, "ok", False) and result.text):
+        return []
+    m = re.search(r"\[.*\]", result.text, re.S)
+    if not m:
+        return []
+    try:
+        raw = json.loads(m.group(0))
+    except Exception:
+        return []
+    qs = []
+    for i, item in enumerate(raw[:3]):
+        if not isinstance(item, dict):
+            continue
+        q = " ".join(str(item.get("q") or "").split())
+        if not q or len(q.split()) > 16:
+            continue
+        key = re.sub(r"[^a-z0-9_]", "_", str(item.get("key") or f"q{i + 1}").lower()).strip("_")[:32]
+        qs.append({"key": key or f"q{i + 1}", "q": q[:140], "hint": str(item.get("hint") or "").strip()[:80]})
+    return qs
 
 
 def goal_details_summary(details_json):
@@ -947,7 +895,16 @@ def _is_event_goal(text):
 
 
 
-# Estimate effort differently for event, habit, and project goals
+# ---------------------------------------------------------------------------
+# Effort model. A goal is not "fill every free hour until the deadline".
+#   event   - one-off with a date (date night, party, proposal): the work is a few
+#             hours, done in the LAST days; perishables (flowers, food) land on the
+#             day; one early slot handles anything with lead time (bookings, orders).
+#   habit   - a practice (gym, six-pack, run, diet): sessions live INSIDE the
+#             user's own window for it (their 'gym 5-6'), plus short movement
+#             snacks after meals - so the routine they already have is the plan.
+#   project - everything else: the horizon planner above.
+# ---------------------------------------------------------------------------
 _HABIT_WORDS = ("gym", "workout", "work out", "six pack", "six-pack", "6 pack", "6-pack", "abs",
                 "fitness", "get fit", "lose weight", "weight loss", "fat loss", "muscle", "bulk",
                 "cut ", "run ", "running", "marathon", "yoga", "diet", "walk daily", "stretch",
@@ -972,7 +929,46 @@ def is_workout_label(text):
     return any(re.search(rf"\b{re.escape(w)}", low) for w in _WORKOUT_LABELS)
 
 
+_state_brief = threading.local()
+
+
+def set_brief(b):
+    _state_brief.b = b
+
+
+def goal_brief(title, db=None, deadline=""):
+    """One model call: what kind of effort is this really? None when no model answers."""
+    sys = ("You size real-life goals the way a sensible person would. Reply with ONLY JSON: "
+           '{"kind":"event|habit|project","total_hours":number,"active_days":number}. '
+           "event = a one-off occasion needing a few hours near the date; habit = repeated "
+           "practice (exercise, language, diet); project = sustained build/study. total_hours is the "
+           "whole realistic effort, active_days how many separate days it needs.")
+    try:
+        r = get_manager(db).generate(sys, f"Goal: {title}\nDeadline: {deadline}", timeout=25, max_tokens=80)
+    except Exception:
+        return None
+    if not (r is not None and getattr(r, "ok", False) and r.text):
+        return None
+    m = re.search(r"\{.*?\}", r.text, re.S)
+    try:
+        b = json.loads(m.group(0)) if m else None
+        if b and b.get("kind") in ("event", "habit", "project"):
+            return {"kind": b["kind"], "total_hours": max(0.25, min(float(b.get("total_hours") or 0) or 0.25, 400)),
+                    "active_days": max(1, min(int(b.get("active_days") or 1), 60))}
+    except Exception:
+        pass
+    return None
+
+
 def effort_profile(goal, days_left):
+    brief = getattr(_state_brief, "b", None)
+    if brief and brief["kind"] == "event":
+        return {"kind": "event", "event_kind": "event", "budget_min": int(brief["total_hours"] * 60),
+                "active_days": min(brief["active_days"], max(days_left + 1, 1))}
+    if brief and brief["kind"] == "habit":
+        return {"kind": "habit"}
+    if brief and brief["kind"] == "project" and _goal_kind(goal.get("title") or "") not in ("hookup", "romance"):
+        return {"kind": "project"}
     title = (goal.get("title") or goal.get("display_title") or "")
     low = title.lower() + " "
     kind = _goal_kind(title)
@@ -983,6 +979,20 @@ def effort_profile(goal, days_left):
     if any(w in low for w in _HABIT_WORDS):
         return {"kind": "habit"}
     return {"kind": "project"}
+
+
+_state_routine = threading.local()
+
+
+def set_routine(r):
+    _state_routine.r = r
+
+
+def get_routine():
+    return getattr(_state_routine, "r", None)
+
+
+fmt_min = planner.fmt
 
 
 def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_days=5):
@@ -1019,35 +1029,53 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
     return [(d, sl) for d, sl in out if sl]
 
 
-def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, detail_days=None):
-    """Sessions inside the user's workout windows (one per day, a rest day every 7th),
-    plus a 5-minute movement snack right after each meal."""
+def habit_sessions_per_week(goal):
+    low = ((goal.get("title") or "") + " " + (goal.get("display_title") or "")).lower()
+    if any(w in low for w in ("marathon", "yoga", "walk", "stretch")):
+        return 5
+    if any(w in low for w in ("six pack", "6 pack", "abs", "muscle", "bulk", "gym", "lose weight", "weight loss", "fat loss", "fitness", "get fit")):
+        return 4
+    return 3
+
+
+_SESSION_DAYS = {2: (1, 4), 3: (0, 2, 4), 4: (0, 1, 3, 4), 5: (0, 1, 2, 4, 5)}
+SESSION_MAX_MIN = 60
+SNACK_MIN = 5
+SNACKS_PER_DAY = 2
+
+
+def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, detail_days=None, per_week=4):
+    """~per_week gym sessions on fixed weekdays (60 min max) inside the person's workout window;
+    on the other days at most two 5-minute movement snacks right after lunch/dinner."""
     t0 = date.fromisoformat(today)
     end = date.fromisoformat(deadline)
     span = min((end - t0).days + 1, 121)
     if detail_days:
         span = min(span, detail_days)
+    train = _SESSION_DAYS.get(per_week, _SESSION_DAYS[4])
+    after = sorted(meal_windows, key=lambda w: w[1] % 1440)[1:3] if len(meal_windows) > 2 else sorted(meal_windows, key=lambda w: w[1] % 1440)[-2:]
     out = []
     for i in range(span):
-        d = (t0 + timedelta(days=i)).isoformat()
+        day = t0 + timedelta(days=i)
+        d = day.isoformat()
         busy = list(others_for(d) or [])
         slots = []
-        rest = (i % 7) == 6
-        if not rest:
+        is_train = day.weekday() in train
+        if is_train:
             for (ws, we) in windows[:1]:
-                if we <= ws:
-                    continue
-                if i == 0 and now_min is not None and ws < now_min + LEAD_TODAY_MIN:
+                we = min(we, ws + SESSION_MAX_MIN)
+                if we <= ws or (i == 0 and now_min is not None and ws < now_min + LEAD_TODAY_MIN):
                     continue
                 if not any(ws < be and bs < we for bs, be in busy):
                     slots.append((ws, we))
-        for (ms, me) in meal_windows:
-            a, b = me % 1440, me % 1440 + 5
-            if i == 0 and now_min is not None and a < now_min + LEAD_TODAY_MIN:
-                continue
-            if b <= 23 * 60 and not any(a < be and bs < b for bs, be in busy) \
-                    and not any(a < we and ws < b for ws, we in windows):
-                slots.append((a, b))
+        else:
+            for (ms, me) in after[:SNACKS_PER_DAY]:
+                a, b = me % 1440, me % 1440 + SNACK_MIN
+                if i == 0 and now_min is not None and a < now_min + LEAD_TODAY_MIN:
+                    continue
+                if b <= 23 * 60 and not any(a < be and bs < b for bs, be in busy) \
+                        and not any(a < we and ws < b for ws, we in windows):
+                    slots.append((a, b))
         if slots:
             out.append((d, sorted(slots)))
     return out
@@ -1055,7 +1083,11 @@ def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, 
 
 LEAD_TODAY_MIN = 30
 
-# Keep detailed plans near-term and use roadmaps for distant goals
+# ---------------------------------------------------------------------------
+# Horizon-aware planning. Nobody plans day-by-day 4 months out: far goals get a
+# monthly roadmap, mid-range goals a weekly one, and only the near days are
+# drawn hour-by-hour. The detailed window rolls forward every day.
+# ---------------------------------------------------------------------------
 WEEKLY_AT = 56        # > 8 weeks out  -> weekly outline
 MONTHLY_AT = 75       # > ~2.5 months  -> monthly outline
 DETAIL_DAYS = 14      # hour-by-hour days kept ahead in weekly/monthly mode
@@ -1158,8 +1190,10 @@ def _kind_rules(profile):
         return (
             "THIS IS A PHYSICAL HABIT. Long slots (30+ min) are the person's own gym/exercise window: "
             "name the session - muscle group, 4-6 exercises, sets x reps - and rotate groups so no "
-            "muscle is hit two days running. Slots of 10 minutes or less are MOVEMENT SNACKS right "
-            "after a meal: one exact exercise and rep count (e.g. '25 push-ups, then 30s plank'). "
+            "muscle is hit two days running. A session never exceeds 60 minutes. Slots of 5 minutes are "
+            "MOVEMENT SNACKS right after lunch or dinner on rest days only: one exact exercise and rep count "
+            "(e.g. '25 push-ups'). The person is not living in the gym: never pad a slot, and never schedule "
+            "a session where there is no slot. "
             "Add a one-line food target to the session slots when it serves the goal (protein, "
             "calories) - no lectures.\n"
         )
@@ -1206,7 +1240,12 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
 
     # Sleep, meals and movement are not negotiable. Build around the times the
     # user told us when filing; fall back to a sane default day if they skipped.
-    human_windows = parse_routine_windows(details) or _DEFAULT_HUMAN_WINDOWS
+    _r = get_routine()
+    if _r:
+        from core import routine as _routine_mod
+        human_windows = _routine_mod.human_windows(_r)
+    else:
+        human_windows = parse_routine_windows(details) or _DEFAULT_HUMAN_WINDOWS
     for w in human_windows:
         if w:
             blocked.append(w)
@@ -1257,7 +1296,9 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             return None
         return (cur, cur + span)
 
-    # Use the user's stated availability instead of a fixed estimate
+    # --- how much, and when: the human-nature engine (core/planner.py) -----
+    # Parse the user's own "hours per day I can commit" answer so the load
+    # follows THEIR life, not a fixed guess.
     commit_min = 120
     tp = (details.get("time_per_day") or "").strip().lower()
     m = re.search(r"(\d+)", tp)
@@ -1272,7 +1313,8 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             commit_min = n * 60
 
     wake, bed = 7 * 60, 23 * 60
-    sleep_times = parse_clock_list(details.get("sleep_schedule") or "")
+    _r = get_routine()
+    sleep_times = list(_r["sleep"]) if _r else parse_clock_list(details.get("sleep_schedule") or "")
     if len(sleep_times) >= 2:
         b0, w0 = sleep_times[0], sleep_times[1]
         if w0 > 13 * 60 and b0 < w0:      # typed backwards ("7am to 11pm")
@@ -1282,7 +1324,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             bed, wake = nb, w0
     prefs = planner.Prefs(
         wake=wake, bed=bed, commit_min=commit_min,
-        chronotype=planner.infer_chronotype(details.get("peak_energy"), wake, bed),
+        chronotype=planner.infer_chronotype((_r or {}).get("peak") or details.get("peak_energy"), wake, bed),
     )
     others_for = (lambda d: list((busy_by_date or {}).get(d, [])))
     profile = effort_profile(goal, max(days_remaining(deadline, today), 0))
@@ -1291,7 +1333,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         meals = [w for w in (human_windows or []) if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60]
         # meal windows are the short ones in the routine (sleep is long); take their END
         meals = [w for w in meals if w not in wins]
-        horizon = _habit_horizon(today, deadline, wins, now_min, others_for, meals, detail_days)
+        horizon = _habit_horizon(today, deadline, wins, now_min, others_for, meals, detail_days, habit_sessions_per_week(goal))
     else:
         horizon = planner.plan_horizon(
             today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
@@ -1658,7 +1700,12 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         _details = json.loads(goal.get("details") or "{}")
     except Exception:
         _details = {}
-    _routine = parse_routine_windows(_details)
+    _rr = get_routine()
+    if _rr:
+        from core import routine as _routine_mod
+        _routine = _routine_mod.human_windows(_rr)
+    else:
+        _routine = parse_routine_windows(_details)
     if _routine:
         _routine_txt = ", ".join(
             f"{a // 60:02d}:{a % 60:02d}-{b // 60:02d}:{b % 60:02d}" for a, b in _routine
@@ -2026,6 +2073,9 @@ def _parse_title_map(text):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Goal completion detection
+# ---------------------------------------------------------------------------
 def completion_detected(message):
     """Detect a genuine 'I finished the task' claim, guarding against questions
     and vague statements like 'what do I have to do today' or 'I'm done with...'."""
@@ -2051,6 +2101,9 @@ def completion_detected(message):
     return any(p in lowered for p in success)
 
 
+# ---------------------------------------------------------------------------
+# Progress / stats
+# ---------------------------------------------------------------------------
 def progress_stats(goal, actions, today=None):
     total_planned = sum((a.get("duration_min") or 60) for a in actions) / 60.0
     completed = sum((a.get("duration_min") or 60) for a in actions if a.get("status") == "done") / 60.0

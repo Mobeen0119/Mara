@@ -1,3 +1,4 @@
+"""Horizon-aware planning, history-safe redraws, global constraints, triage."""
 import json
 from datetime import date, timedelta
 
@@ -128,6 +129,9 @@ def test_chat_board_snapshot_carries_the_priority_call(client, monkeypatch):
     assert "PRIORITY CALL" in snap and "gym 5-7pm" in snap
 
 
+# ---------------------------------------------------------------------------
+# Effort model: events are short, habits live in the user's own window
+# ---------------------------------------------------------------------------
 def _goal(title, days, constraints=()):
     return {"id": 1, "user_id": 1, "title": title, "display_title": title, "deadline": _d(days),
             "constraints": json.dumps(list(constraints)), "details": "{}"}
@@ -169,10 +173,14 @@ def test_habit_goal_uses_the_gym_window_and_movement_snacks_after_meals():
     plan = generation._build_fallback_plan(_goal("Get a six pack", 14, ["gym 5 to 6 pm"]), today=_d(0), now_min=0)
     gym = [e for e in plan if e["start_time"] == "17:00" and e["end_time"] == "18:00"]
     snacks = [e for e in plan if _mins(e) <= 10]
-    assert len(gym) >= 10                                     # ~6 of every 7 days
-    assert len(snacks) >= 14 * 2                              # after most meals, every day
+    assert 6 <= len(gym) <= 9                                 # about 4 sessions a week, not daily
+    assert all(_mins(e) <= 60 for e in plan)
+    per_day = {}
+    for e in snacks:
+        per_day[e["date"]] = per_day.get(e["date"], 0) + 1
+    assert per_day and max(per_day.values()) <= 2
+    assert not {e["date"] for e in gym} & set(per_day)        # snacks only on rest days
     assert not [e for e in plan if 17 * 60 < int(e["start_time"][:2]) * 60 + int(e["start_time"][3:]) < 18 * 60]
-    assert {e["date"] for e in gym}.__len__() == len(gym)     # one session a day
     generation.set_workout_windows([])
 
 

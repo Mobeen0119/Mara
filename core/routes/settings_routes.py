@@ -406,6 +406,8 @@ def email_status(user: dict = Depends(require_user)):
     from core.mailer import smtp_diag
     diag = smtp_diag()
     hint = sched_email_hint("ok" if diag["configured"] and user["email"] else "smtp")
+    if not user.get("is_admin"):
+        diag = {"configured": diag["configured"], "problems": [] if diag["configured"] else ["Email is not switched on for this server."]}
     return {
         **diag,
         "user_has_email": bool(user["email"]),

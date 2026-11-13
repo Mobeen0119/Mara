@@ -168,6 +168,13 @@ CREATE INDEX IF NOT EXISTS idx_actions_user_date ON actions (user_id, date);
 CREATE INDEX IF NOT EXISTS idx_goals_user ON goals (user_id, status);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);
 
+CREATE TABLE IF NOT EXISTS login_codes (
+  email TEXT PRIMARY KEY,
+  code_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  attempts INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS pending_actions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,

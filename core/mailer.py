@@ -31,7 +31,8 @@ def smtp_password():
 
 
 def smtp_from():
-    return _cfg_any(_FROM_KEYS) or _cfg("SMTP_USER") or "eloise@localhost"
+    """Every mail leaves from the one account the server owner configured."""
+    return _cfg("SMTP_USER") or "eloise@localhost"
 
 
 def smtp_from_name():

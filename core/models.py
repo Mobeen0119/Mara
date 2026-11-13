@@ -30,10 +30,19 @@ class SignupRequest(BaseModel):
 
 
 class GuestLoginRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=80)
+    name: str = Field(default="guest", max_length=80)
     # Accepted for old clients but ignored: a guest never claims an email, so a
     # guest can never be handed someone else's account.
     email: Optional[str] = None
+
+
+class CodeRequest(BaseModel):
+    email: EmailStr
+
+
+class CodeVerify(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6)
 
 
 class LoginRequest(BaseModel):

@@ -72,7 +72,7 @@ Keep it to one worker (the scheduler is in-process).
 
 ## Email (optional)
 
-Eloise sends verification emails, check-ins and digests through SMTP. For a Gmail sender (e.g. `maravey3@gmail.com`):
+Eloise sends verification emails, sign-in codes, check-ins and digests through SMTP. Every message leaves from the one `SMTP_USER` account that you, the owner, configure on the server; users never supply a sender and the credentials are never shown to them. For a Gmail sender (e.g. `maravey3@gmail.com`):
 
 1. Sign in to that Google account -> **Manage your Google Account -> Security** and turn on **2-Step Verification**.
 2. Open **https://myaccount.google.com/apppasswords**, name it "Eloise", and copy the 16-letter password.
@@ -83,7 +83,6 @@ SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=maravey3@gmail.com
 SMTP_PASS=abcdefghijklmnop           # the App Password, never the normal password
-FROM_EMAIL=maravey3@gmail.com
 ELOISE_PUBLIC_URL=http://127.0.0.1:8000   # used in the verify-email link
 ```
 

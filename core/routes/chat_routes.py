@@ -17,7 +17,8 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 @router.get("/eloise")
 def eloise_state(user: dict = Depends(require_user)):
-
+    """Feed for the console panel: live telemetry + Eloise's current mood, derived
+    from the real board (pressure of the hottest goal, momentum, stakes, uptime)."""
     conn = get_connection()
     today_d = today_for(user)
     today = today_d.isoformat()
@@ -162,10 +163,7 @@ def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
             "SELECT * FROM general_chat WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
-    # Speed: a bloated context makes the (CPU) model slower. Cap each
-    # message's size and drop the OLDEST turns once the whole history exceeds
-    # a token budget. The model only ever needs the recent tail + the current
-    # question to answer.
+  
     _MAX_TOTAL_CHARS = 2200
     _MAX_MSG_CHARS = 400
     lines = []
@@ -199,7 +197,7 @@ def _act_before_llm(conn, user, goal_id, message):
         bits = []
     
         if patch.get("sleep"):
-            bits.append(f"sleep {generation.fmt_min(patch['sleep'][0])}-{generation.fmt_min(patch['sleep'][1])}")
+            bits.append(f"sleep {generation.fmt_min(patch['sleep'][0])}-{generation.fmt_min(patch['sleep'][1])}")   
        
         for k, v in (patch.get("meals") or {}).items():
             bits.append(f"{k} {generation.fmt_min(v[0])}")
@@ -266,9 +264,6 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         ).fetchall()
     ]
 
-    # A personality directive ("be sarcastic", "don't be a motivational
-    # speaker") typed into chat is stored as a standing contract and applied
-    # to every reply.
     generation.absorb_persona_directive(conn, user["id"], message)
 
     acted = _act_before_llm(conn, user, goal_id, message)
@@ -279,9 +274,7 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
     history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
     goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
 
-    # Content safety: refuse harmful requests before they reach the LLM.
-    # Context-aware: "sister" alone is fine, but as a follow-up to an incest
-    # message it must refuse too.
+  
     if generation._is_truly_harmful(message, context=history):
         refusal = generation.GUARDRAIL_REFUSAL
         _add_message(conn, user["id"], goal_id, "eloise", refusal)
@@ -319,9 +312,7 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
                    "and hit Test connection: the test shows the real error. Once it answers, "
                    "send that again.",
         )
-    # Duplicate gate: a weak model that just said the same thing will say it
-    # again. Spamming the exact previous line is not a reply, so refuse it as
-    # an echo instead of doubling the nonsense on the screen.
+  
     prev = _last_eloise_reply(conn, goal_id, user["id"])
     if prev and _is_near_dup(text, prev):
         conn.commit()
@@ -387,9 +378,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
 
     _add_message(conn, user["id"], goal_id, "user", message)
 
-    # Personality directives ("be sarcastic", "don't be a motivational
-    # speaker") are stored as a standing contract applied to every future
-    # reply.
+   
     generation.absorb_persona_directive(conn, user["id"], message)
 
     acted = _act_before_llm(conn, user, goal_id, message)
@@ -413,12 +402,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
             media_type="text/event-stream",
         )
 
-    # No canned replies: if the model can't be reached right now, say so with
-    # a real error instead of fabricating an Eloise answer. A streaming
-    # response can't change status mid-frame, so if the model is genuinely
-    # unreachable the stream itself fails with an honest error frame — and if
-    # it's merely BUSY, the call queues on the shared model lock instead of
-    # being read as "down" by a fast probe.
+ 
     def generate():
         collected = []
         gconn = get_connection()
@@ -596,7 +580,7 @@ def quick_command(body: QuickCommandRequest, user: dict = Depends(require_user))
             "source": "quick",
         }
 
-    return {"reply": "I don't know that command. Try Today, Score, Fire, Momentum, Fuck it, or Stakes.", "source": "quick"}
+    return {"reply": "I don't know that command. Try Today, Score, Fire, Momentum, Reschedule, or Stakes.", "source": "quick"}
 
 
 @router.post("/chat/nudge")

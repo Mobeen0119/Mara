@@ -9,7 +9,7 @@ const api = async (path, opts = {}) => {
   };
   if (token) headers["Authorization"] = "Bearer " + token;
   const res = await fetch("/api" + path, { ...opts, headers });
-  if (res.status === 401) {
+  if (res.status === 401 && token) {
     logout();
     throw new Error("unauthorized");
   }
@@ -125,9 +125,6 @@ function safeLink(url) {
   return s;
 }
 
-/* ============================================================
-   Modals
-   ============================================================ */
 function closeModal() {
   const m = document.getElementById("app-modal");
   if (m) m.remove();
@@ -236,79 +233,146 @@ async function respondCheckIn(done) {
   } catch (e) {}
 }
 
-function renderAuth() {
-  const form = document.getElementById("auth-form");
-  form.innerHTML = `
-    <div id="auth-signin">
-      <h2>Claim a seat</h2>
-      <p class="sub">Eloise keeps the ledger. You keep time.</p>
-      <div class="field"><label>Name</label><input type="text" id="auth-name" placeholder="Your name"></div>
-      <div class="field"><label>Email</label><input type="email" id="auth-email" placeholder="You@place.com"></div>
-      <div class="field"><label>Password</label><input type="password" id="auth-pass" placeholder="At least 6 characters"></div>
-      <button class="btn" onclick="doSignup()">Sign in</button>
-      <div class="rule"><span>or</span></div>
-      <button class="btn btn-ghost" onclick="showGuest()">Guest pass — no email</button>
-    </div>
-    <div id="auth-guest" class="hidden">
-      <h2>Guest pass</h2>
-      <p class="sub">Walk in. No password, no verification.</p>
-      <div class="field"><label>Just a name</label><input type="text" id="guest-name" placeholder="What do we call you?"></div>
-      <div class="field"><label>Email (needed to get schedules emailed)</label><input type="email" id="guest-email" placeholder="You@place.com"></div>
-      <button class="btn" onclick="doGuest()">Take a seat</button>
-      <div class="rule"><span>or</span></div>
-      <button class="btn btn-ghost" onclick="showSignin()">&#8617; Sign in instead</button>
-    </div>
-  `;
+let _authTab = "signin";
+let _codeLogin = false;
+async function renderAuth(tab) {
+  if (tab) _authTab = tab;
+  try {
+    _codeLogin = !!(await fetch("/api/auth/config").then((r) => r.json()))
+      .code_login;
+  } catch (e) {
+    _codeLogin = false;
+  }
+  const tabs = [
+    ["signin", "Sign in"],
+    ["signup", "New here"],
+    ["guest", "Guest"],
+  ];
+  const head = `<div class="auth-tabs" role="tablist">${tabs
+    .map(
+      ([k, l]) =>
+        `<button role="tab" aria-selected="${k === _authTab}" onclick="renderAuth('${k}')">${l}</button>`,
+    )
+    .join("")}</div>`;
+  const forms = {
+    signin: `<h2>Welcome back</h2>
+      <div class="field"><label for="auth-email">Email</label><input type="email" id="auth-email" autocomplete="username" placeholder="you@place.com"></div>
+      <div id="auth-pass-box"><div class="field"><label for="auth-pass">Password</label><input type="password" id="auth-pass" autocomplete="current-password" placeholder="Your password"></div>
+      <button class="btn" onclick="doLogin()">Sign in</button></div>
+      <div id="auth-code-box" class="hidden"><div class="field"><label for="auth-code">6-digit code from your email</label><input type="text" id="auth-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="123456"></div>
+      <button class="btn" onclick="verifyCode()">Sign in with code</button></div>
+      ${_codeLogin ? '<button class="auth-link" id="auth-code-toggle" onclick="requestCode()">Email me a code instead of a password</button>' : ""}`,
+    signup: `<h2>New here</h2>
+      <div class="field"><label for="auth-name">Name</label><input type="text" id="auth-name" autocomplete="name" placeholder="What should I call you?"></div>
+      <div class="field"><label for="auth-email">Email</label><input type="email" id="auth-email" autocomplete="username" placeholder="you@place.com"></div>
+      <div class="field"><label for="auth-pass">Password</label><input type="password" id="auth-pass" autocomplete="new-password" placeholder="At least 8 characters"></div>
+      <button class="btn" onclick="doSignup()">Create account</button>
+      <p class="auth-note">Your email is only used to sign you in and send you your own plan.</p>`,
+    guest: `<h2>Just try it</h2>
+      <div class="field"><label for="guest-name">First name</label><input type="text" id="guest-name" autocomplete="given-name" placeholder="What do we call you?"></div>
+      <button class="btn" onclick="doGuest()">Start now</button>
+      <p class="auth-note">No email, no password. Your guest workspace lives in this browser, so clear it or switch device and it is gone. Create an account whenever you want to keep things.</p>`,
+  };
+  document.getElementById("auth-form").innerHTML = head + forms[_authTab];
+  const first = document.querySelector("#auth-form input");
+  if (first) first.focus();
+  document.querySelectorAll("#auth-form input").forEach((i) =>
+    i.addEventListener("keydown", (e) => {
+      if (e.key === "Enter")
+        document.querySelector("#auth-form .btn:not(.hidden)")?.click();
+    }),
+  );
 }
-function showGuest() {
-  document.getElementById("auth-signin").classList.add("hidden");
-  document.getElementById("auth-guest").classList.remove("hidden");
-  const n = document.getElementById("guest-name");
-  if (n) {
-    n.value = document.getElementById("auth-name").value || "";
-    n.focus();
+function _startSession(r) {
+  token = r.token;
+  userName = r.name;
+  localStorage.setItem("eloise_token", token);
+  localStorage.setItem("eloise_name", userName);
+  enterApp();
+}
+async function doLogin() {
+  try {
+    _startSession(
+      await api("/login", {
+        method: "POST",
+        body: JSON.stringify({
+          email: document.getElementById("auth-email").value.trim(),
+          password: document.getElementById("auth-pass").value,
+        }),
+      }),
+    );
+  } catch (e) {
+    showToast(
+      e.message === "unauthorized"
+        ? "That email and password do not match."
+        : e.message,
+      "error",
+    );
   }
 }
-function showSignin() {
-  document.getElementById("auth-guest").classList.add("hidden");
-  document.getElementById("auth-signin").classList.remove("hidden");
-}
 async function doSignup() {
-  const body = {
-    name: document.getElementById("auth-name").value,
-    email: document.getElementById("auth-email").value,
-    password: document.getElementById("auth-pass").value,
-  };
   try {
-    const r = await api("/signup", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    token = r.token;
-    userName = r.name;
-    localStorage.setItem("eloise_token", token);
-    localStorage.setItem("eloise_name", userName);
-    enterApp();
+    _startSession(
+      await api("/signup", {
+        method: "POST",
+        body: JSON.stringify({
+          name: document.getElementById("auth-name").value.trim(),
+          email: document.getElementById("auth-email").value.trim(),
+          password: document.getElementById("auth-pass").value,
+        }),
+      }),
+    );
   } catch (e) {
     showToast(e.message, "error");
   }
 }
+async function requestCode() {
+  const email = document.getElementById("auth-email").value.trim();
+  if (!email) {
+    showToast("Type your email first.", "error");
+    return;
+  }
+  try {
+    await api("/auth/code/request", {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    });
+    document.getElementById("auth-pass-box").classList.add("hidden");
+    document.getElementById("auth-code-box").classList.remove("hidden");
+    document.getElementById("auth-code-toggle").classList.add("hidden");
+    document.getElementById("auth-code").focus();
+    showToast(
+      "If that address has an account, a code is on its way. It lasts 10 minutes.",
+      "success",
+    );
+  } catch (e) {
+    showToast(e.message, "error");
+  }
+}
+async function verifyCode() {
+  try {
+    _startSession(
+      await api("/auth/code/verify", {
+        method: "POST",
+        body: JSON.stringify({
+          email: document.getElementById("auth-email").value.trim(),
+          code: document.getElementById("auth-code").value.trim(),
+        }),
+      }),
+    );
+  } catch (e) {
+    showToast(
+      e.message === "unauthorized" ? "That code did not work." : e.message,
+      "error",
+    );
+  }
+}
 async function doGuest() {
   const name = document.getElementById("guest-name")?.value?.trim() || "Guest";
-  const email =
-    document.getElementById("guest-email")?.value?.trim() || undefined;
   try {
-    const r = await api("/guest", {
-      method: "POST",
-      body: JSON.stringify({ name, email }),
-    });
-    token = r.token;
-    userName = r.name;
-    localStorage.setItem("eloise_token", token);
-    localStorage.setItem("eloise_name", userName);
-    if (email)
-      showToast("Seat's taken. You'll get the list emailed.", "success");
-    enterApp();
+    _startSession(
+      await api("/guest", { method: "POST", body: JSON.stringify({ name }) }),
+    );
   } catch (e) {
     showToast(e.message, "error");
   }
@@ -320,7 +384,9 @@ function logout() {
   localStorage.removeItem("eloise_name");
   document.getElementById("app-screen").classList.add("hidden");
   document.getElementById("auth-screen").classList.remove("hidden");
-  renderAuth();
+  closeModal();
+  document.querySelectorAll(".onboarding-overlay").forEach((n) => n.remove());
+  renderAuth("signin");
 }
 async function syncTimezone() {
   try {
@@ -363,9 +429,6 @@ async function refreshFootMomentum() {
   }
 }
 
-/* ============================================================
-   Cinematic onboarding — first-run seat & demo files
-   ============================================================ */
 async function maybeOnboarding() {
   if (!token) return;
   try {
@@ -446,10 +509,6 @@ async function onboardSeedGo() {
 }
 const onboardSeed = onboardSeedGo;
 
-/* ============================================================
-   Navigation & router — hash-backed so refresh keeps the page and
-   the browser back button works.
-   ============================================================ */
 const KNOWN_SCREENS = [
   "today",
   "board",
@@ -534,9 +593,6 @@ window.addEventListener("hashchange", () => {
   routeFromHash();
 });
 
-/* ============================================================
-   Today
-   ============================================================ */
 async function renderToday(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Today —</div><h1>…</h1></div>`;
   try {
@@ -645,10 +701,6 @@ async function renderToday(el) {
   }
 }
 
-/* ============================================================
-   Day Dial — the whole 24h as a ring: sleep/meals/busy on the outer
-   rail, planned tasks on the main track, a needle for "now".
-   ============================================================ */
 const _DIAL_COLORS = [
   "#ffb25b",
   "#ff6b86",
@@ -770,9 +822,6 @@ async function ackIntervention(interventionId, goalId) {
   navigate("today");
 }
 
-/* ============================================================
-   Board — momentum, pressure, stakes (the "how'd they do that" view)
-   ============================================================ */
 async function renderBoard(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Board</div><h1>…</h1></div>`;
   try {
@@ -834,21 +883,6 @@ async function renderBoard(el) {
       html += `</div>`;
     }
 
-    // — stakes removed per user request — //
-    /* if (m.stakes && m.stakes.length > 0) {
-      html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">On the line</div>
-        <h1>Debt.</h1><div class="header-rule"></div></div>`;
-      m.stakes.forEach(s => {
-        html += `<div class="card stake-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-            <div style="flex:1;"><span class="chip bad">STAKED</span> <strong style="color:var(--bone);">${escHtml(s.punishment)}</strong>
-              <span class="sub" style="margin:6px 0 0;display:block;color:var(--bone-dim);">if <strong style="color:var(--bone);">${escHtml(s.display_title)}</strong> slips, this comes due.</span></div>
-            <button class="btn btn-sm btn-danger" style="color:#fff;" onclick="callInDebt(${escHtml(s.goal_id)})">Call it in</button>
-          </div>
-        </div>`;
-      });
-    } */
-
     html += `</div>`; // close .screen-fill
     el.innerHTML = html;
   } catch (e) {
@@ -865,9 +899,6 @@ async function callInDebt(goalId) {
   }
 }
 
-/* ============================================================
-   Goals
-   ============================================================ */
 async function renderGoals(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Goals</div><h1>…</h1></div>`;
   try {
@@ -918,9 +949,6 @@ async function renderGoals(el) {
   }
 }
 
-/* ============================================================
-   Goal detail
-   ============================================================ */
 async function renderGoalDetail(el, id) {
   el.innerHTML = `<div class="page-header"><div class="kicker">On file</div><h1>…</h1></div>`;
   try {
@@ -958,10 +986,7 @@ async function renderGoalDetail(el, id) {
 
     try {
       const rt = await api("/routine");
-      if (rt.assumed && rt.assumed.length) {
-        html += `<div class="card call-card"><div class="kicker">Assuming</div>
-          <p style="margin:0">${escHtml(rt.assumed.join("; "))}. Wrong? Tell Eloise in chat, e.g. "I sleep 1am to 9am" or "gym is 7 to 8am", and every plan redraws.</p></div>`;
-      }
+      html += routineCardHtml(rt);
     } catch (e) {
       /* optional */
     }
@@ -1306,9 +1331,6 @@ async function deleteGoal(id) {
   } catch (e) {}
 }
 
-/* ============================================================
-   New goal
-   ============================================================ */
 function renderNewGoal(el) {
   let html = `<div class="page-header"><div class="kicker">New file</div><h1>What's on the table.</h1><p class="sub">Give it a name, a date, and what's off-limits.</p><div class="header-rule"></div></div>
     <div class="card">
@@ -1428,9 +1450,6 @@ async function submitQuestionnaire(e, goalId) {
   navigate("goal", goalId);
 }
 
-/* ============================================================
-   Schedule
-   ============================================================ */
 async function renderSchedule(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Schedule</div><h1>…</h1></div>`;
   try {
@@ -2183,9 +2202,6 @@ async function sendGoalChat(goalId) {
   }
 }
 
-/* ============================================================
-   Settings
-   ============================================================ */
 async function renderSettings(el) {
   let html = `<div class="page-header"><div class="kicker">Settings</div><h1>Tuning the rig.</h1><div class="header-rule"></div></div>`;
   try {
@@ -2256,15 +2272,8 @@ async function renderSettings(el) {
     try {
       rt = await api("/routine");
     } catch (e) {}
-    if (rt) {
-      html += `<div class="settings-section"><h3>Your routine</h3>
-      <div class="card">
-        <p style="font-size:15px;line-height:1.6;margin:0 0 10px;">${escHtml(rt.routine)}</p>
-        ${(rt.assumed || []).length ? `<p class="field-hint">Assumed, not told: ${escHtml(rt.assumed.join("; "))}.</p>` : ""}
-        <p class="field-hint">Every goal follows this one routine. To change it, tell Eloise: "I sleep 1am to 9am", "gym at 7am".</p>
-        <button class="btn btn-ghost" style="width:auto;" onclick="toggleChatPanel(true)">Tell Eloise</button>
-      </div></div>`;
-    }
+    if (rt)
+      html += `<div class="settings-section"><h3>Your routine</h3>${routineCardHtml(rt)}</div>`;
     html += `<div class="settings-section"><h3>Location</h3>
       <div class="card">
         <p style="font-size:13px;color:var(--bone-dim);margin-bottom:14px;">Where you actually live. Chat and schedules only suggest services, shops and apps that exist here — no DoorDash in Lahore.</p>
@@ -2338,8 +2347,6 @@ async function renderSettings(el) {
     const elc = document.getElementById("set-enable-local");
     if (elc) elc.checked = !!llmState.enable_local;
   }
-  // Pasting a key snaps the provider to match it, so a Gemini key never
-  // silently lands on an OpenRouter endpoint (the old way nothing changed).
   const keyInput = document.getElementById("set-api-key");
   if (keyInput) keyInput.addEventListener("input", _detectProviderFromKey);
   renderBusyWindows();
@@ -2410,6 +2417,47 @@ async function saveLLMSettings() {
   }
   await testLLMSettings();
 }
+function routineCardHtml(rt) {
+  const rows = (rt.rows || [])
+    .map(
+      (r) => `<div class="rt-row" data-key="${r.key}">
+      <span class="rt-name">${escHtml(r.label)}</span>
+      <span class="rt-time"><input type="time" value="${r.from}" aria-label="${escHtml(r.label)} start"> to <input type="time" value="${r.to}" aria-label="${escHtml(r.label)} end"></span>
+      <span class="rt-src ${r.source === "assumed" ? "guess" : ""}">${r.source === "assumed" ? "my guess" : escHtml(r.source)}</span>
+    </div>`,
+    )
+    .join("");
+  const fixed = (rt.fixed || [])
+    .map(
+      (f) =>
+        `<span class="chip off">${escHtml(f.days)} ${f.from}-${f.to}</span>`,
+    )
+    .join(" ");
+  const guess = (rt.assumed || []).length;
+  return `<div class="card routine-card" id="routine-card">
+    <div class="kicker">${guess ? "Your day, part guessed" : "Your day, as I have it"}</div>
+    ${rows}
+    ${fixed ? `<div class="rt-fixed">Also blocked: ${fixed}</div>` : ""}
+    <div class="rt-actions"><button class="btn" style="width:auto;" onclick="saveRoutine()">Save and replan</button>
+    <span class="field-hint">Every goal plans around this one day. Or just tell me in chat.</span></div>
+  </div>`;
+}
+
+async function saveRoutine() {
+  const body = {};
+  document.querySelectorAll("#routine-card .rt-row").forEach((row) => {
+    const t = row.querySelectorAll("input");
+    if (t[0].value && t[1].value)
+      body[row.dataset.key] = [t[0].value, t[1].value];
+  });
+  try {
+    await api("/routine", { method: "POST", body: JSON.stringify(body) });
+    showToast("Saved. Redrawing every plan around it.");
+  } catch (e) {
+    showToast(e.message || "Could not save that.");
+  }
+}
+
 async function testLLMSettings() {
   _setTestResult("pending", "Contacting the provider…");
   try {
@@ -2549,7 +2597,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const ru = document.getElementById("orbit-user");
     if (ru) ru.textContent = (userName || "?").slice(0, 1).toUpperCase();
     enterApp();
-
+    // Restore the page from the URL hash (refresh keeps your place).
     if (!routeFromHash()) navigate("today");
   } else {
     document.getElementById("auth-screen").classList.remove("hidden");

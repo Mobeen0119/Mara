@@ -63,9 +63,23 @@ def _apply(state, key, win, source):
         state["meals"][key] = (win[0] % 1440, win[1] % 1440 if win[1] - win[0] >= 20 else (win[0] + 45) % 1440)
 
 
+_DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def weekdays_in(label):
+    """Which weekdays a constraint applies to; None means every day."""
+    low = (label or "").lower()
+    if re.search(r"\bweek ?days?\b|\bmon(?:day)?\s*(?:-|to|through)\s*fri", low):
+        return {0, 1, 2, 3, 4}
+    if re.search(r"\bweek ?ends?\b", low):
+        return {5, 6}
+    found = {v for k, v in _DAY_NAMES.items() if re.search(rf"\b{k}[a-z]*\b", low)}
+    return found or None
+
+
 def merged(conn, user):
     uid = user["id"]
-    state = {"sleep": None, "meals": {}, "workout": None, "peak": None, "seen": set(), "src": {}, "other": []}
+    state = {"sleep": None, "meals": {}, "workout": None, "peak": None, "seen": set(), "src": {}, "other": [], "dated": []}
     urow = conn.execute("SELECT routine, blocked_windows FROM users WHERE id=?", (uid,)).fetchone()
     mine = _jl(urow["routine"] if urow and "routine" in urow.keys() else "", {})
     if mine.get("sleep"):
@@ -105,8 +119,13 @@ def merged(conn, user):
             continue
         if act:
             _apply(state, act, win, src)
-        elif tuple(win) not in state["other"]:
-            state["other"].append(tuple(win))
+        else:
+            days = weekdays_in(lab)
+            if days:
+                if (tuple(win), days) not in state["dated"]:
+                    state["dated"].append((tuple(win), days))
+            elif tuple(win) not in state["other"]:
+                state["other"].append(tuple(win))
     assumed = []
     if state["sleep"] is None:
         state["sleep"] = DEFAULT_SLEEP
@@ -122,6 +141,24 @@ def merged(conn, user):
 
 def human_windows(r):
     return [tuple(r["sleep"])] + [tuple(w) for w in r["meals"].values()]
+
+
+def dated_busy(r, today, deadline):
+    """Weekday-specific busy windows (class on weekdays, church on Sunday) as {date: [(s, e)]}."""
+    from datetime import date, timedelta
+    out = {}
+    try:
+        d, end = date.fromisoformat(today), date.fromisoformat(deadline)
+    except Exception:
+        return out
+    n = 0
+    while d <= end and n < 400:
+        for win, days in r.get("dated", []):
+            if d.weekday() in days:
+                out.setdefault(d.isoformat(), []).append(tuple(win))
+        d += timedelta(days=1)
+        n += 1
+    return out
 
 
 def blocked_windows(r):

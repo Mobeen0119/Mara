@@ -84,30 +84,24 @@ def detect(conn, user_id, message, today, goal_id=None):
         if best and _score(text, best["title"]) >= 1:
             return _store(conn, user_id, "delete_task", best["goal_id"], [best["id"]], f"Delete task \"{best['title']}\"?")
         return None
-   
     if not done:
         return None
     tasks = _pending(conn, user_id, today, goal_id)
-  
     if _ALL.search(text) and re.search(r"\btoday|tasks?\b", text, re.I) and tasks:
         ids = [t["id"] for t in tasks if t["date"] == today] or [t["id"] for t in tasks]
         return _store(conn, user_id, "complete_all_today", goal_id, ids, f"Mark all {len(ids)} of today's pending tasks done?")
     scored = sorted(((_score(text, t["title"] + " " + t["display_title"]), t) for t in tasks), key=lambda x: -x[0])
- 
     if scored and scored[0][0] >= 1:
         top = scored[0][0]
         chosen = [t for s, t in scored if s == top][:3]
-   
         if len(chosen) == 1 or len({t["goal_id"] for t in chosen}) == 1:
             ids = [t["id"] for t in chosen]
             names = "; ".join(t["title"] for t in chosen)
             return _store(conn, user_id, "complete_task", chosen[0]["goal_id"], ids, f"Mark done: {names}?")
-   
     if goal_id and _GOALISH.search(text) or (goal_id and _ALL.search(text)):
         g = conn.execute("SELECT display_title FROM goals WHERE id=? AND user_id=?", (goal_id, user_id)).fetchone()
         if g:
             return _store(conn, user_id, "complete_goal", goal_id, [], f"Close \"{g['display_title']}\" as achieved? Every remaining task gets marked done.")
-   
     if goal_id and tasks:
         t = tasks[0]
         return _store(conn, user_id, "complete_task", goal_id, [t["id"]], f"Mark done: {t['title']}?")
@@ -116,25 +110,20 @@ def detect(conn, user_id, message, today, goal_id=None):
 
 def resolve(conn, user_id, proposal_id, accept):
     row = conn.execute("SELECT * FROM pending_actions WHERE id=? AND user_id=?", (proposal_id, user_id)).fetchone()
-  
     if not row:
         return {"ok": False, "detail": "proposal not found"}
-   
     if row["status"] != "open":
         return {"ok": False, "detail": "already handled"}
-   
     if row["expires_at"] < _now().isoformat():
         conn.execute("UPDATE pending_actions SET status='expired' WHERE id=?", (proposal_id,))
         conn.commit()
         return {"ok": False, "detail": "That proposal expired. Say it again."}
-  
     if not accept:
         conn.execute("UPDATE pending_actions SET status='declined' WHERE id=?", (proposal_id,))
         conn.commit()
         return {"ok": True, "applied": False, "message": "Fine, nothing touched."}
     ids = json.loads(row["ids"] or "[]")
     kind, gid = row["kind"], row["goal_id"]
-   
     if isinstance(ids, dict):
         from core import actions
         user = dict(conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
@@ -145,32 +134,26 @@ def resolve(conn, user_id, proposal_id, accept):
         conn.commit()
         return {"ok": True, "applied": True, "kind": kind, "goal_id": out.get("goal_id", gid), "message": out["message"]}
     marks = ",".join("?" * len(ids)) or "NULL"
-   
     if kind in ("complete_task", "complete_all_today"):
         conn.execute(f"UPDATE actions SET status='done' WHERE user_id=? AND id IN ({marks})", [user_id, *ids])
         msg = f"Marked {len(ids)} done."
-  
     elif kind == "delete_task":
         conn.execute(f"DELETE FROM actions WHERE user_id=? AND id IN ({marks})", [user_id, *ids])
         msg = "Task deleted."
-  
     elif kind == "slide_all":
         conn.execute(
             f"UPDATE actions SET date=date(date,'+1 day') WHERE user_id=? AND status='pending' AND id IN ({marks}) "
             "AND date < (SELECT deadline FROM goals WHERE id=actions.goal_id)", [user_id, *ids])
         msg = "Everything pending slid a day."
-  
     elif kind == "complete_goal":
         conn.execute("UPDATE goals SET status='succeeded', manually_succeeded=1 WHERE id=? AND user_id=?", (gid, user_id))
         conn.execute("UPDATE actions SET status='done' WHERE goal_id=? AND status='pending'", (gid,))
         msg = "Goal closed as achieved."
-  
     elif kind == "cancel_goal":
         conn.execute("UPDATE goals SET status='cancelled', plan_status=? WHERE id=? AND user_id=?",
                      (f"cancelled: {row['note'] or 'by you'}", gid, user_id))
         conn.execute("DELETE FROM actions WHERE goal_id=? AND status!='done'", (gid,))
         msg = "Goal cancelled. Done work stays on the record."
-   
     else:
         return {"ok": False, "detail": "unknown proposal"}
     conn.execute("UPDATE pending_actions SET status='applied' WHERE id=?", (proposal_id,))
@@ -189,19 +172,39 @@ _SCREENS = (
 )
 
 
+_LOOSE = re.compile(r"\b(show|see|open|view|check|look|where|what|whats|what's|how|take|go|take me|switch|want|need|let me|can i|bring)\b", re.I)
+_LOOSE_SCREENS = (
+    (r"\b(what'?s|whats)\s+(on|up)\b|\bfor today\b|\bmy day\b|\btoday\b", "today", "Today. This is what's on you."),
+    (r"\bhow am i doing\b|\bhow('?s| is) it going\b|\bscore\b|\bpressure\b|\bstreak\b|\bbehind\b|\bprogress\b", "board", "The pressure board. Try not to flinch."),
+    (r"\b(schedule|calendar|timetable|week|plan)\b", "schedule", "Here's the plan, all of it."),
+    (r"\b(settings?|api key|provider|account|notifications?)\b", "settings", "Settings. Don't break anything."),
+    (r"\b(add|new|start|create|set up|begin)\b.*\bgoal\b|\bnew goal\b", "new-goal", "Fine. Tell me what you're chasing."),
+    (r"\b(my |all |every )?goals\b", "goals", "Everything you've committed to."),
+)
+
+
+def _loose_screen(message):
+    low = (message or "").lower().strip()
+    if len(low.split()) > 9 or not _LOOSE.search(low):
+        return None
+    if re.search(r"\b(move|change|delete|remove|cancel|reschedule|push|slide|finish|complete|mark)\b", low):
+        return None
+    for pat, screen, line in _LOOSE_SCREENS:
+        if re.search(pat, low):
+            return {"reply": line, "ui": {"screen": screen}}
+    return None
+
+
 def navigate(conn, user_id, message):
     m = _NAV.match((message or "").strip())
-   
     if not m or len(message.split()) > 8:
-        return None
+        return _loose_screen(message)
     target = m.group(1).strip().lower()
-   
     for names, screen, line in _SCREENS:
         if target in names:
             return {"reply": line, "ui": {"screen": screen}}
     goals = _goals(conn, user_id)
     best = max(goals, key=lambda g: _score(target, g["title"] + " " + g["display_title"]), default=None)
-  
     if best and _score(target, best["title"] + " " + best["display_title"]) >= 1:
         return {"reply": f"Opening {best['display_title']}.", "ui": {"screen": "goal", "id": best["id"]}}
-    return None
+    return _loose_screen(message)

@@ -908,7 +908,7 @@ def _is_event_goal(text):
 _HABIT_WORDS = ("gym", "workout", "work out", "six pack", "six-pack", "6 pack", "6-pack", "abs",
                 "fitness", "get fit", "lose weight", "weight loss", "fat loss", "muscle", "bulk",
                 "cut ", "run ", "running", "marathon", "yoga", "diet", "walk daily", "stretch",
-                "pushup", "push-up", "pull-up", "body")
+                "pushup", "push-up", "pull-up", "body", "lose ", "slim", "stamina", "cardio", "jogging", "calisthenic")
 _WORKOUT_LABELS = ("gym", "workout", "work out", "run", "jog", "yoga", "swim", "training", "exercise", "sport")
 _EVENT_BUDGET_MIN = {"hookup": 360, "romance": 300, "event": 420}
 _EVENT_ACTIVE_DAYS = 3
@@ -1229,7 +1229,10 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     except Exception:
         constraints = []
     blocked = []
+    from core import routine as _rtm
     for c in constraints:
+        if get_routine() and _rtm.weekdays_in(c):
+            continue
         w = parse_time_window(c)
         if w:
             blocked.append(w)
@@ -1259,12 +1262,17 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         return _hookup_arc(today, deadline, blocked, details,
                            goal.get("title") or goal["display_title"])
 
+    _fixed_dated = {}
+    if get_routine():
+        from core import routine as _rt
+        _fixed_dated = _rt.dated_busy(get_routine(), today, deadline)
+
     def _day_bounds(day_date=None):
         # convert blocked windows into a busy silhouette over one day (minutes
         # 0-1439), splitting overnight windows across midnight, plus other
         # goals' booked blocks
         busy = []
-        for (s, e) in blocked:
+        for (s, e) in list(blocked) + list(_fixed_dated.get(day_date, [])):
             s = s % (24 * 60)
             e = (e - s) % (24 * 60) + s  # normalize span, keep end in (s, s+24h]
             if e > 24 * 60:
@@ -1327,13 +1335,14 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         chronotype=planner.infer_chronotype((_r or {}).get("peak") or details.get("peak_energy"), wake, bed),
     )
     others_for = (lambda d: list((busy_by_date or {}).get(d, [])))
+    habit_others = (lambda d: others_for(d) + list(_fixed_dated.get(d, [])))
     profile = effort_profile(goal, max(days_remaining(deadline, today), 0))
     wins = workout_windows()
     if profile["kind"] == "habit" and wins:
         meals = [w for w in (human_windows or []) if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60]
         # meal windows are the short ones in the routine (sleep is long); take their END
         meals = [w for w in meals if w not in wins]
-        horizon = _habit_horizon(today, deadline, wins, now_min, others_for, meals, detail_days, habit_sessions_per_week(goal))
+        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, habit_sessions_per_week(goal))
     else:
         horizon = planner.plan_horizon(
             today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,

@@ -11,7 +11,7 @@ from core import ratelimit
 from core.clock import tz_name_for, valid_tz
 from core.database import get_connection
 from core.deps import bearer_token, require_user
-from core.models import GuestLoginRequest, LoginRequest, SignupRequest, TimezoneRequest
+from core.models import CodeRequest, CodeVerify, GuestLoginRequest, LoginRequest, SignupRequest, TimezoneRequest
 from core.security import _utcnow
 from core.security import (
     burn_password_time, create_session, hash_password, revoke_all_sessions,
@@ -128,6 +128,67 @@ def login(body: LoginRequest, request: Request):
     token = create_session(conn, row["id"])
     return {"token": token, "name": row["name"], "email": row["email"],
             "is_admin": bool(row["is_admin"]), "verified": bool(row["verified"])}
+
+
+CODE_TTL_MIN = 10
+CODE_TRIES = 5
+
+
+def _code_hash(email, code):
+    import hashlib
+    return hashlib.sha256(f"{email}:{code}".encode()).hexdigest()
+
+
+@router.get("/auth/config")
+def auth_config():
+    return {"code_login": _smtp_ready()}
+
+
+@router.post("/auth/code/request")
+def code_request(body: CodeRequest, request: Request):
+    """Same answer whether or not the address has an account, so it can't be used to find accounts.
+    Mail only ever goes to verified, existing, non-guest accounts."""
+    ip = ratelimit.client_ip(request)
+    email = str(body.email).strip().lower()
+    ratelimit.enforce(f"codereq:ip:{ip}", 10, 3600, "too many code requests, try later")
+    ratelimit.enforce(f"codereq:{email}", 4, 3600, "too many code requests, try later")
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM users WHERE lower(email)=? AND is_guest=0 AND verified=1", (email,)).fetchone()
+    if row and _smtp_ready():
+        code = f"{secrets.randbelow(10 ** 6):06d}"
+        exp = (_utcnow() + timedelta(minutes=CODE_TTL_MIN)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT OR REPLACE INTO login_codes (email, code_hash, expires_at, attempts) VALUES (?,?,?,0)",
+                     (email, _code_hash(email, code), exp))
+        conn.commit()
+        from core.mailer import send_email
+        send_email(email, f"{code} is your Eloise sign-in code",
+                   f"Your sign-in code is {code}. It works for {CODE_TTL_MIN} minutes. If this wasn't you, ignore this mail.",
+                   f"<div style='font:16px Georgia,serif;color:#1d2320'>Your sign-in code<div style='font:700 34px monospace;letter-spacing:.2em;margin:10px 0'>{code}</div>"
+                   f"<span style='font:13px sans-serif;color:#6b6358'>Works for {CODE_TTL_MIN} minutes. If this wasn't you, ignore this mail.</span></div>")
+    return {"ok": True}
+
+
+@router.post("/auth/code/verify")
+def code_verify(body: CodeVerify, request: Request):
+    ip = ratelimit.client_ip(request)
+    email = str(body.email).strip().lower()
+    ratelimit.enforce(f"codever:ip:{ip}", 30, 900, "too many attempts, try later")
+    conn = get_connection()
+    rec = conn.execute("SELECT * FROM login_codes WHERE email=?", (email,)).fetchone()
+    bad = HTTPException(status_code=401, detail="wrong or expired code")
+    if not rec or rec["expires_at"] < _utcnow().strftime("%Y-%m-%d %H:%M:%S") or rec["attempts"] >= CODE_TRIES:
+        raise bad
+    if not secrets.compare_digest(rec["code_hash"], _code_hash(email, body.code)):
+        conn.execute("UPDATE login_codes SET attempts=attempts+1 WHERE email=?", (email,))
+        conn.commit()
+        raise bad
+    conn.execute("DELETE FROM login_codes WHERE email=?", (email,))
+    row = conn.execute("SELECT * FROM users WHERE lower(email)=? AND is_guest=0", (email,)).fetchone()
+    if not row:
+        raise bad
+    token = create_session(conn, row["id"])
+    return {"token": token, "name": row["name"], "email": row["email"],
+            "is_admin": bool(row["is_admin"]), "verified": True}
 
 
 @router.post("/guest")

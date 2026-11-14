@@ -59,7 +59,7 @@ def test_redraw_keeps_done_history_and_other_windows(client):
     from core.routes import goal_routes
     u = signup(client)
     h = auth(u["token"])
-    gid = client.post("/api/goals", headers=h, json={"title": "Pass exam", "deadline": _d(9)}).json()["id"]
+    gid = client.post("/api/goals", headers=h, json={"title": "Pass exam", "deadline": _d(90)}).json()["id"]
     conn = get_connection()
     conn.execute("DELETE FROM actions WHERE goal_id=?", (gid,))
     uid = conn.execute("SELECT user_id FROM goals WHERE id=?", (gid,)).fetchone()[0]
@@ -200,3 +200,39 @@ def test_habit_goal_is_not_flagged_for_sitting_in_its_own_gym_window(client):
     assert goal_routes._action_violates_goal_windows(habit) is False
     other = dict(habit, title="Ship the launch", display_title="Ship the launch")
     assert goal_routes._action_violates_goal_windows(other) is True       # normal goals must still avoid the gym
+
+
+def test_short_horizon_redraw_replaces_stale_tasks_past_the_new_window(client):
+    from core.routes import goal_routes
+    u = signup(client)
+    h = auth(u["token"])
+    gid = client.post("/api/goals", headers=h, json={"title": "Pass exam", "deadline": _d(9)}).json()["id"]
+    conn = get_connection()
+    conn.execute("DELETE FROM actions WHERE goal_id=?", (gid,))
+    uid = conn.execute("SELECT user_id FROM goals WHERE id=?", (gid,)).fetchone()[0]
+    conn.execute("INSERT INTO actions (goal_id,user_id,date,title,start_time,end_time,duration_min,status,order_idx)"
+                 " VALUES (?,?,?,?,?,?,60,'pending',0)", (gid, uid, _d(6), "stale task", "14:00", "15:00"))
+    conn.commit()
+    goal = dict(conn.execute("SELECT * FROM goals WHERE id=?", (gid,)).fetchone())
+    new = [{"date": _d(2), "start_time": "16:00", "end_time": "17:00", "title": "Write both stacks from memory"}]
+    assert goal_routes._write_plan(conn, goal, new)
+    assert not conn.execute("SELECT 1 FROM actions WHERE goal_id=? AND title='stale task'", (gid,)).fetchone()
+
+
+def test_importance_is_rated_by_the_model_and_beats_a_nearer_deadline(client, monkeypatch):
+    import types
+    from core import generation, triage
+    from core.routes import goal_routes
+    monkeypatch.setattr(generation, "get_manager", lambda db=None: types.SimpleNamespace(
+        generate=lambda s, u, **k: types.SimpleNamespace(ok=True, text='{"importance": 3}' if "exam" in u else '{"importance": 1}')))
+    u = signup(client)
+    h = auth(u["token"])
+    ids = [client.post("/api/goals", headers=h, json={"title": t, "deadline": _d(n)}).json()["id"]
+           for t, n in (("Pass the exam", 20), ("Anniversary dinner", 2))]
+    conn = get_connection()
+    rows = [dict(conn.execute("SELECT * FROM goals WHERE id=?", (i,)).fetchone()) for i in ids]
+    for r in rows:
+        triage.rate_importance(conn, r)
+    rows = [dict(conn.execute("SELECT * FROM goals WHERE id=?", (i,)).fetchone()) for i in ids]
+    assert [triage.importance_of(r) for r in rows] == [3, 1]
+    assert goal_routes._rank(rows[0]) < goal_routes._rank(rows[1])

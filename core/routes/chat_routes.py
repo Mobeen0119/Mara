@@ -1,3 +1,4 @@
+import re
 import json
 from datetime import date
 
@@ -163,7 +164,10 @@ def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
             "SELECT * FROM general_chat WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
-  
+    # Speed: a bloated context makes the (CPU) model slower. Cap each
+    # message's size and drop the OLDEST turns once the whole history exceeds
+    # a token budget. The model only ever needs the recent tail + the current
+    # question to answer.
     _MAX_TOTAL_CHARS = 2200
     _MAX_MSG_CHARS = 400
     lines = []
@@ -174,11 +178,19 @@ def _history(conn, goal_id, user_id, limit=8, drop_reply_to=None):
         lines.append(f"{r['role']}: {content}")
     while sum(len(l) for l in lines) > _MAX_TOTAL_CHARS and len(lines) > 1:
         lines.pop(0)
-
+    # Structural anti-repeat: ALWAYS drop the most recent Eloise reply from
+    # the LLM's context. Weak models parrot the immediately-previous Eloise
+    # line verbatim when it is in context — that is exactly the "spamming the
+    # same answer" the user hit. Without it in front of them, they cannot copy
+    # it. The latest user message stays in so the model answers the question
+    # actually asked. (drop_reply_to kept for backwards compatibility.)
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip().startswith("eloise:"):
             lines.pop(i)
             break
+    used = [x for x in _recent_lines(conn, goal_id, user_id, 5) if len(x) > 25][:6]
+    if used:
+        lines.append("note: lines you already used, never reuse or rephrase any of them: " + " | ".join(used))
     return lines
 
 
@@ -195,13 +207,10 @@ def _act_before_llm(conn, user, goal_id, message):
         for g in conn.execute("SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall():
             submit_plan(user, g["id"])
         bits = []
-    
         if patch.get("sleep"):
-            bits.append(f"sleep {generation.fmt_min(patch['sleep'][0])}-{generation.fmt_min(patch['sleep'][1])}")   
-       
+            bits.append(f"sleep {generation.fmt_min(patch['sleep'][0])}-{generation.fmt_min(patch['sleep'][1])}")
         for k, v in (patch.get("meals") or {}).items():
             bits.append(f"{k} {generation.fmt_min(v[0])}")
-      
         if patch.get("workout"):
             bits.append(f"workout {generation.fmt_min(patch['workout'][0])}-{generation.fmt_min(patch['workout'][1])}")
         return {"reply": "Noted for every goal, not just this one: " + ", ".join(bits) + ". Redrawing your plans around it.",
@@ -264,6 +273,9 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         ).fetchall()
     ]
 
+    # A personality directive ("be sarcastic", "don't be a motivational
+    # speaker") typed into chat is stored as a standing contract and applied
+    # to every reply.
     generation.absorb_persona_directive(conn, user["id"], message)
 
     acted = _act_before_llm(conn, user, goal_id, message)
@@ -274,7 +286,9 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
     history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
     goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
 
-  
+    # Content safety: refuse harmful requests before they reach the LLM.
+    # Context-aware: "sister" alone is fine, but as a follow-up to an incest
+    # message it must refuse too.
     if generation._is_truly_harmful(message, context=history):
         refusal = generation.GUARDRAIL_REFUSAL
         _add_message(conn, user["id"], goal_id, "eloise", refusal)
@@ -312,7 +326,10 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
                    "and hit Test connection: the test shows the real error. Once it answers, "
                    "send that again.",
         )
-  
+    text = _freshen(conn, goal_id, user["id"], text)
+    # Duplicate gate: a weak model that just said the same thing will say it
+    # again. Spamming the exact previous line is not a reply, so refuse it as
+    # an echo instead of doubling the nonsense on the screen.
     prev = _last_eloise_reply(conn, goal_id, user["id"])
     if prev and _is_near_dup(text, prev):
         conn.commit()
@@ -339,6 +356,41 @@ def _last_eloise_reply(conn, goal_id, user_id):
         return row["content"] if row else ""
     except Exception:
         return ""
+
+
+_SHRUG = re.compile(r"\b(who(?:'s| is| will|'ll)?\s+(?:going|gonna|will)\s+to?\s*remember|who(?:'ll| will) remember|nobody(?:'ll| will)? remember|no one(?:'ll| will)? remember|who remembers|not like anyone(?:'ll| will)? remember)\b", re.I)
+
+
+def _sentences(text):
+    return [x for x in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if x]
+
+
+def _recent_lines(conn, goal_id, user_id, n=8):
+    try:
+        if goal_id:
+            rows = conn.execute("SELECT content FROM chat_messages WHERE goal_id=? AND user_id=? AND role='eloise' ORDER BY id DESC LIMIT ?", (goal_id, user_id, n)).fetchall()
+        else:
+            rows = conn.execute("SELECT content FROM general_chat WHERE user_id=? AND role='eloise' ORDER BY id DESC LIMIT ?", (user_id, n)).fetchall()
+    except Exception:
+        return []
+    return [x for r in rows for x in _sentences(r["content"])]
+
+
+def _freshen(conn, goal_id, user_id, text):
+    import difflib
+    sents = _sentences(text)
+    if len(sents) < 2:
+        return text
+    seen = [x.lower() for x in _recent_lines(conn, goal_id, user_id)]
+    keep = []
+    for i, snt in enumerate(sents):
+        low = snt.lower()
+        if _SHRUG.search(snt):
+            continue
+        if i > 0 and len(snt) > 18 and any(difflib.SequenceMatcher(None, low, o).ratio() > 0.8 for o in seen):
+            continue
+        keep.append(snt)
+    return " ".join(keep) if keep else sents[0]
 
 
 def _is_near_dup(a, b):
@@ -378,7 +430,9 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
 
     _add_message(conn, user["id"], goal_id, "user", message)
 
-   
+    # Personality directives ("be sarcastic", "don't be a motivational
+    # speaker") are stored as a standing contract applied to every future
+    # reply.
     generation.absorb_persona_directive(conn, user["id"], message)
 
     acted = _act_before_llm(conn, user, goal_id, message)
@@ -402,7 +456,12 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
             media_type="text/event-stream",
         )
 
- 
+    # No canned replies: if the model can't be reached right now, say so with
+    # a real error instead of fabricating an Eloise answer. A streaming
+    # response can't change status mid-frame, so if the model is genuinely
+    # unreachable the stream itself fails with an honest error frame — and if
+    # it's merely BUSY, the call queues on the shared model lock instead of
+    # being read as "down" by a fast probe.
     def generate():
         collected = []
         gconn = get_connection()
@@ -439,6 +498,10 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
                 yield _json.dumps({"delta": chunk})
             if collected:
                 joined = "".join(collected)
+                cleaned = _freshen(gconn, goal_id, user["id"], joined)
+                if cleaned != joined:
+                    yield _json.dumps({"replace": cleaned})
+                    joined = cleaned
                 prev = _last_eloise_reply(gconn, goal_id, user["id"])
                 if prev and _is_near_dup(joined, prev):
                     yield _json.dumps({"error": True, "done": True, "source": source or "offline",

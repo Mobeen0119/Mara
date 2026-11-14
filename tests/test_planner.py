@@ -148,7 +148,8 @@ def test_two_goals_drawn_at_once_do_not_collide_or_eat_lunch(client, monkeypatch
             return FakeRes(json.dumps([{"date": d, "start_time": s, "end_time": e, "title": f"Solve problem set {i} on paper"}
                                        for i, (d, s, e) in enumerate(slots)]))
     monkeypatch.setattr(generation, "get_manager", lambda db=None: FakeMgr())
-    monkeypatch.setattr(goal_routes, "submit_plan", lambda *a, **k: True)
+    queued = []
+    monkeypatch.setattr(goal_routes, "submit_plan", lambda user, gid, **k: queued.append(gid) or True)
     u = signup(client)
     h = auth(u["token"])
     ids = []
@@ -162,6 +163,10 @@ def test_two_goals_drawn_at_once_do_not_collide_or_eat_lunch(client, monkeypatch
     user = dict(conn.execute("SELECT * FROM users WHERE id=1").fetchone())
     ts = [threading.Thread(target=goal_routes._regenerate_plan_bg, args=(user, gid)) for gid in ids]
     [t.start() for t in ts]; [t.join(30) for t in ts]
+    for _ in range(4):
+        batch, queued[:] = sorted(set(queued)), []
+        for gid in batch:
+            goal_routes._regenerate_plan_bg(user, gid)
     rows = [dict(r) for r in get_connection().execute("SELECT * FROM actions ORDER BY date, start_time").fetchall()]
     assert rows
     to_min = lambda t: int(t[:2]) * 60 + int(t[3:])

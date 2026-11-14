@@ -825,7 +825,7 @@ def user_blocked_windows(user):
     return out
 
 
-def user_calendar_busy(db, user_id, exclude_goal_id, start_date, end_date):
+def user_calendar_busy(db, user_id, exclude_goal_id, start_date, end_date, only_goal_ids=None):
     """Map date -> [(start_min, end_min), ...] of this user's OTHER goals' pending
     actions in [start_date, end_date]. Lets a plan's slot grid avoid the user's real
     calendar (other goals already occupying time), not just declared busy windows."""
@@ -834,11 +834,13 @@ def user_calendar_busy(db, user_id, exclude_goal_id, start_date, end_date):
         return busy
     try:
         rows = db.execute(
-            "SELECT date, start_time, end_time FROM actions "
+            "SELECT date, start_time, end_time, goal_id FROM actions "
             "WHERE user_id=? AND goal_id!=? AND status!='done' "
             "AND date>=? AND date<=?",
             (user_id, exclude_goal_id, start_date, end_date),
         ).fetchall()
+        if only_goal_ids is not None:
+            rows = [r for r in rows if r["goal_id"] in only_goal_ids]
     except Exception:
         return busy
     for r in rows:
@@ -856,43 +858,9 @@ def user_calendar_busy(db, user_id, exclude_goal_id, start_date, end_date):
     return busy
 
 
-_PERISHABLE_WORDS = (
-    "flower", "bouquet", "cake", "grocer", "produce", "fresh", "meat",
-    "milk", "dairy", "fruit", "vegetable", "ice cream", "ingredient",
-    "dessert", "seafood", "bakery", "salad",
-)
-_EVENT_WORDS = (
-    "date", "night", "dinner", "party", "wedding", "anniversary",
-    "birthday", "gift", "surprise", "proposal", "valentine", "celebration",
-    "getaway", "romantic", "hookup", "intimate",
-)
-
-
-def _is_perishable(text):
-    low = (text or "").lower()
-    return any(w in low for w in _PERISHABLE_WORDS)
-
-
-# Tasks that only make sense on the day itself (cooking, serving, decorating,
-# getting ready, picking up a fresh order). Treated like perishables when
-# ordering an event arc so they land on the event day, not days early.
-_SAME_DAY_WORDS = (
-    "cook", "serve", "bake", "roast", "grill", "fry", "assemble", "decorate",
-    "set up", "setup", "get ready", "pick up", "pickup", "collect", "deliver",
-    "dress", "hair", "makeup", "thaw", "warm", "reheat", "plate", "chill",
-)
-
-
-def _is_same_day(text):
-    low = (text or "").lower()
-    return _is_perishable(text) or any(w in low for w in _SAME_DAY_WORDS)
-
-
 def _is_event_goal(text):
-    low = (text or "").lower()
-    return any(w in low for w in _EVENT_WORDS)
-
-
+    b = getattr(_state_brief, "b", None)
+    return bool(b and b.get("kind") == "event")
 
 
 # ---------------------------------------------------------------------------
@@ -1374,15 +1342,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     full_title = goal.get("title") or goal["display_title"]
     is_event = _is_event_goal(full_title)
 
-    # Order tasks so anything that only makes sense ON the day (fresh flowers,
-    # cooking, decorating, getting ready) sits at the END of the sequence and
-    # lands on the event day — never days early where it would spoil or be
-    # pointless.
-    if split_topics and is_event:
-        same = [t for t in split_topics if _is_same_day(t)]
-        early = [t for t in split_topics if not _is_same_day(t)]
-        split_topics = early + same
-
     packed = []
     for d in reversed(day_list):
         for (s, e) in reversed(day_slots_map.get(d, [])):
@@ -1658,22 +1617,67 @@ def _plan_guidance(title, details_summary):
 
 
 def _goal_chat_log(db, goal):
-    """Pull the goal's chat history (the 'chat notes' the user writes while working)
-    so a regenerated schedule can respect work the user already reports done."""
     if db is None or not goal or not goal.get("id"):
         return ""
+    uid = goal.get("user_id") or 0
+    out = []
     try:
         rows = db.execute(
-            "SELECT role, content FROM chat_messages "
-            "WHERE goal_id=? AND user_id=? ORDER BY id ASC LIMIT 60",
-            (goal["id"], goal.get("user_id") or 0),
+            "SELECT role, content FROM (SELECT id, role, content FROM chat_messages "
+            "WHERE goal_id=? AND user_id=? ORDER BY id DESC LIMIT 40) ORDER BY id ASC",
+            (goal["id"], uid),
         ).fetchall()
-        if not rows:
-            return ""
-        lines = [f"{r['role']}: {r['content']}".strip() for r in rows]
-        return "\n".join(lines)
+        out += [f"{r['role']}: {r['content']}".strip() for r in rows]
     except Exception:
-        return ""
+        pass
+    try:
+        rows = db.execute(
+            "SELECT content FROM (SELECT id, content FROM general_chat WHERE user_id=? AND role='user' "
+            "ORDER BY id DESC LIMIT 15) ORDER BY id ASC", (uid,),
+        ).fetchall()
+        if rows:
+            out.append("(from the main chat, use only what concerns this goal)")
+            out += [f"user: {r['content']}".strip() for r in rows]
+    except Exception:
+        pass
+    try:
+        notes = json.loads(goal.get("details") or "{}").get("plan_notes") or []
+        out += [f"REDRAW INSTRUCTION: {n}" for n in notes[-6:]]
+    except Exception:
+        pass
+    return "\n".join(out)[-6000:]
+
+
+def reorder_naturally(entries, title, db=None):
+    ordered = sorted(entries, key=lambda e: (e["date"], e.get("start_time") or ""))
+    if len(ordered) < 2 or len({e["date"] for e in ordered}) < 2:
+        return entries
+    listing = "\n".join(f"{i}. {e['date']} {e.get('start_time') or ''} - {e.get('title')}" for i, e in enumerate(ordered))
+    sys = ("You sanity-check a schedule the way a sensible person would. Tasks keep their slots, "
+           "but you may reorder which task sits in which slot so the sequence is realistic: "
+           "things that spoil or go stale happen close to when they are used, prerequisites come "
+           "before what depends on them, nothing is done too early to still matter or too late to help. "
+           "Reply with ONLY a JSON array containing every index exactly once, in the new order. "
+           "If the order is already realistic return it unchanged.")
+    try:
+        r = get_manager(db).generate(sys, f"Goal: {title}\nSlots in time order:\n{listing}", timeout=40, max_tokens=300)
+    except Exception:
+        return entries
+    if not (r is not None and getattr(r, "ok", False) and r.text):
+        return entries
+    m = re.search(r"\[[\d,\s]*\]", r.text)
+    try:
+        order = json.loads(m.group(0)) if m else None
+    except Exception:
+        return entries
+    if not order or sorted(order) != list(range(len(ordered))):
+        return entries
+    keys = [k for k in ("title", "description", "details") if any(k in e for e in ordered)]
+    snap = [{k: e.get(k) for k in keys} for e in ordered]
+    for slot, src in zip(ordered, order):
+        for k in keys:
+            slot[k] = snap[src][k]
+    return entries
 
 
 def _extract_links(text):
@@ -1781,7 +1785,9 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             "\n=== CHAT NOTES (the user's own conversation on this file) ===\n"
             f"{chat_log}\n"
             "=== END CHAT NOTES ===\n"
-            "Read those notes BEFORE building the plan. If the user already said a task "
+            "These notes are instructions, not background. If the person asked you to build "
+            "around something, to add, drop or change anything, the new plan MUST visibly do it "
+            "(a REDRAW INSTRUCTION is the newest word and wins). If the user already said a task "
             "or a specific block/time is done or cancelled, DO NOT re-schedule it as pending. "
             "Plan forward from what is still outstanding. Match real dates/times the user "
             "mentioned. Do not invent new topics unrelated to the goal."
@@ -1835,10 +1841,8 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         # the cause (their blocked windows eat every usable hour) instead of
         # the app retrying a model that was never the problem.
         _state.plan_blocked_reason = (
-            "your available windows leave no usable free time between 8am and 11pm on any "
-            "day before the deadline — set or relax the Always-Busy Windows once (Settings "
-            "panel) and redraw. Ignoring whoever told me what you do at those hours would "
-            "mean lying to you, and I don't lie to you."
+            "your fixed windows, plus the goals that outrank this one, leave no usable time "
+            "before the deadline. Push this deadline out or relax a window and I'll redraw."
         )
         return None
     _state.plan_blocked_reason = None

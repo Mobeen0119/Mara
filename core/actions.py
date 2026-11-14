@@ -82,7 +82,7 @@ def _validate(conn, user_id, today, action, a, goals, tasks):
         return intents._store(conn, user_id, "set_deadline", gid(), {"deadline": day()},
                               f"Move \"{g['display_title']}\" deadline from {g['deadline']} to {day()} and redraw the plan?")
     if action == "replan" and gid():
-        return intents._store(conn, user_id, "replan", gid(), {}, f"Redraw the schedule for \"{gids[gid()]['display_title']}\"?")
+        return intents._store(conn, user_id, "replan", gid(), {"note": message[:400]}, f"Redraw the schedule for \"{gids[gid()]['display_title']}\"?")
     if action == "set_checkin" and _TIME.match(str(a.get("time") or "")):
         return intents._store(conn, user_id, "set_checkin", None, {"time": a["time"]},
                               f"Send the daily check-in and email at {a['time']}?")
@@ -115,7 +115,17 @@ def execute(conn, user, row, payload):
         goal_routes.submit_plan(user, gid)
         return {"message": "Deadline moved. Redrawing the plan.", "goal_id": gid}
     if kind == "replan":
-        goal_routes.submit_plan(user, gid)
+        note = (payload or {}).get("note") if isinstance(payload, dict) else None
+        if note:
+            g = conn.execute("SELECT details FROM goals WHERE id=? AND user_id=?", (gid, uid)).fetchone()
+            try:
+                d = json.loads(g["details"] or "{}")
+            except Exception:
+                d = {}
+            d["plan_notes"] = (d.get("plan_notes") or [])[-5:] + [note]
+            conn.execute("UPDATE goals SET details=?, plan_status='generating' WHERE id=?", (json.dumps(d), gid))
+            conn.commit()
+        goal_routes.submit_plan(user, gid, prefer_cloud=True)
         return {"message": "Redrawing it now.", "goal_id": gid}
     if kind == "set_checkin":
         conn.execute("UPDATE users SET checkin_time=? WHERE id=?", (payload["time"], uid))

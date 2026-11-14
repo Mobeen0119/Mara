@@ -2014,3 +2014,17 @@ body.eloise-busy .sigil {
   background: none;
   overflow: hidden;
 }
+.itab[data-screen="new-goal"] {
+  margin-top: 6px;
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 11px 11px;
+  padding-top: 12px;
+}
+@media (max-width: 860px) {
+  .itab[data-screen="new-goal"] {
+    margin-top: 0;
+    border-top: 0;
+    border-radius: 11px;
+    padding-top: 7px;
+  }
+}

@@ -28,7 +28,7 @@ def mk(client, user, title="learn guitar", days=5):
 
 
 # ----- validation: 'banana' deadlines used to poison /scoreboard with a 500 ---------
-@pytest.mark.parametrize("bad", ["banana", "2026-13-45", "", "26-10-2026", "1999-01-01"])
+@pytest.mark.parametrize("bad", ["banana", "2026-13-45", "26-10-2026", "1999-01-01"])
 def test_invalid_deadline_rejected(client, user, bad):
     r = client.post("/api/goals", headers=user["h"], json={"title": "x", "deadline": bad})
     assert r.status_code == 422
@@ -254,6 +254,12 @@ def test_oversized_body_rejected(client):
 def test_constraint_in_one_goal_redraws_the_others(client, monkeypatch):
     calls = []
     monkeypatch.setattr("core.routes.goal_routes.submit_plan", lambda u, gid, **k: calls.append(gid) or True)
+    monkeypatch.setattr("core.routes.goal_routes._rebalance_job", lambda u, ids: calls.extend(ids))
+
+    class _Inline:
+        def submit(self, fn, *a):
+            fn(*a)
+    monkeypatch.setattr("core.routes.goal_routes._get_pool", lambda: _Inline())
     u = signup(client)
     h = auth(u["token"])
     a = client.post("/api/goals", headers=h, json={"title": "A goal", "deadline": _tomorrow(5)}).json()["id"]

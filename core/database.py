@@ -263,6 +263,7 @@ MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT ''",
     "ALTER TABLE goals ADD COLUMN outline TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN routine TEXT DEFAULT ''",
+    "ALTER TABLE goals ADD COLUMN open_ended INTEGER DEFAULT 0",
 ]
 
 # One-shot data migrations, keyed by PRAGMA user_version.

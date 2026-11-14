@@ -192,6 +192,9 @@ function askModal(title, placeholder) {
   });
 }
 
+/* ============================================================
+   24h check-in dialog
+   ============================================================ */
 let _checkinShown = false;
 async function pollCheckIn() {
   if (!token || _checkinShown) return;
@@ -233,6 +236,9 @@ async function respondCheckIn(done) {
   } catch (e) {}
 }
 
+/* ============================================================
+   Auth
+   ============================================================ */
 let _authTab = "signin";
 let _codeLogin = false;
 async function renderAuth(tab) {
@@ -429,6 +435,9 @@ async function refreshFootMomentum() {
   }
 }
 
+/* ============================================================
+   Cinematic onboarding — first-run seat & demo files
+   ============================================================ */
 async function maybeOnboarding() {
   if (!token) return;
   try {
@@ -509,6 +518,10 @@ async function onboardSeedGo() {
 }
 const onboardSeed = onboardSeedGo;
 
+/* ============================================================
+   Navigation & router — hash-backed so refresh keeps the page and
+   the browser back button works.
+   ============================================================ */
 const KNOWN_SCREENS = [
   "today",
   "board",
@@ -593,6 +606,9 @@ window.addEventListener("hashchange", () => {
   routeFromHash();
 });
 
+/* ============================================================
+   Today
+   ============================================================ */
 async function renderToday(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Today —</div><h1>…</h1></div>`;
   try {
@@ -934,7 +950,7 @@ async function renderGoals(el) {
           <div class="title">${escHtml(g.display_title)}</div>
           <div class="meta">
             <span class="chip ${tagCls}">${escHtml(statusText)}</span>
-            <span>Due ${escHtml(g.deadline)}</span>
+            <span>${g.open_ended ? "Ongoing" : "Due " + escHtml(g.deadline)}</span>
             <span class="chip off">${escHtml(g.plan_status)}</span>
             ${g.open_intervention_type ? `<span class="chip bad">flag: ${escHtml(g.open_intervention_type)}</span>` : ""}
           </div>
@@ -956,7 +972,7 @@ async function renderGoalDetail(el, id) {
     let html = `<div class="page-header">
       <div class="kicker">On file · #${escHtml(g.id)}</div>
       <h1>${escHtml(g.display_title)}</h1>
-      <p class="sub">Due ${escHtml(g.deadline)} · ${g.days_left >= 0 ? escHtml(g.days_left) + " days left" : "OVERDUE"} · ${escHtml(g.plan_status)}</p>
+      <p class="sub">${g.open_ended ? "Ongoing, planned to " + escHtml(g.deadline) : "Due " + escHtml(g.deadline) + " · " + (g.days_left >= 0 ? escHtml(g.days_left) + " days left" : "OVERDUE")} · ${escHtml(g.plan_status)}</p>
       <div class="header-rule"></div>
     </div>`;
 
@@ -991,7 +1007,6 @@ async function renderGoalDetail(el, id) {
       /* optional */
     }
 
-    // roadmap: monthly/weekly outline for far-off goals
     try {
       const ro = await api(`/outline/${g.id}`);
       if (ro.outline && ro.outline.periods && ro.outline.periods.length) {
@@ -1332,10 +1347,10 @@ async function deleteGoal(id) {
 }
 
 function renderNewGoal(el) {
-  let html = `<div class="page-header"><div class="kicker">New file</div><h1>What's on the table.</h1><p class="sub">Give it a name, a date, and what's off-limits.</p><div class="header-rule"></div></div>
+  let html = `<div class="page-header"><div class="kicker">New file</div><h1>What's on the table.</h1><p class="sub">Give it a name, a date if it has one, and what's off-limits.</p><div class="header-rule"></div></div>
     <div class="card">
       <div class="field"><label>What needs to get done?</label><input type="text" id="new-goal-title" placeholder="e.g. Study networking exam"></div>
-      <div class="field"><label>Deadline</label><input type="date" id="new-goal-deadline"></div>
+      <div class="field"><label>Deadline <small style="opacity:.7">(optional)</small></label><input type="date" id="new-goal-deadline"><p class="field-hint">Leave it blank if it never really ends, like gym or guitar. I plan a few weeks ahead, keep rolling it forward, and it stays open until you mark it done.</p></div>
       <div class="field"><label>Daily reminder time</label><input type="time" id="new-goal-reminder" value="08:00"></div>
       <div class="field"><label>Constraints</label>
         <div id="constraints-list"></div>
@@ -1375,8 +1390,8 @@ async function createGoal() {
   const title = document.getElementById("new-goal-title").value;
   const deadline = document.getElementById("new-goal-deadline").value;
   const reminder = document.getElementById("new-goal-reminder").value;
-  if (!title || !deadline) {
-    showToast("Name and deadline needed", "error");
+  if (!title) {
+    showToast("Give it a name first", "error");
     return;
   }
   try {
@@ -1563,6 +1578,10 @@ async function toggleTask(id, btn) {
   try {
     const r = await api(`/actions/${id}/toggle`, { method: "POST" });
     const done = r.status === "done";
+    if (r.goal_closed) {
+      showToast("Last task done. Goal closed as achieved.", "success");
+      setTimeout(() => navigate(currentScreen), 1200);
+    }
     row.classList.toggle("done", done);
     row.classList.toggle("missed", !done && r.status === "missed");
     btn.textContent = done ? "REOPEN" : "DONE";
@@ -2089,6 +2108,10 @@ async function streamChatReply(goalId, message, onDelta, onEvent) {
         if (ev.stage && onEvent) onEvent(ev);
         if (ev.delta) {
           full += ev.delta;
+          onDelta(full);
+        }
+        if (ev.replace) {
+          full = ev.replace;
           onDelta(full);
         }
         if (ev.done) {

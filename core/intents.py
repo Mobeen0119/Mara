@@ -137,6 +137,11 @@ def resolve(conn, user_id, proposal_id, accept):
     if kind in ("complete_task", "complete_all_today"):
         conn.execute(f"UPDATE actions SET status='done' WHERE user_id=? AND id IN ({marks})", [user_id, *ids])
         msg = f"Marked {len(ids)} done."
+       
+        from core.routes.goal_routes import close_if_finished
+        for r in conn.execute(f"SELECT DISTINCT goal_id FROM actions WHERE user_id=? AND id IN ({marks})", [user_id, *ids]).fetchall():
+            if close_if_finished(conn, r["goal_id"]):
+                msg += " That was the last task, so the goal is closed as achieved."
     elif kind == "delete_task":
         conn.execute(f"DELETE FROM actions WHERE user_id=? AND id IN ({marks})", [user_id, *ids])
         msg = "Task deleted."

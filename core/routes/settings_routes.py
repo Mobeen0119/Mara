@@ -285,7 +285,7 @@ def put_blocked_windows(body: BlockedWindowsRequest, user: dict = Depends(requir
         if not parse_time_window(text):
             raise HTTPException(
                 status_code=400,
-                detail=f"'{text}' doesn't look like a time window (e.g. '5pm-7pm', 'gym 5-7').",
+                detail=f"'{text}' doesn't look like a time window (e.g. '5pm-7pm', 'class 9-11am').",
             )
         cleaned.append(text)
     conn = get_connection()

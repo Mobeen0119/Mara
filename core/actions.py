@@ -13,7 +13,7 @@ CATALOG = """Actions (reply ONLY JSON {"action": name, "args": {...}} or {"actio
 - set_deadline {goal_id, deadline YYYY-MM-DD}
 - replan {goal_id}  (redraw that goal's schedule)
 - set_checkin {time HH:MM}  (daily check-in and email time)
-- add_constraint {goal_id, text}  (a recurring busy window or rule, e.g. "gym 6-7pm")
+- add_constraint {goal_id, text}  (a recurring busy window or rule, e.g. "class 9-11am")
 - move_task {task_id, date YYYY-MM-DD}
 - create_goal {title, deadline YYYY-MM-DD}
 Use "none" for anything that is not a clear instruction to change the app."""
@@ -55,10 +55,10 @@ def propose(conn, user_id, message, today, goal_id=None, db=None):
         data = json.loads(m.group(0)) if m else {}
     except Exception:
         return None
-    return _validate(conn, user_id, today, data.get("action"), data.get("args") or {}, goals, tasks)
+    return _validate(conn, user_id, today, data.get("action"), data.get("args") or {}, goals, tasks, note=text)
 
 
-def _validate(conn, user_id, today, action, a, goals, tasks):
+def _validate(conn, user_id, today, action, a, goals, tasks, note=""):
     gids = {g["id"]: g for g in goals}
     tids = {t["id"]: t for t in tasks}
 
@@ -82,7 +82,7 @@ def _validate(conn, user_id, today, action, a, goals, tasks):
         return intents._store(conn, user_id, "set_deadline", gid(), {"deadline": day()},
                               f"Move \"{g['display_title']}\" deadline from {g['deadline']} to {day()} and redraw the plan?")
     if action == "replan" and gid():
-        return intents._store(conn, user_id, "replan", gid(), {"note": message[:400]}, f"Redraw the schedule for \"{gids[gid()]['display_title']}\"?")
+        return intents._store(conn, user_id, "replan", gid(), {"note": (note or "")[:400]}, f"Redraw the schedule for \"{gids[gid()]['display_title']}\"?")
     if action == "set_checkin" and _TIME.match(str(a.get("time") or "")):
         return intents._store(conn, user_id, "set_checkin", None, {"time": a["time"]},
                               f"Send the daily check-in and email at {a['time']}?")

@@ -98,7 +98,11 @@ def shutdown_workers():
         pool.shutdown(wait=False, cancel_futures=True)
 
 
-
+# Retry bookkeeping per goal. A failed model call used to spawn "another
+# thread in 60s" forever — a single bad CPU spike could stack unbounded
+# dueling threads. Now each goal gets at most _PLAN_RETRY_MAX scheduled
+# retries with exponential backoff, and only ONE pending retry can exist for a
+# goal at a time.
 _PLAN_RETRY_MAX = 3
 _plan_retry_state = {}  # goal_id -> {"attempts": int, "scheduled": bool}
 _retry_state_lock = threading.Lock()
@@ -140,6 +144,50 @@ def _outranking_ids(conn, user_id, goal):
         "SELECT id, deadline, open_ended, title, details FROM goals WHERE user_id=? AND status='active' AND id!=?", (user_id, goal["id"])).fetchall()]
     me = _rank(goal)
     return {r["id"] for r in rows if _rank(r) < me}
+
+
+def _record_squeeze(conn, goal, today_iso, blocked, busy_by_date, outranking, user=None):
+    got, free = {}, {}
+    generation._build_fallback_plan(goal, today=today_iso, extra_blocked=blocked, busy_by_date=busy_by_date, outline_out=got)
+    generation._build_fallback_plan(goal, today=today_iso, extra_blocked=blocked, busy_by_date={}, outline_out=free)
+    lost = max(0, sum(free.get("slot_minutes", {}).values()) - sum(got.get("slot_minutes", {}).values()))
+    names = [r["title"] for r in conn.execute(
+        f"SELECT title FROM goals WHERE id IN ({','.join('?' * len(outranking))})", list(outranking)).fetchall()] if outranking else []
+    row = conn.execute("SELECT details FROM goals WHERE id=?", (goal["id"],)).fetchone()
+    try:
+        d = json.loads((row["details"] if row else "") or "{}")
+    except Exception:
+        d = {}
+    d["squeezed_min"] = lost if lost >= 60 else 0
+    d["squeezed_by"] = names[:3]
+    conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps(d), goal["id"]))
+    conn.commit()
+    if lost >= 60:
+        _yield_winners(conn, goal, outranking, user)
+
+
+def _yield_winners(conn, goal, outranking, user=None):
+    user = user or dict(conn.execute("SELECT * FROM users WHERE id=?", (goal["user_id"],)).fetchone())
+    eased = []
+    for gid in sorted(outranking, reverse=True):
+        row = conn.execute("SELECT id, details FROM goals WHERE id=?", (gid,)).fetchone()
+        try:
+            d = json.loads(row["details"] or "{}")
+        except Exception:
+            d = {}
+        full = generation.daily_commit_min(d)
+        floor = max(60, int(full * 0.6))
+        now = int(d.get("cap_min") or full)
+        nxt = max(floor, int(now * 0.8))
+        if nxt >= now:
+            continue
+        d["cap_min"] = nxt
+        conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps(d), gid))
+        eased.append(gid)
+    conn.commit()
+    if eased:
+        for gid in eased + [goal["id"]]:
+            submit_plan(user, gid)
 
 
 def _bump_losers(conn, user, goal_id, entries):
@@ -329,7 +377,14 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         blocked = _routine.blocked_windows(rt) + _routine_windows(goal, conn, user)
         from core import triage as _triage
         goal["details"] = json.dumps({**json.loads(goal.get("details") or "{}"), "importance": _triage.rate_importance(conn, goal)})
-        generation.set_brief(generation.goal_brief(goal["title"], conn, goal["deadline"]))
+        _d0 = json.loads(goal.get("details") or "{}")
+        _cached = _d0.get("brief") if _d0.get("brief_for") == goal["title"] else None
+        _brief = _cached or generation.goal_brief(goal["title"], conn, goal["deadline"])
+        if _brief and not _cached:
+            _fresh = json.loads(conn.execute("SELECT details FROM goals WHERE id=?", (goal_id,)).fetchone()["details"] or "{}")
+            conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps({**_fresh, "brief": _brief, "brief_for": goal["title"]}), goal_id))
+            conn.commit()
+        generation.set_brief(_brief)
         kind = generation.effort_profile(goal, 30)["kind"]
         wins = [tuple(rt["workout"])] if rt["workout"] else []
         if kind == "habit" and not wins:
@@ -385,6 +440,7 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
                 _first_day_mail(conn, user, goal_id)
                 try:
                     _bump_losers(conn, user, goal_id, written)
+                    _record_squeeze(conn, goal, today_iso, blocked, busy_by_date, outranking, user)
                 except Exception as exc:
                     logger.warning("bump losers failed: %r", exc)
         if not written:
@@ -404,14 +460,20 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
                     (blocked_msg, goal_id),
                 )
                 conn.commit()
+                try:
+                    _record_squeeze(conn, goal, today_iso, blocked, busy_by_date, outranking, user)
+                except Exception as exc:
+                    logger.warning("squeeze record failed: %r", exc)
                 return
             existing = conn.execute("SELECT COUNT(*) c FROM actions WHERE goal_id=?", (goal_id,)).fetchone()[0]
-            summary = "kept previous schedule (model unavailable, retrying)"
+            err = generation.last_llm_error()
+            tail = f": {err}" if err else ""
+            summary = f"kept previous schedule (model error{tail}, retrying)"
             if existing:
                 logger.warning("plan bg: goal %s LLM down, keeping %s existing entries", goal_id, existing)
             else:
                 logger.warning("plan bg: goal %s LLM down, no schedule yet — will retry", goal_id)
-                summary = "model unavailable — no plan drawn yet, retrying"
+                summary = f"no plan drawn yet (model error{tail}), retrying"
             conn.execute(
                 "UPDATE goals SET plan_status='active', plan_summary=? WHERE id=?",
                 (summary, goal_id),
@@ -1244,7 +1306,7 @@ def seed_demo(user: dict = Depends(require_user)):
         {
             "title": "Ship the v3 launch",
             "deadline": (today + _td(days=5)).isoformat(),
-            "constraints": ["gym 5-7pm"],
+            "constraints": [],
         },
         {
             "title": "Read the floor report",

@@ -1,3 +1,12 @@
+"""Priority triage across ALL of a person's goals.
+
+The planner decides when; this decides what wins when life doesn't fit. It ranks
+goals by evidence (days left, remaining work, slippage, what is at stake) and, when
+something is on fire, names the SOFT commitments (gym, hobbies, social) that should
+give way - never the hard ones (class, work, sleep, meals, family). The output is a
+plain-fact "call" Eloise can state with confidence because every number in it is
+computed, not guessed.
+"""
 import json
 import re
 from datetime import date
@@ -121,7 +130,15 @@ def triage(conn, user, today):
             why.append(f"{missed} missed")
         if st >= 2:
             why.append("high stakes" if st == 3 else "real stakes")
+        sched_h = round(sum((a.get("duration_min") or 0) for a in acts if a["status"] == "pending") / 60.0, 1)
+        try:
+            dd = json.loads(g.get("details") or "{}")
+        except Exception:
+            dd = {}
+        short_h = round((dd.get("squeezed_min") or 0) / 60.0, 1)
+        held_by = dd.get("squeezed_by") or []
         ranked.append({"goal_id": g["id"], "title": g["display_title"], "days_left": left,
+                       "scheduled_hours": sched_h, "short_hours": short_h, "held_by": held_by,
                        "pressure": pr["score"], "remaining_hours": pr["remaining_hours"],
                        "stakes": st, "score": score, "why": ", ".join(why) or "no rush"})
     ranked.sort(key=lambda r: -r["score"])
@@ -149,7 +166,15 @@ def triage(conn, user, today):
             call = f"No fire. '{ranked[0]['title']}' is first in line; keep the rest of your routine."
         else:
             call = ""
-    return {"ranked": ranked, "call": call, "cut": cut, "fire": bool(cut) or bool(call and "wins" in call)}
+    squeezed = [r for r in ranked if r["short_hours"] >= 1]
+    for r in squeezed:
+        by = ", ".join(f"'{x}'" for x in r["held_by"]) or "a higher priority goal"
+        gym = soft[0]["label"] if soft else ""
+        options = [f"{gym} can wait a day" if gym else "", "push the deadline", "give it more time a day"]
+        note = f"'{r['title']}' lost about {r['short_hours']}h to {by}. Your options: {'; '.join(o for o in options if o)}."
+        call = f"{call} {note}".strip()
+    fire = bool(cut) or bool(call and "wins" in call) or bool(squeezed)
+    return {"ranked": ranked, "call": call, "cut": cut, "squeezed": [r["goal_id"] for r in squeezed], "fire": fire}
 
 
 def summary_line(conn, user, today):

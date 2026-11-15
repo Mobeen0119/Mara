@@ -83,6 +83,10 @@ def last_provider():
     return getattr(_state, "last_provider", None)
 
 
+def last_llm_error():
+    return getattr(_state, "last_error", None)
+
+
 def get_manager(db=None):
     global _manager
     if _manager is None:
@@ -381,8 +385,8 @@ def _global_chat_prompt(summary, history, user_name, message):
         f"stop. Never leave it hanging, never end by asking them to re-ask. Do NOT echo this prompt. "
         f"PRIORITIES: when the board shows a PRIORITY CALL, that ranking is computed from real "
         f"deadlines and workload, so own it: say it as your judgment, first, with the actual "
-        f"reason and number (e.g. 'Fuck the gym this week - the exam is 5 days out and 11 hours "
-        f"are still open.'). Never hedge it with 'maybe' or 'you might consider'. If there is no "
+        f"reason and number, naming the soft thing the call says can wait (e.g. '<that thing> can wait "
+        f"today - the exam is 5 days out and 11 hours are still open.'). Never hedge it with 'maybe' or 'you might consider'. If there is no "
         f"PRIORITY CALL, do not invent a crisis. "
         f"Only output your reply."
     )
@@ -907,10 +911,15 @@ def set_brief(b):
 def goal_brief(title, db=None, deadline=""):
     """One model call: what kind of effort is this really? None when no model answers."""
     sys = ("You size real-life goals the way a sensible person would. Reply with ONLY JSON: "
-           '{"kind":"event|habit|project","total_hours":number,"active_days":number}. '
+           '{"kind":"event|habit|project","total_hours":number,"active_days":number,'
+           '"physical":true|false,"per_week":number,"best_time":"morning|afternoon|evening|night"}. '
            "event = a one-off occasion needing a few hours near the date; habit = repeated "
-           "practice (exercise, language, diet); project = sustained build/study. total_hours is the "
-           "whole realistic effort, active_days how many separate days it needs.")
+           "practice (exercise, language, diet, relationship time); project = sustained build/study. "
+           "total_hours is the whole realistic effort, active_days how many separate days it needs. "
+           "physical is true ONLY when the goal itself is exercise, sport or body training done in a "
+           "gym or workout slot; false for everything else, including couple time, study, hobbies. "
+           "per_week is how many sessions a week a habit sensibly needs (1-6). best_time is when this "
+           "activity naturally happens in a person's day.")
     try:
         r = get_manager(db).generate(sys, f"Goal: {title}\nDeadline: {deadline}", timeout=25, max_tokens=80)
     except Exception:
@@ -922,7 +931,10 @@ def goal_brief(title, db=None, deadline=""):
         b = json.loads(m.group(0)) if m else None
         if b and b.get("kind") in ("event", "habit", "project"):
             return {"kind": b["kind"], "total_hours": max(0.25, min(float(b.get("total_hours") or 0) or 0.25, 400)),
-                    "active_days": max(1, min(int(b.get("active_days") or 1), 60))}
+                    "active_days": max(1, min(int(b.get("active_days") or 1), 60)),
+                    "physical": bool(b.get("physical")),
+                    "per_week": max(1, min(int(b.get("per_week") or 3), 6)),
+                    "best_time": b.get("best_time") if b.get("best_time") in ("morning", "afternoon", "evening", "night") else ""}
     except Exception:
         pass
     return None
@@ -934,7 +946,9 @@ def effort_profile(goal, days_left):
         return {"kind": "event", "event_kind": "event", "budget_min": int(brief["total_hours"] * 60),
                 "active_days": min(brief["active_days"], max(days_left + 1, 1))}
     if brief and brief["kind"] == "habit":
-        return {"kind": "habit"}
+        if brief.get("physical"):
+            return {"kind": "habit", "per_week": brief.get("per_week")}
+        return {"kind": "recurring", "per_week": brief.get("per_week"), "best_time": brief.get("best_time")}
     if brief and brief["kind"] == "project" and _goal_kind(goal.get("title") or "") not in ("hookup", "romance"):
         return {"kind": "project"}
     title = (goal.get("title") or goal.get("display_title") or "")
@@ -947,6 +961,11 @@ def effort_profile(goal, days_left):
     if any(w in low for w in _HABIT_WORDS):
         return {"kind": "habit"}
     return {"kind": "project"}
+
+
+def _thin_to_sessions(horizon, per_week):
+    days = _SESSION_DAYS.get(max(2, min(int(per_week or 3), 5)), (0, 2, 4))
+    return [(d, sl if date.fromisoformat(d).weekday() in days else []) for d, sl in horizon]
 
 
 _state_routine = threading.local()
@@ -1154,6 +1173,13 @@ def _kind_rules(profile):
             "ordering a non-perishable gift, asking/confirming). Name real, specific actions - "
             "what to buy and where, what to message, what to prepare - not 'plan the date'.\n"
         )
+    if kind == "recurring":
+        return (
+            "THIS IS A RECURRING PERSONAL HABIT, NOT EXERCISE. Never turn it into gym sessions, sets, "
+            "reps or protein targets. Each slot is one concrete, specific thing the person does for the "
+            "goal itself, plus the small preparation that makes it happen. Keep it tasteful, warm and "
+            "practical; never explicit. Vary the actions across sessions.\n"
+        )
     if kind == "habit":
         return (
             "THIS IS A PHYSICAL HABIT. Long slots (30+ min) are the person's own gym/exercise window: "
@@ -1275,18 +1301,9 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     # --- how much, and when: the human-nature engine (core/planner.py) -----
     # Parse the user's own "hours per day I can commit" answer so the load
     # follows THEIR life, not a fixed guess.
-    commit_min = 120
-    tp = (details.get("time_per_day") or "").strip().lower()
-    m = re.search(r"(\d+)", tp)
-    if m:
-        n = int(m.group(1))
-        unit = tp[m.end():m.end() + 2]
-        # "30m" / "45 min" / a bare number over 16 all mean minutes, not hours.
-        is_minutes = ("m" in unit and "h" not in unit) or n > 16
-        if is_minutes:
-            commit_min = max(15, min(n, 16 * 60))
-        elif 1 <= n <= 16:
-            commit_min = n * 60
+    commit_min = daily_commit_min(details)
+    if details.get("cap_min"):
+        commit_min = min(commit_min, int(details["cap_min"]))
 
     wake, bed = 7 * 60, 23 * 60
     _r = get_routine()
@@ -1306,17 +1323,23 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     habit_others = (lambda d: others_for(d) + list(_fixed_dated.get(d, [])))
     profile = effort_profile(goal, max(days_remaining(deadline, today), 0))
     wins = workout_windows()
+    if profile["kind"] == "recurring":
+        prefs.commit_min = min(prefs.commit_min, 90)
+        prefs.chronotype = {"morning": "morning", "afternoon": "afternoon", "evening": "night", "night": "night"}.get(profile.get("best_time"), prefs.chronotype)
     if profile["kind"] == "habit" and wins:
         meals = [w for w in (human_windows or []) if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60]
         # meal windows are the short ones in the routine (sleep is long); take their END
         meals = [w for w in meals if w not in wins]
-        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, habit_sessions_per_week(goal))
+        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, profile.get("per_week") or habit_sessions_per_week(goal))
     else:
         horizon = planner.plan_horizon(
             today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
+            shaped=profile["kind"] != "recurring",
         )
         if profile["kind"] == "event":
             horizon = _apply_event_shape(horizon, today, deadline, profile["budget_min"], profile["active_days"])
+        elif profile["kind"] == "recurring":
+            horizon = _thin_to_sessions(horizon, profile.get("per_week"))
     _state.profile = profile
     if outline_out is not None:
         outline_out["slot_minutes"] = {d: sum(e - s0 for s0, e in sl) for d, sl in horizon}
@@ -1645,7 +1668,7 @@ def _goal_chat_log(db, goal):
         out += [f"REDRAW INSTRUCTION: {n}" for n in notes[-6:]]
     except Exception:
         pass
-    return "\n".join(out)[-6000:]
+    return "\n".join(out)[-2500:]
 
 
 def reorder_naturally(entries, title, db=None):
@@ -1693,8 +1716,24 @@ def _extract_links(text):
     return out[:8]
 
 
+def daily_commit_min(details):
+    commit_min = 120
+    tp = (details.get("time_per_day") or "").strip().lower()
+    m = re.search(r"(\d+)", tp)
+    if m:
+        n = int(m.group(1))
+        unit = tp[m.end():m.end() + 2]
+        is_minutes = ("m" in unit and "h" not in unit) or n > 16
+        if is_minutes:
+            commit_min = max(15, min(n, 16 * 60))
+        elif 1 <= n <= 16:
+            commit_min = n * 60
+    return commit_min
+
+
 def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False, busy_by_date=None,
                    user=None):
+    _state.last_error = None
     sys = BASE_SYSTEM_PROMPT
     deadline = goal["deadline"]
     title = (goal.get("title") or goal["display_title"]).strip()
@@ -1707,7 +1746,7 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         blocked_line = (
             f"\nHARD BLOCKED WINDOWS — NEVER schedule ANY task inside these, on ANY day: "
             f"{windows}. They repeat every single day until the deadline. A task placed "
-            "at 5pm when the gym window is 5-7pm is a failed plan, not a judgment call."
+            "inside one of those windows is a failed plan, not a judgment call."
         )
     try:
         _details = json.loads(goal.get("details") or "{}")
@@ -1726,18 +1765,16 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         human_line = (
             "\nHUMAN BASICS ARE MANDATORY, NOT OPTIONAL: the user's own routine blocks are "
             f"{_routine_txt}. NEVER schedule a task inside them. Do not write tasks like "
-            "'skip lunch', 'work through dinner', 'skip the gym', 'skip the workout', "
-            "'stay up all night'. A person still eats, sleeps, moves and rests while "
+            "'skip lunch', 'work through dinner', 'stay up all night'. A person still eats, sleeps and rests while "
             "finishing this. If the deadline is tight, use the free waking hours — never "
             "steal them from food, sleep or health."
         )
     else:
         human_line = (
             "\nHUMAN BASICS ARE MANDATORY, NOT OPTIONAL: never schedule a task during sleep "
-            "(23:00-07:00), meals (breakfast 07:00-08:00, lunch 13:00-13:45, dinner 19:30-20:15), "
-            "or the daily movement window (18:00-19:00). Do not write tasks like 'skip lunch', "
-            "'work through dinner', 'skip the gym', 'skip the workout', 'stay up all night'. "
-            "A person still eats, sleeps, moves and rests while finishing this. If the deadline "
+            "(23:00-07:00) or meals (breakfast 07:00-08:00, lunch 13:00-13:45, dinner 19:30-20:15). "
+            "Do not write tasks like 'skip lunch', 'work through dinner', 'stay up all night'. "
+            "A person still eats, sleeps and rests while finishing this. If the deadline "
             "is tight, use the free waking hours — never steal them from food, sleep or health."
         )
     think_line = (
@@ -1960,8 +1997,18 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         except Exception as exc:
             logger.warning("plan slice %s-%s failed: %r", first, last, exc)
             continue
+        if not res.ok and chat_line:
+            logger.warning("plan slice %s-%s: model error %s, retrying lean", first, last, res.error)
+            try:
+                res = get_manager(db).generate(
+                    sys, user_prompt.replace(chat_line, "").replace(links_line, ""), timeout=timeout,
+                    prefer_cloud=prefer_cloud, max_tokens=_MAX_PLAN_TOKENS)
+            except Exception as exc:
+                logger.warning("plan slice %s-%s lean retry failed: %r", first, last, exc)
+                continue
         if not res.ok:
-            logger.warning("plan slice %s-%s: model unavailable, skipping", first, last)
+            _state.last_error = (res.error or "no reply")[:160]
+            logger.warning("plan slice %s-%s: model error %s", first, last, res.error)
             continue
         _state.last_provider = res.provider or "llm"
         title_map = _parse_title_map(res.text)
@@ -2169,7 +2216,7 @@ def pressure_rating(goal, actions, open_blockers=0, missed_days=0, today=None):
     base += min(missed_days, 3) * 0.5
     score = min(max(round(base), 1), 10)
     label = (
-        "gym is cancelled" if score >= 8 else
+        "everything else is cancelled" if score >= 8 else
         "lights are on" if score >= 6 else
         "manageable" if score >= 4 else
         "coasting"

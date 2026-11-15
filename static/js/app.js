@@ -2577,7 +2577,7 @@ function addBusyWindow() {
   const inp = document.getElementById("busy-new");
   const val = ((inp && inp.value) || "").trim();
   if (!val) {
-    showToast("Type a window like gym 5-7pm", "error");
+    showToast("Type a window like class 9am-1pm", "error");
     return;
   }
   window._busyWindows = window._busyWindows || [];

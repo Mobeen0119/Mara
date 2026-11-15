@@ -40,6 +40,7 @@ ENERGY_WINDOWS = {
     "afternoon": [(13 * _H + 30, 17 * _H + 30), (9 * _H + 30, 12 * _H), (19 * _H + 30, 21 * _H + 30)],
     "balanced":  [(9 * _H + 30, 12 * _H + 30), (15 * _H, 18 * _H), (19 * _H + 30, 21 * _H + 30)],
     "evening":   [(11 * _H, 13 * _H), (16 * _H, 19 * _H), (20 * _H, 23 * _H + 30)],
+    "night":     [(20 * _H, 23 * _H + 30), (18 * _H, 20 * _H)],
 }
 
 
@@ -209,7 +210,7 @@ def plan_day(prefs, busy, *, max_blocks, length, latest_end=None, earliest=None,
     return sorted(placed)
 
 
-def plan_horizon(today, deadline, prefs, busy_for, *, now_min=None, max_days=121, others_for=None):
+def plan_horizon(today, deadline, prefs, busy_for, *, now_min=None, max_days=121, others_for=None, shaped=True):
     """Plan every day from `today` to `deadline` inclusive.
     busy_for(date_iso) -> list of (start, end) minutes for that date.
     now_min: minutes since midnight right now (only affects `today`).
@@ -221,7 +222,7 @@ def plan_horizon(today, deadline, prefs, busy_for, *, now_min=None, max_days=121
     for i in range(total):
         day = d0 + timedelta(days=i)
         days_left = total - 1 - i
-        max_blocks, latest_end, _kind = load_for_day(days_left, total, n_blocks, i)
+        max_blocks, latest_end, _kind = load_for_day(days_left, total, n_blocks, i) if shaped else (n_blocks, None, "flat")
         earliest = None
         if i == 0 and now_min is not None:
             earliest = ceil15(now_min + LEAD_TODAY)

@@ -1129,7 +1129,7 @@ def regen_plan(goal_id: int, user: dict = Depends(require_user), body: RegenPlan
     The goal is flagged plan_status='generating' so the UI can keep showing the current
     schedule and render the result when it settles."""
     goal = _goal_or_404(user, goal_id)
-    ratelimit.enforce(f"regen:{user['id']}", 12, 3600, "that's a lot of redraws — give the model a breather")
+    ratelimit.enforce(f"regen:{user['id']}", 30, 3600, "that's a lot of redraws — give the model a breather")
     conn = get_connection()
     existing = [dict(a) for a in conn.execute(
         "SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (goal_id,)

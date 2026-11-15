@@ -134,6 +134,56 @@ def _rebalance_job(user, ids):
         _run_plan_job(user, gid, False)
 
 
+def _allocation(conn, user, goal, rt, blocked, alloc_wins, today_iso):
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, deadline, open_ended, title, details FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall()]
+    rows = [goal if r["id"] == goal["id"] else r for r in rows]
+    if not any(r["id"] == goal["id"] for r in rows):
+        rows.append(goal)
+    wake, bed = generation.routine_day_prefs(rt)
+    prefs = planner.Prefs(wake=wake, bed=bed)
+    live = generation.get_routine()
+    if live:
+        human = _routine_mod().human_windows(live)
+    else:
+        try:
+            gd = json.loads(goal.get("details") or "{}")
+        except Exception:
+            gd = {}
+        human = generation.parse_routine_windows(gd) or generation._DEFAULT_HUMAN_WINDOWS
+    fixed = list(blocked) + [tuple(w) for w in alloc_wins] + [tuple(w) for w in human if w]
+    far = max([r["deadline"] for r in rows if r.get("deadline")] + [today_iso])
+    dated = _routine_mod().dated_busy(rt, today_iso, far)
+    try:
+        ln = generation._local_now(conn, goal, user)
+        now_min = ln.hour * 60 + ln.minute
+    except Exception:
+        now_min = None
+
+    def cap(day):
+        busy = generation.split_windows(fixed) + list(dated.get(day, []))
+        earliest = planner.ceil15(now_min + planner.LEAD_TODAY) if (day == today_iso and now_min is not None) else None
+        return planner.day_capacity(prefs, planner.merge(busy), earliest)
+
+    return generation.allocate_for_user(rows, today_iso, cap)
+
+
+def _has_physical_habit(conn, user, skip_id):
+    today_iso = _get_today(user).isoformat()
+    for r in conn.execute("SELECT id, deadline, open_ended, title, details FROM goals WHERE user_id=? AND status='active' AND id!=?", (user["id"], skip_id)).fetchall():
+        try:
+            if generation.goal_demand(dict(r), today_iso)["free"]:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _routine_mod():
+    from core import routine
+    return routine
+
+
 def _rank(g):
     from core import triage
     return (-triage.importance_of(g), g["deadline"] if not g.get("open_ended") else "9999-12-31", g["id"])
@@ -148,8 +198,13 @@ def _outranking_ids(conn, user_id, goal):
 
 def _record_squeeze(conn, goal, today_iso, blocked, busy_by_date, outranking, user=None):
     got, free = {}, {}
+    mine = generation.get_allocation()
     generation._build_fallback_plan(goal, today=today_iso, extra_blocked=blocked, busy_by_date=busy_by_date, outline_out=got)
-    generation._build_fallback_plan(goal, today=today_iso, extra_blocked=blocked, busy_by_date={}, outline_out=free)
+    generation.set_allocation(None)
+    try:
+        generation._build_fallback_plan(goal, today=today_iso, extra_blocked=blocked, busy_by_date={}, outline_out=free)
+    finally:
+        generation.set_allocation(mine)
     lost = max(0, sum(free.get("slot_minutes", {}).values()) - sum(got.get("slot_minutes", {}).values()))
     names = [r["title"] for r in conn.execute(
         f"SELECT title FROM goals WHERE id IN ({','.join('?' * len(outranking))})", list(outranking)).fetchall()] if outranking else []
@@ -162,32 +217,24 @@ def _record_squeeze(conn, goal, today_iso, blocked, busy_by_date, outranking, us
     d["squeezed_by"] = names[:3]
     conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps(d), goal["id"]))
     conn.commit()
-    if lost >= 60:
-        _yield_winners(conn, goal, outranking, user)
 
 
-def _yield_winners(conn, goal, outranking, user=None):
-    user = user or dict(conn.execute("SELECT * FROM users WHERE id=?", (goal["user_id"],)).fetchone())
-    eased = []
-    for gid in sorted(outranking, reverse=True):
-        row = conn.execute("SELECT id, details FROM goals WHERE id=?", (gid,)).fetchone()
-        try:
-            d = json.loads(row["details"] or "{}")
-        except Exception:
-            d = {}
-        full = generation.daily_commit_min(d)
-        floor = max(60, int(full * 0.6))
-        now = int(d.get("cap_min") or full)
-        nxt = max(floor, int(now * 0.8))
-        if nxt >= now:
-            continue
-        d["cap_min"] = nxt
-        conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps(d), gid))
-        eased.append(gid)
-    conn.commit()
-    if eased:
-        for gid in eased + [goal["id"]]:
-            submit_plan(user, gid)
+def _blocked_message(conn, goal, today_iso, blocked, outranking, fallback):
+    free = {}
+    mine = generation.get_allocation()
+    generation.set_allocation(None)
+    try:
+        generation._build_fallback_plan(goal, today=today_iso, extra_blocked=blocked, busy_by_date={}, outline_out=free)
+    except Exception:
+        return fallback
+    finally:
+        generation.set_allocation(mine)
+    if not sum(free.get("slot_minutes", {}).values()) or not outranking:
+        return fallback
+    names = [r["title"] for r in conn.execute(
+        f"SELECT title FROM goals WHERE id IN ({','.join('?' * len(outranking))})", list(outranking)).fetchall()][:3]
+    return (f"Every free hour before {goal['deadline']} is already taken by what matters more ({', '.join(names)}). "
+            "Tell me in chat which of those can wait a day, or push this deadline out, and I'll redraw.")
 
 
 def _bump_losers(conn, user, goal_id, entries):
@@ -394,6 +441,11 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
             rt = dict(rt, assumed=list(rt.get("assumed", [])) + [f"you work out {generation.fmt_min(ws)}-{generation.fmt_min(ws + 60)}"])
             generation.set_routine(rt)
         generation.set_workout_windows(wins if kind == "habit" else [])
+        alloc_wins = list(wins)
+        if not wins and kind != "habit" and _has_physical_habit(conn, user, goal_id):
+            ws = rt["sleep"][1] % 1440 + 60 if rt.get("peak") == "morning" else 18 * 60
+            alloc_wins = [(ws, ws + 60)]
+            blocked = blocked + alloc_wins
         _mark(goal_id, 1)
         if kind == "habit" and wins:
             blocked = [b for b in blocked if tuple(b) not in set(wins)]
@@ -410,6 +462,7 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
             only_goal_ids=outranking,
         )
         dated = _routine.dated_busy(rt, today_iso, goal.get("deadline") or today_iso)
+        generation.set_allocation(_allocation(conn, user, goal, rt, blocked, alloc_wins, today_iso))
         # NO hardcoded fallback schedule. Only a real LLM plan is written. We
         # try the model; if it is down or times out, we KEEP whatever plan
         # already exists and retry in a minute. A hardcoded fill-in is never
@@ -452,6 +505,7 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
             # other failure keeps the previous plan and retries.
             blocked_msg = generation.plan_blocked_reason()
             if blocked_msg:
+                blocked_msg = _blocked_message(conn, goal, today_iso, blocked, outranking, blocked_msg)
                 logger.warning(
                     "plan bg: goal %s has no usable free windows, marking blocked", goal_id
                 )
@@ -489,6 +543,9 @@ def _regenerate_plan_bg(user, goal_id, prefer_cloud=False):
         except Exception:
             pass
     finally:
+        generation.set_allocation(None)
+        generation.set_brief(None)
+        generation.set_workout_windows([])
         ulock.release()
         lock.release()
 

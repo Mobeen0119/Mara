@@ -591,9 +591,6 @@ def generate_nudge(user_name, goal_summary, nearest, db=None):
     return text, source
 
 
-# ---------------------------------------------------------------------------
-# Check-in
-# ---------------------------------------------------------------------------
 def generate_check_in_prompt(user_name, goals_summary, db=None):
     sys = CHECK_IN_SYSTEM_PROMPT
     user_prompt = f"User: {user_name}\nActive goals: {'; '.join(goals_summary) or 'none'}\nAsk the check-in question."
@@ -963,9 +960,87 @@ def effort_profile(goal, days_left):
     return {"kind": "project"}
 
 
-def _thin_to_sessions(horizon, per_week):
-    days = _SESSION_DAYS.get(max(2, min(int(per_week or 3), 5)), (0, 2, 4))
-    return [(d, sl if date.fromisoformat(d).weekday() in days else []) for d, sl in horizon]
+_state_alloc = threading.local()
+
+
+def set_allocation(a):
+    _state_alloc.a = a
+
+
+def get_allocation():
+    return getattr(_state_alloc, "a", None)
+
+
+def goal_demand(goal, today):
+    try:
+        details = json.loads(goal.get("details") or "{}")
+    except Exception:
+        details = {}
+    title = goal.get("title") or goal.get("display_title") or ""
+    brief = details.get("brief") if details.get("brief_for") == title else None
+    prev = getattr(_state_brief, "b", None)
+    _state_brief.b = brief
+    try:
+        left = max(days_remaining(goal["deadline"], today), 0) if goal.get("deadline") else 365
+        prof = effort_profile(goal, left)
+    finally:
+        _state_brief.b = prev
+    commit = daily_commit_min(details)
+    if details.get("cap_min"):
+        commit = min(commit, int(details["cap_min"]))
+    out = {"session": MIN_SESSION_MIN, "free": False, "start": None, "kind": prof["kind"]}
+    if prof["kind"] == "event":
+        n = max(1, int(prof["active_days"]))
+        out["rate"] = prof["budget_min"] / float(n)
+        if goal.get("deadline"):
+            out["start"] = (date.fromisoformat(goal["deadline"]) - timedelta(days=n - 1)).isoformat()
+    elif prof["kind"] in ("habit", "recurring"):
+        per_week = max(1, min(int(prof.get("per_week") or habit_sessions_per_week(goal)), 6))
+        sess = SESSION_MAX_MIN if prof["kind"] == "habit" else max(MIN_SESSION_MIN, min(commit, 90))
+        out["session"] = sess
+        out["rate"] = sess * per_week / 7.0
+        out["free"] = prof["kind"] == "habit"
+    else:
+        out["rate"] = float(commit)
+    return out
+
+
+def routine_day_prefs(rt):
+    wake, bed = 7 * 60, 23 * 60
+    st = list(rt["sleep"]) if rt else []
+    if len(st) >= 2:
+        b0, w0 = st[0], st[1]
+        if w0 > 13 * 60 and b0 < w0:
+            b0, w0 = w0, b0
+        nb = planner.normalize_sleep(b0, w0)
+        if nb is not None:
+            bed, wake = nb, w0
+    return wake, bed
+
+
+def split_windows(windows):
+    out = []
+    for s, e in windows:
+        s %= 1440
+        e = (e - s) % 1440 + s
+        if e > 1440:
+            out += [(s, 1440), (0, e - 1440)]
+        else:
+            out.append((s, e))
+    return planner.merge(out)
+
+
+def allocate_for_user(rows, today, capacity_for, horizon_days=121):
+    from core import triage
+    items = []
+    for g in rows:
+        dm = goal_demand(g, today)
+        items.append({"id": g["id"], "importance": triage.importance_of(g),
+                      "deadline": None if g.get("open_ended") else g.get("deadline"),
+                      "rate": dm["rate"], "session": dm["session"], "free": dm["free"], "start": dm["start"]})
+    ends = [i["deadline"] for i in items if i["deadline"]]
+    span = horizon_days if (len(ends) < len(items) or not ends) else min(horizon_days, max(0, days_remaining(max(ends), today)) + 1)
+    return planner.allocate(items, today, span, capacity_for)
 
 
 _state_routine = threading.local()
@@ -1016,6 +1091,17 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
     return [(d, sl) for d, sl in out if sl]
 
 
+def _even_days(today, deadline, per_week):
+    t0 = date.fromisoformat(today)
+    n = max(1, (date.fromisoformat(deadline) - t0).days + 1)
+    gap = 7.0 / max(1, min(per_week, 7))
+    out, x = set(), 0.0
+    while x < n:
+        out.add((t0 + timedelta(days=int(x))).isoformat())
+        x += gap
+    return out
+
+
 def habit_sessions_per_week(goal):
     low = ((goal.get("title") or "") + " " + (goal.get("display_title") or "")).lower()
     if any(w in low for w in ("marathon", "yoga", "walk", "stretch")):
@@ -1025,21 +1111,20 @@ def habit_sessions_per_week(goal):
     return 3
 
 
-_SESSION_DAYS = {2: (1, 4), 3: (0, 2, 4), 4: (0, 1, 3, 4), 5: (0, 1, 2, 4, 5)}
+MIN_SESSION_MIN = planner.MIN_SESSION
 SESSION_MAX_MIN = 60
 SNACK_MIN = 5
 SNACKS_PER_DAY = 2
 
 
-def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, detail_days=None, per_week=4):
-    """~per_week gym sessions on fixed weekdays (60 min max) inside the person's workout window;
+def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, detail_days=None, session_days=None):
+    """~per_week gym sessions (60 min max) inside the person's workout window;
     on the other days at most two 5-minute movement snacks right after lunch/dinner."""
     t0 = date.fromisoformat(today)
     end = date.fromisoformat(deadline)
     span = min((end - t0).days + 1, 121)
     if detail_days:
         span = min(span, detail_days)
-    train = _SESSION_DAYS.get(per_week, _SESSION_DAYS[4])
     after = sorted(meal_windows, key=lambda w: w[1] % 1440)[1:3] if len(meal_windows) > 2 else sorted(meal_windows, key=lambda w: w[1] % 1440)[-2:]
     out = []
     for i in range(span):
@@ -1047,7 +1132,7 @@ def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, 
         d = day.isoformat()
         busy = list(others_for(d) or [])
         slots = []
-        is_train = day.weekday() in train
+        is_train = d in session_days if session_days is not None else False
         if is_train:
             for (ws, we) in windows[:1]:
                 we = min(we, ws + SESSION_MAX_MIN)
@@ -1330,16 +1415,28 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         meals = [w for w in (human_windows or []) if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60]
         # meal windows are the short ones in the routine (sleep is long); take their END
         meals = [w for w in meals if w not in wins]
-        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, profile.get("per_week") or habit_sessions_per_week(goal))
+        mine = (get_allocation() or {}).get(goal.get("id"))
+        sdays = {d for d, m in mine.items() if m > 0} if mine is not None else _even_days(today, deadline, profile.get("per_week") or habit_sessions_per_week(goal))
+        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, sdays)
     else:
+        alloc = get_allocation()
+        mine = alloc.get(goal.get("id")) if alloc else None
         horizon = planner.plan_horizon(
             today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
             shaped=profile["kind"] != "recurring",
+            day_budget=(lambda d: mine.get(d, 0)) if mine is not None else None,
         )
+        if mine is not None and not any(sl for _d, sl in horizon):
+            horizon = planner.plan_horizon(
+                today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
+                shaped=profile["kind"] != "recurring",
+            )
+            mine = None
         if profile["kind"] == "event":
             horizon = _apply_event_shape(horizon, today, deadline, profile["budget_min"], profile["active_days"])
-        elif profile["kind"] == "recurring":
-            horizon = _thin_to_sessions(horizon, profile.get("per_week"))
+        elif profile["kind"] == "recurring" and mine is None:
+            keep = _even_days(today, deadline, profile.get("per_week") or 3)
+            horizon = [(d, sl if d in keep else []) for d, sl in horizon]
     _state.profile = profile
     if outline_out is not None:
         outline_out["slot_minutes"] = {d: sum(e - s0 for s0, e in sl) for d, sl in horizon}

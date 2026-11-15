@@ -210,7 +210,118 @@ def plan_day(prefs, busy, *, max_blocks, length, latest_end=None, earliest=None,
     return sorted(placed)
 
 
-def plan_horizon(today, deadline, prefs, busy_for, *, now_min=None, max_days=121, others_for=None, shaped=True):
+IMPORTANCE_WEIGHT = {1: 1.0, 2: 2.2, 3: 4.5}
+MIN_SESSION = 45
+URGENCY_WINDOW = 14
+
+
+def urgency(days_left):
+    if days_left is None:
+        return 1.0
+    return 1.0 + 1.5 * max(0.0, 1.0 - max(days_left, 0) / float(URGENCY_WINDOW))
+
+
+def day_capacity(prefs, busy, earliest=None):
+    lo = prefs.wake + WAKE_LEAD
+    hi = prefs.bed - WIND_DOWN
+    if earliest is not None:
+        lo = max(lo, earliest)
+    if hi - lo < MIN_BLOCK:
+        return 0
+    free = sum(e - s for s, e in subtract((lo, hi), merge(pad(busy))))
+    return int(min(DAY_FOCUS_CAP, free * 0.75))
+
+
+def _waterfill(items, capacity):
+    share = {k: 0.0 for k, _w, _c in items}
+    hungry = list(items)
+    left = float(capacity)
+    while hungry and left > 0.5:
+        total = sum(w for _k, w, _c in hungry)
+        nxt, spent = [], 0.0
+        for k, w, cap in hungry:
+            give = left * w / total
+            room = cap - share[k]
+            if give >= room - 1e-9:
+                share[k] += room
+                spent += room
+            else:
+                nxt.append((k, w, cap))
+        if len(nxt) == len(hungry):
+            for k, w, cap in hungry:
+                share[k] += left * w / total
+            return share
+        left -= spent
+        hungry = nxt
+    return share
+
+
+def allocate(goals, today, days, capacity_for):
+    d0 = date.fromisoformat(today)
+    out = {g["id"]: {} for g in goals}
+    credit = {g["id"]: 0.0 for g in goals}
+    for i in range(days):
+        day = (d0 + timedelta(days=i)).isoformat()
+        active = []
+        for g in goals:
+            dl = g.get("deadline")
+            if (dl and dl < day) or (g.get("start") and day < g["start"]):
+                continue
+            left = (date.fromisoformat(dl) - date.fromisoformat(day)).days if dl else None
+            w = IMPORTANCE_WEIGHT.get(int(g.get("importance") or 1), 1.0) * urgency(left)
+            active.append({**g, "w": w, "left": left})
+        if not active:
+            continue
+        cap = float(capacity_for(day))
+        due, daily = [], []
+        for g in active:
+            if g["rate"] < g["session"]:
+                credit[g["id"]] += g["rate"]
+                if credit[g["id"]] + 1e-6 >= g["session"] or (g["left"] is not None and g["left"] <= 0 and credit[g["id"]] >= g["session"] * 0.5):
+                    due.append(g)
+            elif credit[g["id"]] + 1e-6 >= MIN_SESSION or (g["left"] is not None and g["left"] <= 0 and credit[g["id"]] >= MIN_SESSION * 0.5):
+                due.append({**g, "session": MIN_SESSION})
+            else:
+                daily.append(g)
+        due_ids = {g["id"] for g in due}
+        daily = [g for g in daily if g["id"] not in due_ids]
+        for g in sorted(due, key=lambda x: -x["w"]):
+            size = float(g["session"])
+            if g.get("free"):
+                out[g["id"]][day] = int(round(size))
+                credit[g["id"]] -= size
+            elif size <= cap + 1e-9:
+                out[g["id"]][day] = int(round(size))
+                credit[g["id"]] -= size
+                cap -= size
+        pool = list(daily)
+        while pool and cap > 0:
+            share = _waterfill([(g["id"], g["w"], float(g["rate"])) for g in pool], cap)
+            small = [g for g in pool if 0 < share[g["id"]] + 1e-6 < min(MIN_SESSION, g["rate"])]
+            if not small:
+                break
+            g = min(small, key=lambda x: (x["w"], -x["id"]))
+            pool.remove(g)
+            credit[g["id"]] += share[g["id"]]
+        if pool and cap > 0:
+            share = _waterfill([(g["id"], g["w"], float(g["rate"])) for g in pool], cap)
+            for g in pool:
+                m = int(share[g["id"]] // 15 * 15)
+                if m >= min(MIN_SESSION, g["rate"]):
+                    out[g["id"]][day] = m
+                    credit[g["id"]] = 0.0
+    for g in goals:
+        if out[g["id"]] or g.get("free") or g["rate"] <= 0:
+            continue
+        span = [(date.fromisoformat(today) + timedelta(days=i)).isoformat() for i in range(days)]
+        span = [x for x in span if (not g.get("deadline") or x <= g["deadline"]) and (not g.get("start") or x >= g["start"])]
+        if span:
+            out[g["id"]][span[-1] if g.get("deadline") else span[0]] = int(min(MIN_SESSION, max(g["rate"], 30)) // 15 * 15 or 45)
+    return out
+
+
+def plan_horizon(today, deadline, prefs, busy_for, *, now_min=None, max_days=121, others_for=None, shaped=True,
+                 day_budget=None):
     """Plan every day from `today` to `deadline` inclusive.
     busy_for(date_iso) -> list of (start, end) minutes for that date.
     now_min: minutes since midnight right now (only affects `today`).
@@ -222,6 +333,12 @@ def plan_horizon(today, deadline, prefs, busy_for, *, now_min=None, max_days=121
     for i in range(total):
         day = d0 + timedelta(days=i)
         days_left = total - 1 - i
+        if day_budget is not None:
+            mins = day_budget(day.isoformat())
+            if mins <= 0:
+                out.append((day.isoformat(), []))
+                continue
+            n_blocks, length = block_plan(mins)
         max_blocks, latest_end, _kind = load_for_day(days_left, total, n_blocks, i) if shaped else (n_blocks, None, "flat")
         earliest = None
         if i == 0 and now_min is not None:

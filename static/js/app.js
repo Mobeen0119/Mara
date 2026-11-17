@@ -1023,14 +1023,10 @@ async function renderGoalDetail(el, id) {
         });
         html += `</div>`;
       }
-    } catch (e) {
-      /* roadmap is optional */
-    }
+    } catch (e) {}
 
-    // tabs
     html += `<div class="tabs"><span class="tab active" onclick="switchTab('schedule','${g.id}')">Schedule</span><span class="tab" onclick="switchTab('progress','${g.id}')">Progress</span><span class="tab" onclick="switchTab('constraints','${g.id}')">Constraints</span></div>`;
 
-    // schedule
     html += `<div id="detail-schedule"><div class="schedule-grid">`;
     const byDate = {};
     (g.plan || []).forEach((a) => {

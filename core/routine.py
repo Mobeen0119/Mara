@@ -1,8 +1,3 @@
-"""One shared daily routine per person: sleep, meals, workout time.
-
-Every goal plans around the same routine. Where sources disagree the newest
-statement wins: chat/settings override > newest goal's answers or constraints >
-older ones > assumed defaults (which are reported, never hidden)."""
 import json
 import re
 
@@ -38,6 +33,13 @@ def _vague(label, wake):
     return None
 
 
+def _plausible_sleep(start, end):
+    # Sleep goes to bed at night and wakes in the morning; a 3pm-8pm "sleep" is a mis-parse.
+    bed_ok = start >= 20 * 60 or start <= 4 * 60
+    wake_ok = 4 * 60 <= end <= 12 * 60
+    dur = (end - start) % 1440
+    return bed_ok and wake_ok and 4 * 60 <= dur <= 12 * 60
+
 def window_of(label, wake=7 * 60):
     return generation.parse_time_window(label) or _vague(label, wake)
 
@@ -67,7 +69,6 @@ _DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun":
 
 
 def weekdays_in(label):
-    """Which weekdays a constraint applies to; None means every day."""
     low = (label or "").lower()
     if re.search(r"\bweek ?days?\b|\bmon(?:day)?\s*(?:-|to|through)\s*fri", low):
         return {0, 1, 2, 3, 4}

@@ -5,29 +5,34 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from core import planner as P
 
-DAY_CAP = 8 * 60            
-SOFT_SHARE = 0.5      
-HEAVY_DAY = 7 * 60 + 30    
-HEAVY_STREAK = 3     
-LIGHT_CAP = 4 * 60       
+DAY_CAP = 8 * 60
+SOFT_SHARE = 0.5
+HEAVY_DAY = 5 * 60 + 30
+HEAVY_STREAK = 3
+LIGHT_CAP = 4 * 60
 BREAK = P.SHORT_BREAK
-TOUCH = 30                 
-LAST_MIN = 24 * 60 - 15     # never schedule into the last quarter hour: times must stay HH:MM < 24:00
+TOUCH = 30
+LAST_MIN = 24 * 60 - 15  # never schedule into the last quarter hour: times must stay HH:MM < 24:00
 MAX_BLOCKS_PER_DAY = 4
-FILL = 0.85                 # share of free time we plan to use; fragmentation eats the rest
+FILL = 0.85  # share of free time we plan to use; fragmentation eats the rest
 
 SESSION_WEEKDAYS = {
-    1: (2,), 2: (1, 4), 3: (0, 2, 4), 4: (0, 1, 3, 4), 5: (0, 1, 2, 4, 5),
-    6: (0, 1, 2, 3, 4, 5), 7: (0, 1, 2, 3, 4, 5, 6),
+    1: (2,),
+    2: (1, 4),
+    3: (0, 2, 4),
+    4: (0, 1, 3, 4),
+    5: (0, 1, 2, 4, 5),
+    6: (0, 1, 2, 3, 4, 5),
+    7: (0, 1, 2, 3, 4, 5, 6),
 }
 
 Seg = Tuple[int, int]
 
 MODE_FACTOR = {"normal": 1.0, "light": 0.5, "travel": 0.4, "sick": 0.0, "off": 0.0}
-EXCUSED_MODES = ("sick", "off")     
-REST_MIN = 45                        # a real gap in the middle of a long day (walk, nap, prayer, food)
-REST_TRIGGER = 4 * 60               
-NEUTRAL_RATE = 0.7                   
+EXCUSED_MODES = ("sick", "off")
+REST_MIN = 45  # a real gap in the middle of a long day (walk, nap, prayer, food)
+REST_TRIGGER = 4 * 60
+NEUTRAL_RATE = 0.7
 
 
 def bucket_of(minute: int) -> str:
@@ -44,10 +49,13 @@ def bucket_of(minute: int) -> str:
 @dataclass
 class Tuning:
     """What the person's real history says. Every field is optional; empty = the plain plan."""
-    bucket_rate: Dict[str, float] = field(default_factory=dict)   # time of day -> share of blocks actually done
-    weekend_factor: float = 1.0                                   # learned: do weekends carry less?
-    day_mode: Optional[Callable[[str], str]] = None               # iso date -> normal|light|travel|sick|off
-    block_cap: Optional[int] = None                               # learned longest focus block they really finish
+
+    bucket_rate: Dict[str, float] = field(
+        default_factory=dict
+    )  # time of day -> share of blocks actually done
+    weekend_factor: float = 1.0  # learned: do weekends carry less?
+    day_mode: Optional[Callable[[str], str]] = None  # iso date -> normal|light|travel|sick|off
+    block_cap: Optional[int] = None  # learned longest focus block they really finish
     rest: bool = True
 
 
@@ -56,22 +64,22 @@ class Spec:
     id: int
     deadline: str
     weight: float = 1.0
-    kind: str = "project"            # project | habit | recurring | event
-    ideal: int = 120                 
-    floor: int = TOUCH               
+    kind: str = "project"  # project | habit | recurring | event
+    ideal: int = 120
+    floor: int = TOUCH
     max_block: int = 90
     min_block: int = 30
-    per_week: int = 3                # habit / recurring sessions per week
-    best_time: str = ""            
-    important: bool = False          
-    budget: int = 0                  
-    active_days: int = 3            
-    windows: List[Seg] = field(default_factory=list)  
-    uses_soft: bool = False         
-    touch: int = 0                   
+    per_week: int = 3  # habit / recurring sessions per week
+    best_time: str = ""
+    important: bool = False
+    budget: int = 0
+    active_days: int = 3
+    windows: List[Seg] = field(default_factory=list)
+    uses_soft: bool = False
+    touch: int = 0
     title: str = ""
-    backlog: int = 0                 
-    scale: float = 1.0               
+    backlog: int = 0
+    scale: float = 1.0
 
 
 def _demand(g: Spec, day: date, d0: date):
@@ -88,23 +96,23 @@ def _demand(g: Spec, day: date, d0: date):
             share = P.round15(g.budget * g.scale / max(1, min(g.active_days, total))) if g.budget else g.ideal
             ideal = min(max(share, floor), 240)
             return ideal, min(floor, ideal), True, None
-        if left == 5 and total > g.active_days + 3:       # one early slot for anything with lead time
+        if left == 5 and total > g.active_days + 3:  # one early slot for anything with lead time
             return 60, min(floor, 60), False, None
         return 0, 0, False, None
     if g.kind in ("habit", "recurring"):
         days = SESSION_WEEKDAYS[max(1, min(int(g.per_week or 3), 7))]
         ideal = g.ideal if day.weekday() in days else 0
         return ideal, min(floor, g.ideal), True, None
-    
+
     latest = None
     if total == 1:
         frac = 1.0
     elif left == 0:
-        frac, latest = 0.6, 14 * 60                       # finish early on the day
+        frac, latest = 0.6, 14 * 60  # finish early on the day
     elif left == 1 and total >= 4:
-        frac, latest = 0.8, 19 * 60                       # no cramming into the night before
+        frac, latest = 0.8, 19 * 60  # no cramming into the night before
     elif total >= 9 and left > 3 and (i + 1) % 7 == 0:
-        frac = 0.4                                        # a lighter day about weekly
+        frac = 0.4  # a lighter day about weekly
     elif left > 21:
         frac = 0.5
     elif left > 7:
@@ -135,8 +143,9 @@ def _free(base: List[Seg], taken: List[Seg]) -> List[Seg]:
 
 
 def _chrono(g: Spec, prefs) -> str:
-    return {"morning": "morning", "afternoon": "afternoon", "evening": "evening",
-            "night": "night"}.get(g.best_time) or prefs.chronotype
+    return {"morning": "morning", "afternoon": "afternoon", "evening": "evening", "night": "night"}.get(
+        g.best_time
+    ) or prefs.chronotype
 
 
 def _candidates(g: Spec, free: List[Seg], prefs, latest, rates=None) -> List[Seg]:
@@ -145,7 +154,7 @@ def _candidates(g: Spec, free: List[Seg], prefs, latest, rates=None) -> List[Seg
     ordered: List[Seg] = []
     energy = list(P.ENERGY_WINDOWS.get(_chrono(g, prefs), P.ENERGY_WINDOWS["balanced"]))
     learned = bool(rates) and not g.best_time and not g.windows
-    if learned:                       # what they ACTUALLY finish beats what the chronotype guesses
+    if learned:  # what they ACTUALLY finish beats what the chronotype guesses
         energy.sort(key=lambda w: -rates.get(bucket_of(w[0]), NEUTRAL_RATE))
     for w in list(g.windows) + energy:
         ordered += _inter(free, w)
@@ -189,14 +198,15 @@ def _carve_rest(segs: List[Seg]) -> Optional[Seg]:
     return None
 
 
-def _place(g: Spec, want: int, allowed: List[Seg], taken: List[Seg], prefs, latest,
-           rates=None, block_cap=None) -> List[Seg]:
+def _place(
+    g: Spec, want: int, allowed: List[Seg], taken: List[Seg], prefs, latest, rates=None, block_cap=None
+) -> List[Seg]:
     """Put `want` minutes for goal g into blocks. Mutates `taken`. Returns the blocks."""
     blocks: List[Seg] = []
     remaining = int(want)
     longest = g.max_block
     if block_cap and g.kind in ("project", "event"):
-        longest = max(g.min_block, min(longest, int(block_cap)))      # they really finish blocks up to this long
+        longest = max(g.min_block, min(longest, int(block_cap)))  # they really finish blocks up to this long
     while remaining >= g.min_block and len(blocks) < MAX_BLOCKS_PER_DAY:
         placed = False
         for seg_s, seg_e in _candidates(g, _free(allowed, taken), prefs, latest, rates):
@@ -206,7 +216,7 @@ def _place(g: Spec, want: int, allowed: List[Seg], taken: List[Seg], prefs, late
                 continue
             use = min(longest, room, remaining)
             if 0 < remaining - use < g.min_block and room >= remaining:
-                use = min(room, remaining, longest + g.min_block // 2)   # absorb a sliver
+                use = min(room, remaining, longest + g.min_block // 2)  # absorb a sliver
             use = (use // 5) * 5
             if use < g.min_block:
                 continue
@@ -220,10 +230,17 @@ def _place(g: Spec, want: int, allowed: List[Seg], taken: List[Seg], prefs, late
     return sorted(blocks)
 
 
-def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
-             hard_busy_for: Callable[[str], List[Seg]],
-             soft_busy_for: Optional[Callable[[str], List[Seg]]] = None, *,
-             now_min: Optional[int] = None, max_days: int = 121, tuning: Optional[Tuning] = None):
+def allocate(
+    specs: List[Spec],
+    today: str,
+    prefs: "P.Prefs",
+    hard_busy_for: Callable[[str], List[Seg]],
+    soft_busy_for: Optional[Callable[[str], List[Seg]]] = None,
+    *,
+    now_min: Optional[int] = None,
+    max_days: int = 121,
+    tuning: Optional[Tuning] = None
+):
     """-> (alloc, report). alloc[goal_id][date_iso] = [(start, end), ...].
     report[goal_id] = {ideal, got, short, missed_pairs, borrowed, backlog} in minutes / counts.
     report["days"][date_iso] = {mode, total, light, why, rest} explains each day."""
@@ -235,18 +252,20 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
     last = max(date.fromisoformat(s.deadline) for s in specs)
     span = max(1, min((last - d0).days + 1, max_days))
     alloc: Dict[int, Dict[str, List[Seg]]] = {s.id: {} for s in specs}
-    report = {s.id: {"ideal": 0, "got": 0, "short": 0, "missed_pairs": 0, "borrowed": 0, "backlog": s.backlog}
-              for s in specs}
+    report = {
+        s.id: {"ideal": 0, "got": 0, "short": 0, "missed_pairs": 0, "borrowed": 0, "backlog": s.backlog}
+        for s in specs
+    }
     report["days"] = {}
     backlog_left = {s.id: s.backlog for s in specs}
-    last_served = {s.id: -1 for s in specs}            # assume everyone was served "yesterday"
-    heavy_run = 0                                      # consecutive heavy days so far
+    last_served = {s.id: -1 for s in specs}  # assume everyone was served "yesterday"
+    heavy_run = 0  # consecutive heavy days so far
 
     for i in range(span):
         day = d0 + timedelta(days=i)
         iso = day.isoformat()
         mode = (tuning.day_mode(iso) if tuning.day_mode else "normal") or "normal"
-        if mode in EXCUSED_MODES:                       # sick / day off: plan nothing, owe nothing
+        if mode in EXCUSED_MODES:  # sick / day off: plan nothing, owe nothing
             for g in specs:
                 last_served[g.id] = i
             heavy_run = 0
@@ -268,7 +287,9 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
             soft_free = []
             for w in soft:
                 length = w[1] - w[0]
-                give = (min(length, max(int(length * SOFT_SHARE), 45)) // 15) * 15   # half, but a 1h gym still yields 45 min
+                give = (
+                    min(length, max(int(length * SOFT_SHARE), 45)) // 15
+                ) * 15  # half, but a 1h gym still yields 45 min
                 if give >= TOUCH:
                     soft_free += _inter(general, (w[0], w[0] + give))
             general = []
@@ -284,21 +305,33 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
             if (date.fromisoformat(g.deadline) - day).days < 0:
                 continue
             ideal, floor, strict, latest = _demand(g, day, d0)
-            owed = strict and (i - last_served[g.id]) >= 2     # missed yesterday -> must be served today
+            owed = strict and (i - last_served[g.id]) >= 2  # missed yesterday -> must be served today
             if ideal == 0 and owed:
-                ideal = g.touch or max(g.min_block, min(max(floor, g.floor), g.ideal))   # a rest-day touch
+                ideal = g.touch or max(g.min_block, min(max(floor, g.floor), g.ideal))  # a rest-day touch
                 floor = min(floor or ideal, ideal)
             if ideal <= 0:
                 continue
             base, boost = ideal, 0
             if g.kind in ("project", "event") and backlog_left[g.id] >= 15 and strict:
                 left_days = (date.fromisoformat(g.deadline) - day).days
-                boost = min(P.round15(backlog_left[g.id] / max(1, min(left_days + 1, 5))),
-                            P.round15(ideal * 0.5), backlog_left[g.id])
-                ideal += boost                          # catch up in small daily pieces, not one cram day
+                boost = min(
+                    P.round15(backlog_left[g.id] / max(1, min(left_days + 1, 5))),
+                    P.round15(ideal * 0.5),
+                    backlog_left[g.id],
+                )
+                ideal += boost  # catch up in small daily pieces, not one cram day
             floor = max(g.min_block, min(floor, ideal))
-            today_goals.append({"g": g, "ideal": ideal, "floor": floor, "owed": owed, "latest": latest,
-                                "base": base, "boost": boost})
+            today_goals.append(
+                {
+                    "g": g,
+                    "ideal": ideal,
+                    "floor": floor,
+                    "owed": owed,
+                    "latest": latest,
+                    "base": base,
+                    "boost": boost,
+                }
+            )
             report[g.id]["ideal"] += ideal
         if not today_goals:
             heavy_run = 0
@@ -306,6 +339,7 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
 
         def prio(c):
             return -(c["g"].weight * (3.0 if c["owed"] else 1.0))
+
         order = sorted(today_goals, key=prio)
 
         # ---- a real pause in the middle of a long day -------------------------------
@@ -319,19 +353,21 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
                 free_total = sum(e - s for s, e in with_soft)
 
         # ---- how many minutes each gets ---------------------------------------
-        eve = any((date.fromisoformat(c["g"].deadline) - day).days <= 1 and c["g"].kind != "habit"
-                  for c in today_goals)
+        eve = any(
+            (date.fromisoformat(c["g"].deadline) - day).days <= 1 and c["g"].kind != "habit"
+            for c in today_goals
+        )
         heavy_rest = heavy_run >= HEAVY_STREAK and not eve
         day_cap = LIGHT_CAP if heavy_rest else DAY_CAP
         cap = int(min(day_cap, free_total) * FILL * factor)
         minutes = {c["g"].id: 0 for c in order}
         left = cap
-        for c in order:                                   # 1) floors, best-ranked first
+        for c in order:  # 1) floors, best-ranked first
             give = c["floor"] if left >= c["floor"] else (left // 5) * 5
             if give >= c["g"].min_block:
                 minutes[c["g"].id] = give
                 left -= give
-        for _ in range(8):                                # 2) the rest by weight, up to what each wants
+        for _ in range(8):  # 2) the rest by weight, up to what each wants
             open_ = [c for c in order if minutes[c["g"].id] > 0 and minutes[c["g"].id] < c["ideal"]]
             if left < 5 or not open_:
                 break
@@ -363,7 +399,9 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
                     placed[g.id] = []
                     continue
                 allowed = with_soft if g.uses_soft else general
-                placed[g.id] = _place(g, minutes[g.id], allowed, taken, prefs, c["latest"], rates, tuning.block_cap)
+                placed[g.id] = _place(
+                    g, minutes[g.id], allowed, taken, prefs, c["latest"], rates, tuning.block_cap
+                )
             starved = [c for c in order if minutes[c["g"].id] >= c["g"].min_block and not placed[c["g"].id]]
             if not starved:
                 break
@@ -371,7 +409,9 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
             if victims:
                 minutes[victims[0]["g"].id] = victims[0]["floor"]
                 continue
-            victims = [c for c in reversed(order) if c not in starved and not c["owed"] and minutes[c["g"].id] > 0]
+            victims = [
+                c for c in reversed(order) if c not in starved and not c["owed"] and minutes[c["g"].id] > 0
+            ]
             if victims:
                 minutes[victims[0]["g"].id] = 0
                 continue
@@ -385,14 +425,26 @@ def allocate(specs: List[Spec], today: str, prefs: "P.Prefs",
                 got = sum(e - s for s, e in placed.get(g.id, []))
                 if not g.important or g.uses_soft or got >= c["ideal"]:
                     continue
-                extra = _place(g, c["ideal"] - got, soft_free, taken, prefs, c["latest"], rates, tuning.block_cap)
+                extra = _place(
+                    g, c["ideal"] - got, soft_free, taken, prefs, c["latest"], rates, tuning.block_cap
+                )
                 if extra:
                     placed[g.id] = sorted(placed.get(g.id, []) + extra)
                     report[g.id]["borrowed"] += sum(e - s for s, e in extra)
 
         day_total = sum(e - s for bl in placed.values() for s, e in bl)
-        why = "heavy_streak" if heavy_rest else ("mode" if mode != "normal" else ("weekend" if weekend_cut else ""))
-        report["days"][iso] = {"mode": mode, "total": day_total, "light": bool(why), "why": why, "rest": rest_win}
+        why = (
+            "heavy_streak"
+            if heavy_rest
+            else ("mode" if mode != "normal" else ("weekend" if weekend_cut else ""))
+        )
+        report["days"][iso] = {
+            "mode": mode,
+            "total": day_total,
+            "light": bool(why),
+            "why": why,
+            "rest": rest_win,
+        }
         heavy_run = heavy_run + 1 if day_total >= HEAVY_DAY else 0
         for c in order:
             g = c["g"]
@@ -419,7 +471,7 @@ def overlaps(alloc: Dict[int, Dict[str, List[Seg]]]):
             for s, e in bl:
                 by_day.setdefault(d, []).append((s, e, gid))
     bad = []
- 
+
     for d, items in by_day.items():
         items.sort()
         for a, b in zip(items, items[1:]):

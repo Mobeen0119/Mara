@@ -25,29 +25,12 @@ from core.persona import (
 
 _manager = None
 
-# A chat reply is short by contract (at most 2 lines). Capping the model's
-# output turns that contract into a hard guarantee AND makes replies fast
-# (fewer generated tokens, especially on the CPU-bound local model). 120 cut
-# replies off mid-sentence (which read as broken/repetitive); 400 finishes
-# any honest 2-4 line answer without letting a rambler run.
 _MAX_CHAT_TOKENS = 400
 
-# Plan draws have their own output ceiling so a slow CPU box FINISHES instead
-# of timing out mid-JSON. A single request CANNOT carry a whole month (60+
-# slots blow the budget, the model truncates mid-JSON, the parse fails, and
-# the entire plan collapses to empty + infinite retries). So one draw is split
-# into small day-bucketed slices — each request is short enough for a
-# slow/weak/free model to finish, and a failed slice only costs itself, never
-# the whole schedule.
 _MAX_PLAN_TOKENS = 1536
 _PLAN_SLICE_TARGET_SLOTS = 8
 _PLAN_SLICE_MAX_CALLS = 8
 
-# Chat can be routed to a FASTER local model (e.g. a 1.7b instead of the 4b
-# used for plans) so conversations feel instant while background plan draws
-# keep the bigger model's quality. Set
-# OLLAMA_CHAT_MODEL=huihui_ai/qwen3-abliterated:1.7b in .env. Empty/None =
-# chat uses the same model as plans.
 def _chat_model_override():
     try:
         return os.environ.get("OLLAMA_CHAT_MODEL") or None
@@ -56,21 +39,19 @@ def _chat_model_override():
 
 
 def _chat_lock_wait():
-    """How long an interactive chat waits for its local CHAT model lock before giving
-    up. Chat (a small fast model) holds its OWN per-model lock, so it no longer queues
-    behind plan draws on the big model — a contended lock now means another chat is
-    mid-reply, worth waiting for. Past the cap, and only then, it may fall back."""
     return 30
 
-# Which provider drew the most recent plan (set by _llm_plan_call /
-# _chat_llm), so the UI can honestly report "drawn by local / drawn by
-# openrouter".
-_state = threading.local()   # per-thread: concurrent users must never see each other's value
+_state = threading.local()
 
-# When the user's own blocked windows consume every usable slot in a day, the
-# honest truth is NOT "the model is down" — it's "your windows leave no free
-# time", and the schedule must say exactly that instead of retrying a model
-# that isn't the problem.
+
+def set_allocation(alloc):
+    _state.allocation = alloc
+
+
+def get_allocation():
+    return getattr(_state, "allocation", None)
+
+
 def plan_blocked_reason():
     return getattr(_state, "plan_blocked_reason", None)
 
@@ -94,15 +75,6 @@ def get_manager(db=None):
     return _manager
 
 
-# ---------------------------------------------------------------------------
-# Personality contract
-# ---------------------------------------------------------------------------
-# The user can teach Eloise her personality in plain chat ("be sarcastic",
-# "don't be a motivational speaker", "act like you'd abuse me if you could").
-# Whoever says it ONCE expects it to stick forever, but a weak model forgets
-# it next turn. So we sniff these directives out of chat messages, store them
-# on the user, and inject them into EVERY system prompt as a standing
-# override.
 _PERSONA_TRIGGERS = {
     "motivational": "NEVER be a motivational speaker, cheerleader, or hype-person. No 'you can do it!', no pumping-up, no empty positivity. Be dry and real instead.",
     "sarcast": "Be wry, dry and sarcastic by default — make it obvious you are not impressed.",
@@ -125,8 +97,7 @@ def user_persona(db, user_id):
 
 
 def absorb_persona_directive(db, user_id, message):
-    """If the user just set Eloise's personality in plain chat, store it as a
-    standing contract. Returns the (possibly new) stored persona, else ''."""
+    """If the user just set Eloise's personality in plain chat, store it as a"""
     t = (message or "").lower()
     clauses = []
     for key, clause in _PERSONA_TRIGGERS.items():
@@ -151,8 +122,7 @@ DEFAULT_LOCATION = "Pakistan"
 
 
 def user_location(db, user_id):
-    """The user's country/city — used to keep suggestions to services that
-    actually exist where they live (no DoorDash in Pakistan)."""
+    """The user's country/city — used to keep suggestions to services that"""
     try:
         row = db.execute("SELECT location FROM users WHERE id=?", (user_id,)).fetchone()
         return ((row and row["location"]) or "").strip() or DEFAULT_LOCATION
@@ -168,14 +138,6 @@ def chat_system_prompt(db, user_id):
     )
 
 
-# ---------------------------------------------------------------------------
-# Step completion vs goal completion
-# ---------------------------------------------------------------------------
-# The user reports finishing the CURRENT STEP ("done", "finished the layout")
-# far more often than the WHOLE goal. The plan chat must treat those as
-# different: a step-done means "name the NEXT task from the plan, do not
-# re-instruct the one just finished". Closing the entire goal must stay rare
-# and require real evidence.
 _STEP_DONE_RE = re.compile(
     r"^\s*(done|did it|did that|finished|finished it|done with it|done with that|"
     r"got it done|wrapped( up)?|moved on|next|next step|what('| i)?s next|what do i do now|"
@@ -191,9 +153,7 @@ _GOAL_DONE_STRONG = [
 
 
 def step_done_detected(message):
-    """True when the user implies the CURRENT task/step is finished and wants
-    forward motion. Wider than goal completion on purpose: it only steers the
-    prompt (name the NEXT task), it never writes to the DB."""
+    """True when the user implies the CURRENT task/step is finished and wants"""
     text = (message or "").strip()
     if not text or len(text.split()) > 16:
         return False
@@ -210,9 +170,6 @@ def step_done_detected(message):
 
 
 def goal_completion_detected(message):
-    """Auto-closing a whole goal is destructive, so it needs BOTH a completion
-    phrase AND a goal-level framing. Bare step-done chatter ('done', 'i'm done')
-    must never close the file."""
     text = (message or "").strip()
     if not text or len(text.split()) > 16:
         return False
@@ -231,9 +188,6 @@ GUARDRAIL_REFUSAL = (
 
 
 def _chat_llm(sys_prompt, user_prompt, db, user_message=""):
-    """Call the real model with NO canned fallback. If the model can't be reached,
-    returns ("", "offline") — the caller surfaces that as a genuine error, never as
-    fabricated Eloise text. The user explicitly wants no hardcoded replies."""
     result = get_manager(db).generate(
         sys_prompt, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
         model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
@@ -250,17 +204,6 @@ def _chat_llm(sys_prompt, user_prompt, db, user_message=""):
 def _pick(items):
     return items[(datetime.now().microsecond // 100) % len(items)]
 
-
-# --- Content-safety guardrail
-# ------------------------------------------------- Precise, not paranoid:
-# Eloise plans REAL goals — including romantic / intimate ones with a partner
-# (gf / wife / partner), and she answers sexual-wellness questions plainly.
-# She refuses only sexual content involving a family member or a minor, and
-# coercion / violence. Word-BOUNDARY matching only: substring scanning used to
-# refuse "document my progress" ('cum' in document), "every person" ('son' in
-# person), "choose between" ('teen' in between) and "grow grapes" ('rape' in
-# grapes). Thread-aware so follow-ups like "sister" after an incest message are
-# still refused.
 
 def _word_re(words):
     return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
@@ -311,23 +254,12 @@ def _has_phrase(t, phrases):
 
 
 def _is_truly_harmful(msg, context=""):
-    """Detect requests Eloise must refuse. Returns True for:
-    - sexual content involving a family member or minor (thread-aware),
-    - coercion / non-consent or real-world violence.
-    Everything else — partner intimacy, masturbation questions, crude language,
-    non-sexual family goals — is allowed. Returns (no tuple, just bool)."""
+    """Detect requests Eloise must refuse. Returns True for:"""
     t = (msg or "").lower()
-    # Only the USER's own words carry intent. Eloise's replies must never be
-    # scanned: her refusal text contains "minor"/"family member", and plan
-    # lines quote goal titles — scanning them makes benign follow-ups look
-    # like abuse and re-refuse forever.
     user_lines = [
         ln for ln in (context or "").split("\n")
         if not ln.strip().lower().startswith(("eloise:", "assistant:"))
     ]
-    # Whole thread matters: "sister" or "consent" alone are harmless, but as a
-    # follow-up to "i want to fuck my sister" they continue the same abuse
-    # goal.
     full = ("\n".join(user_lines) + "\n" + t).lower()
     has_partner = bool(_PARTNER_RE.search(full)) or _has_phrase(full, _PARTNER_PHRASES)
     has_family = bool(_FAMILY_RE.search(full))
@@ -335,18 +267,14 @@ def _is_truly_harmful(msg, context=""):
     has_sex = bool(_SEXUAL_RE.search(t)) or _has_phrase(t, _SEXUAL_PHRASES) \
         or bool(_SEXUAL_RE.search(full)) or _has_phrase(full, _SEXUAL_PHRASES)
 
-    # 1) Coercion / non-consent / violence in this message — always refuse.
     if _COERCION_RE.search(t) or _has_phrase(t, _COERCION_PHRASES):
         return True
     if _VIOLENCE_RE.search(t) or _has_phrase(t, _VIOLENCE_PHRASES):
         return True
 
-    # 2) Any sexual content involving a minor — refuse.
     if has_minor and has_sex:
         return True
 
-    # 3) Family + sexual in the thread, NOT a partner relationship — refuse.
-    # A partner relationship clears it (girlfriend/wife are consenting adults).
     if has_sex and has_family and not has_partner:
         return True
 
@@ -361,10 +289,6 @@ def days_remaining(deadline, today=None):
     today = today or date.today().isoformat()
     return days_between(today, deadline)
 
-
-# ---------------------------------------------------------------------------
-# Chat
-# ---------------------------------------------------------------------------
 
 def _global_chat_prompt(summary, history, user_name, message):
     return (
@@ -448,11 +372,6 @@ def _goal_chat_prompt(goal_name, plan_section, history, user_name, message, step
 
 
 def _clean_local_stream(stream_iter, user_message="", user_lines=None):
-    """Buffer a chat stream, strip any prompt echo / role-label / verbatim-question
-    repetition a weak local model produces, and re-emit the cleaned reply ONCE, then a
-    terminal ('', source) so the caller knows which provider answered. Yields ONLY the
-    terminal when the model merely echoed — the route reports an honest 'offline'
-    instead of printing the user's own words back at them."""
     buf = []
     source = None
     try:
@@ -462,7 +381,7 @@ def _clean_local_stream(stream_iter, user_message="", user_lines=None):
             if chunk:
                 buf.append(chunk)
             elif src is not None:
-                break  # '' marks the stream's clean completion
+                break
     except RuntimeError:
         raise
     cleaned = _strip_prompt_echo("".join(buf), user_message=user_message, user_lines=user_lines)
@@ -483,13 +402,14 @@ def generate_global_chat_reply(user_name, goals_summary, history, message, db=No
 
 def stream_global_chat_reply(user_name, goals_summary, history, message, db=None, persona="",
                              location=""):
-    """Same as generate_global_chat_reply but streams text chunks (echo-cleaned)."""
     sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
     user_prompt = _global_chat_prompt(summary, history, user_name, message)
+   
     if _is_truly_harmful(message, context=history):
         yield GUARDRAIL_REFUSAL, "guardrail"
         return
+   
     yield from _clean_local_stream(get_manager(db).stream_generate(
         sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
         model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
@@ -508,6 +428,7 @@ def _plan_section(plan_lines):
 
 def _with_persona(base, persona, location=""):
     sys = base
+   
     if persona:
         sys += (
             "\n\nYou have a standing personality contract with this user that they set "
@@ -524,6 +445,7 @@ def _with_persona(base, persona, location=""):
             "the local currency when natural. If a real-world step depends on local "
             "infrastructure, adapt it to theirs."
         )
+   
     else:
         sys += (
             "\n\nLOCATION: the user's country is not set. Never assume US-only "
@@ -539,6 +461,7 @@ def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_li
     plan_section = _plan_section(plan_lines)
     user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
                                     step_done=step_done)
+    
     if _is_truly_harmful(message, context=history):
         return GUARDRAIL_REFUSAL, "guardrail"
     return _chat_llm(sys, user_prompt, db, user_message=message)
@@ -546,15 +469,15 @@ def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_li
 
 def stream_chat_reply(user_name, goal_name, history, message, db=None, plan_lines="",
                       persona="", step_done=False, location=""):
-    """Same as generate_chat_reply but streams text chunks (echo-cleaned). Yields
-    (chunk, source)."""
     sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     plan_section = _plan_section(plan_lines)
     user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
                                     step_done=step_done)
+  
     if _is_truly_harmful(message, context=history):
         yield GUARDRAIL_REFUSAL, "guardrail"
         return
+    
     yield from _clean_local_stream(get_manager(db).stream_generate(
         sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
         model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
@@ -562,11 +485,11 @@ def stream_chat_reply(user_name, goal_name, history, message, db=None, plan_line
 
 
 def _history_user_lines(history):
-    """Pull the user's OWN prior lines out of the formatted history string so the
-    stream cleaner can strip the model re-quoting them verbatim."""
     out = []
+   
     if not history:
         return out
+   
     for ln in history.split("\n"):
         if ln.strip().lower().startswith(("user:", "user|")):
             out.append(ln.split(":", 1)[1].strip()[:200])
@@ -579,6 +502,7 @@ def generate_opening_message(user_name, goal_summary, db=None):
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: OPENING_FALLBACK
     )
+   
     return text, source
 
 
@@ -588,6 +512,7 @@ def generate_nudge(user_name, goal_summary, nearest, db=None):
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: NUDGE_FALLBACK
     )
+   
     return text, source
 
 
@@ -597,6 +522,7 @@ def generate_check_in_prompt(user_name, goals_summary, db=None):
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: _pick(FALLBACK_CHECK_IN_PROMPT)
     )
+   
     return text, source
 
 
@@ -607,40 +533,34 @@ def generate_check_in_response(user_name, done, db=None):
             sys, f"User: {user_name} says they finished. React and set the next move.",
             fallback_fn=lambda: FALLBACK_CHECK_IN_YES,
         )
+  
     else:
         sys = CHECK_IN_NO_SYSTEM_PROMPT
         text, source = get_manager(db).generate_with_fallback(
             sys, f"User: {user_name} says they did NOT finish. Insult lightly, then redirect.",
             fallback_fn=lambda: _pick(NO_INSULTS) + " I've redrawn the board so the gap is undeniable.",
         )
+  
     return text, source
 
 
-# ---------------------------------------------------------------------------
-# Plan generation
-# ---------------------------------------------------------------------------
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
 def normalize_time(t):
     t = (t or "").strip()
     m = TIME_RE.match(t)
+  
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
     return None
 
 
 def parse_time_window(text):
-    """Parse a window like '11pm-7am', '3pm-5pm', '5-7pm', '9:00-12:00', 'gym 5-7pm',
-    'uni 6 to 2 pm' or 'work 9 to 5'.
-    Returns (start_min, end_min) in minutes from midnight, handling overnight.
-    The old parser applied the last explicit am/pm to ALL bare numbers before it,
-    so 'uni 6 to 2 pm' became 6pm-2am (1080, 2280) instead of 6am-2pm (360, 840),
-    and a window with no am/pm at all ('work 9 to 5') was silently dropped — both
-    corrupt the user's 'always busy' silhouette and starve every schedule grid."""
     text = text or ""
     low = text.lower()
     m = re.findall(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", low)
+  
     if len(m) < 2:
         return None
     entries = [(int(n), int(mm) if mm else 0, mer) for n, mm, mer in m]
@@ -648,9 +568,6 @@ def parse_time_window(text):
     has_any = any(mer for _, _, mer in entries)
 
     if not has_any:
-        # No am/pm anywhere. Prefer a same-meridian block ("9:00-9:30",
-        # "9:00-12:00") and only read it as start-am/end-pm when that would be
-        # invalid backwards ("9 to 5" -> 9am-5pm, not 9am-5am).
         start = _hh_12_to_24(entries[0][0], "am") * 60 + entries[0][1]
         end = _hh_12_to_24(entries[-1][0], "am") * 60 + entries[-1][1]
         if end <= start:
@@ -662,8 +579,6 @@ def parse_time_window(text):
     for i, (hh, mm, mer) in enumerate(entries):
         if mer:
             times[i] = _hh_12_to_24(hh, mer) * 60 + mm
-    # Bare numbers inherit the nearest explicit meridian to their RIGHT, else
-    # LEFT.
     for i in range(n):
         if times[i] is not None:
             continue
@@ -672,6 +587,7 @@ def parse_time_window(text):
             if entries[j][2]:
                 inh = entries[j][2]
                 break
+     
         if inh is None:
             for j in range(i - 1, -1, -1):
                 if entries[j][2]:
@@ -681,8 +597,7 @@ def parse_time_window(text):
         times[i] = _hh_12_to_24(entries[i][0], inh) * 60 + entries[i][1]
 
     start, end = times[0], times[-1]
-    # "X to Y pm" with a bare leading hour >= the trailing pm hour reads as X
-    # am - Y pm ("uni 6 to 2 pm" = 6am-2pm), unless X is noon ("12-2pm").
+ 
     if not entries[0][2] and entries[-1][2] == "pm" and entries[0][0] >= entries[-1][0]:
         start = _hh_12_to_24(entries[0][0], "pm" if entries[0][0] == 12 else "am") * 60 + entries[0][1]
     if end < start:
@@ -697,8 +612,7 @@ def _hh_12_to_24(hh, mer):
 
 
 def parse_clock_list(text):
-    """Pull every clock time out of a string into minutes from midnight.
-    '23:30 - 07:00' -> [1410, 420]; '08:00, 13:00, 20:00' -> [480, 780, 1200]."""
+    """Pull every clock time out of a string into minutes from midnight"""
     out = []
     for hh, mm, mer in re.findall(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", (text or "").lower()):
         h, m = int(hh), int(mm) if mm else 0
@@ -710,7 +624,6 @@ def parse_clock_list(text):
 
 
 def parse_routine_windows(details):
-    """Turn the user's sleep / meal / movement answers into busy windows (minutes)."""
     d = details or {}
     windows = []
     sleep_times = parse_clock_list(d.get("sleep_schedule") or "")
@@ -736,8 +649,6 @@ _DEFAULT_HUMAN_WINDOWS = [
 
 
 def generate_clarify_questions(title, db=None, deadline="", known="", unknown=()):
-    """Questions written by the model for THIS goal. No model, no questions: there is
-    deliberately no canned fallback list, the caller says what it assumed instead."""
     ask_routine = ""
     if unknown:
         ask_routine = (
@@ -783,7 +694,6 @@ def generate_clarify_questions(title, db=None, deadline="", known="", unknown=()
 
 
 def goal_details_summary(details_json):
-    """Convert stored details JSON to a human-readable summary for the chat prompt."""
     try:
         d = json.loads(details_json or "{}")
     except Exception:
@@ -798,12 +708,10 @@ def goal_details_summary(details_json):
 
 
 def build_plan_quick(goal, extra_blocked=None):
-    """Fast, deterministic, constraint-aware fallback schedule. Never blocks on the LLM."""
     return _build_fallback_plan(goal, extra_blocked=extra_blocked)
 
 
 def user_blocked_windows(user):
-    """Parse the user's global 'always busy' windows (e.g. gym 5-7pm) into minute tuples."""
     raw = None
     if isinstance(user, dict):
         raw = (user or {}).get("blocked_windows")
@@ -827,9 +735,6 @@ def user_blocked_windows(user):
 
 
 def user_calendar_busy(db, user_id, exclude_goal_id, start_date, end_date, only_goal_ids=None):
-    """Map date -> [(start_min, end_min), ...] of this user's OTHER goals' pending
-    actions in [start_date, end_date]. Lets a plan's slot grid avoid the user's real
-    calendar (other goals already occupying time), not just declared busy windows."""
     busy = {}
     if db is None:
         return busy
@@ -864,16 +769,6 @@ def _is_event_goal(text):
     return bool(b and b.get("kind") == "event")
 
 
-# ---------------------------------------------------------------------------
-# Effort model. A goal is not "fill every free hour until the deadline".
-#   event   - one-off with a date (date night, party, proposal): the work is a few
-#             hours, done in the LAST days; perishables (flowers, food) land on the
-#             day; one early slot handles anything with lead time (bookings, orders).
-#   habit   - a practice (gym, six-pack, run, diet): sessions live INSIDE the
-#             user's own window for it (their 'gym 5-6'), plus short movement
-#             snacks after meals - so the routine they already have is the plan.
-#   project - everything else: the horizon planner above.
-# ---------------------------------------------------------------------------
 _HABIT_WORDS = ("gym", "workout", "work out", "six pack", "six-pack", "6 pack", "6-pack", "abs",
                 "fitness", "get fit", "lose weight", "weight loss", "fat loss", "muscle", "bulk",
                 "cut ", "run ", "running", "marathon", "yoga", "diet", "walk daily", "stretch",
@@ -885,7 +780,7 @@ _state_workout = threading.local()
 
 
 def set_workout_windows(windows):
-    """[(start_min, end_min), ...] - the user's own gym/exercise windows."""
+    """[(start_min, end_min), ...] - the user's own gym/exercise windows"""
     _state_workout.windows = list(windows or [])
 
 
@@ -906,7 +801,6 @@ def set_brief(b):
 
 
 def goal_brief(title, db=None, deadline=""):
-    """One model call: what kind of effort is this really? None when no model answers."""
     sys = ("You size real-life goals the way a sensible person would. Reply with ONLY JSON: "
            '{"kind":"event|habit|project","total_hours":number,"active_days":number,'
            '"physical":true|false,"per_week":number,"best_time":"morning|afternoon|evening|night"}. '
@@ -939,108 +833,36 @@ def goal_brief(title, db=None, deadline=""):
 
 def effort_profile(goal, days_left):
     brief = getattr(_state_brief, "b", None)
+   
     if brief and brief["kind"] == "event":
         return {"kind": "event", "event_kind": "event", "budget_min": int(brief["total_hours"] * 60),
                 "active_days": min(brief["active_days"], max(days_left + 1, 1))}
+   
     if brief and brief["kind"] == "habit":
         if brief.get("physical"):
             return {"kind": "habit", "per_week": brief.get("per_week")}
         return {"kind": "recurring", "per_week": brief.get("per_week"), "best_time": brief.get("best_time")}
+   
     if brief and brief["kind"] == "project" and _goal_kind(goal.get("title") or "") not in ("hookup", "romance"):
         return {"kind": "project"}
     title = (goal.get("title") or goal.get("display_title") or "")
     low = title.lower() + " "
     kind = _goal_kind(title)
+ 
     if kind == "hookup" or kind == "romance" or _is_event_goal(title):
         ek = "hookup" if kind == "hookup" else "romance" if kind == "romance" else "event"
         return {"kind": "event", "event_kind": ek, "budget_min": _EVENT_BUDGET_MIN[ek],
                 "active_days": min(_EVENT_ACTIVE_DAYS if ek != "event" else 4, max(days_left + 1, 1))}
+ 
     if any(w in low for w in _HABIT_WORDS):
         return {"kind": "habit"}
+ 
     return {"kind": "project"}
 
 
-_state_alloc = threading.local()
-
-
-def set_allocation(a):
-    _state_alloc.a = a
-
-
-def get_allocation():
-    return getattr(_state_alloc, "a", None)
-
-
-def goal_demand(goal, today):
-    try:
-        details = json.loads(goal.get("details") or "{}")
-    except Exception:
-        details = {}
-    title = goal.get("title") or goal.get("display_title") or ""
-    brief = details.get("brief") if details.get("brief_for") == title else None
-    prev = getattr(_state_brief, "b", None)
-    _state_brief.b = brief
-    try:
-        left = max(days_remaining(goal["deadline"], today), 0) if goal.get("deadline") else 365
-        prof = effort_profile(goal, left)
-    finally:
-        _state_brief.b = prev
-    commit = daily_commit_min(details)
-    if details.get("cap_min"):
-        commit = min(commit, int(details["cap_min"]))
-    out = {"session": MIN_SESSION_MIN, "free": False, "start": None, "kind": prof["kind"]}
-    if prof["kind"] == "event":
-        n = max(1, int(prof["active_days"]))
-        out["rate"] = prof["budget_min"] / float(n)
-        if goal.get("deadline"):
-            out["start"] = (date.fromisoformat(goal["deadline"]) - timedelta(days=n - 1)).isoformat()
-    elif prof["kind"] in ("habit", "recurring"):
-        per_week = max(1, min(int(prof.get("per_week") or habit_sessions_per_week(goal)), 6))
-        sess = SESSION_MAX_MIN if prof["kind"] == "habit" else max(MIN_SESSION_MIN, min(commit, 90))
-        out["session"] = sess
-        out["rate"] = sess * per_week / 7.0
-        out["free"] = prof["kind"] == "habit"
-    else:
-        out["rate"] = float(commit)
-    return out
-
-
-def routine_day_prefs(rt):
-    wake, bed = 7 * 60, 23 * 60
-    st = list(rt["sleep"]) if rt else []
-    if len(st) >= 2:
-        b0, w0 = st[0], st[1]
-        if w0 > 13 * 60 and b0 < w0:
-            b0, w0 = w0, b0
-        nb = planner.normalize_sleep(b0, w0)
-        if nb is not None:
-            bed, wake = nb, w0
-    return wake, bed
-
-
-def split_windows(windows):
-    out = []
-    for s, e in windows:
-        s %= 1440
-        e = (e - s) % 1440 + s
-        if e > 1440:
-            out += [(s, 1440), (0, e - 1440)]
-        else:
-            out.append((s, e))
-    return planner.merge(out)
-
-
-def allocate_for_user(rows, today, capacity_for, horizon_days=121):
-    from core import triage
-    items = []
-    for g in rows:
-        dm = goal_demand(g, today)
-        items.append({"id": g["id"], "importance": triage.importance_of(g),
-                      "deadline": None if g.get("open_ended") else g.get("deadline"),
-                      "rate": dm["rate"], "session": dm["session"], "free": dm["free"], "start": dm["start"]})
-    ends = [i["deadline"] for i in items if i["deadline"]]
-    span = horizon_days if (len(ends) < len(items) or not ends) else min(horizon_days, max(0, days_remaining(max(ends), today)) + 1)
-    return planner.allocate(items, today, span, capacity_for)
+def _thin_to_sessions(horizon, per_week):
+    days = _SESSION_DAYS.get(max(2, min(int(per_week or 3), 5)), (0, 2, 4))
+    return [(d, sl if date.fromisoformat(d).weekday() in days else []) for d, sl in horizon]
 
 
 _state_routine = threading.local()
@@ -1058,12 +880,12 @@ fmt_min = planner.fmt
 
 
 def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_days=5):
-    """Keep only the final `active_days`, plus ONE early lead-time slot, within a time budget."""
     if not horizon:
         return horizon
     last_days = [d for d, sl in horizon if sl][-active_days:]
     keep = {d: sl for d, sl in horizon if d in set(last_days)}
     lead = None
+  
     if len(horizon) > active_days + 3:
         cutoff = (date.fromisoformat(deadline) - timedelta(days=lead_days)).isoformat()
         cands = [(d, sl) for d, sl in horizon if d <= cutoff and d not in keep and sl]
@@ -1072,9 +894,11 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
             lead = (d, [min(sl, key=lambda x: -(x[1] - x[0]))][:1])
     out = []
     spent = 0
-    if lead:                                              # the lead slot is part of the budget
+   
+    if lead:
         budget_min -= min(lead[1][0][1] - lead[1][0][0], 60)
-    for d in reversed(sorted(keep)):                      # nearest the event first
+   
+    for d in reversed(sorted(keep)):
         slots = []
         for sl in sorted(keep[d], key=lambda x: x[0])[:3]:
             dur = sl[1] - sl[0]
@@ -1084,6 +908,7 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
             spent += dur
         out.append((d, slots))
     out.sort()
+   
     if lead:
         d, sl = lead
         dur = min(sl[0][1] - sl[0][0], 60)
@@ -1091,48 +916,42 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
     return [(d, sl) for d, sl in out if sl]
 
 
-def _even_days(today, deadline, per_week):
-    t0 = date.fromisoformat(today)
-    n = max(1, (date.fromisoformat(deadline) - t0).days + 1)
-    gap = 7.0 / max(1, min(per_week, 7))
-    out, x = set(), 0.0
-    while x < n:
-        out.add((t0 + timedelta(days=int(x))).isoformat())
-        x += gap
-    return out
-
-
 def habit_sessions_per_week(goal):
     low = ((goal.get("title") or "") + " " + (goal.get("display_title") or "")).lower()
+  
     if any(w in low for w in ("marathon", "yoga", "walk", "stretch")):
         return 5
+  
     if any(w in low for w in ("six pack", "6 pack", "abs", "muscle", "bulk", "gym", "lose weight", "weight loss", "fat loss", "fitness", "get fit")):
         return 4
+  
     return 3
 
 
-MIN_SESSION_MIN = planner.MIN_SESSION
+_SESSION_DAYS = {2: (1, 4), 3: (0, 2, 4), 4: (0, 1, 3, 4), 5: (0, 1, 2, 4, 5)}
 SESSION_MAX_MIN = 60
 SNACK_MIN = 5
 SNACKS_PER_DAY = 2
 
 
-def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, detail_days=None, session_days=None):
-    """~per_week gym sessions (60 min max) inside the person's workout window;
-    on the other days at most two 5-minute movement snacks right after lunch/dinner."""
+def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, detail_days=None, per_week=4):
     t0 = date.fromisoformat(today)
     end = date.fromisoformat(deadline)
     span = min((end - t0).days + 1, 121)
+   
     if detail_days:
         span = min(span, detail_days)
+    train = _SESSION_DAYS.get(per_week, _SESSION_DAYS[4])
     after = sorted(meal_windows, key=lambda w: w[1] % 1440)[1:3] if len(meal_windows) > 2 else sorted(meal_windows, key=lambda w: w[1] % 1440)[-2:]
     out = []
+   
     for i in range(span):
         day = t0 + timedelta(days=i)
         d = day.isoformat()
         busy = list(others_for(d) or [])
         slots = []
-        is_train = d in session_days if session_days is not None else False
+        is_train = day.weekday() in train
+     
         if is_train:
             for (ws, we) in windows[:1]:
                 we = min(we, ws + SESSION_MAX_MIN)
@@ -1140,6 +959,7 @@ def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, 
                     continue
                 if not any(ws < be and bs < we for bs, be in busy):
                     slots.append((ws, we))
+      
         else:
             for (ms, me) in after[:SNACKS_PER_DAY]:
                 a, b = me % 1440, me % 1440 + SNACK_MIN
@@ -1150,33 +970,32 @@ def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, 
                     slots.append((a, b))
         if slots:
             out.append((d, sorted(slots)))
+
     return out
 
 
 LEAD_TODAY_MIN = 30
 
-# ---------------------------------------------------------------------------
-# Horizon-aware planning. Nobody plans day-by-day 4 months out: far goals get a
-# monthly roadmap, mid-range goals a weekly one, and only the near days are
-# drawn hour-by-hour. The detailed window rolls forward every day.
-# ---------------------------------------------------------------------------
-WEEKLY_AT = 56        # > 8 weeks out  -> weekly outline
-MONTHLY_AT = 75       # > ~2.5 months  -> monthly outline
-DETAIL_DAYS = 14      # hour-by-hour days kept ahead in weekly/monthly mode
+WEEKLY_AT = 56
+MONTHLY_AT = 75
+DETAIL_DAYS = 14
 _PHASES = ((0.25, "Foundations"), (0.60, "Build"), (0.85, "Pressure test"), (1.01, "Final push"))
 
 
 def scope_for(days_left):
-    """'daily' | 'weekly' | 'monthly' from how far away the deadline is."""
+    """'daily' | 'weekly' | 'monthly' from how far away the deadline is"""
+    
     if days_left > MONTHLY_AT:
         return "monthly"
+    
     if days_left > WEEKLY_AT:
         return "weekly"
+    
     return "daily"
 
 
 def detail_days_for(days_left):
-    """How many days from today get hour-by-hour tasks (None = all of them)."""
+    """How many days from today get hour-by-hour tasks (None = all of them)"""
     return None if scope_for(days_left) == "daily" else DETAIL_DAYS
 
 
@@ -1188,8 +1007,6 @@ def _phase_at(frac):
 
 
 def build_outline_periods(today, deadline, scope, slot_minutes_by_date):
-    """Deterministic roadmap skeleton: periods with a phase and a REAL hours budget
-    (the sum of the free slots the planner actually found in that period)."""
     t0 = date.fromisoformat(today)
     end = date.fromisoformat(deadline)
     total = max((end - t0).days + 1, 1)
@@ -1209,8 +1026,6 @@ def build_outline_periods(today, deadline, scope, slot_minutes_by_date):
 
 
 def generate_outline_objectives(goal, periods, db=None):
-    """One short model call fills each period's concrete objective. Failure leaves
-    the objective empty; the phase + real hours budget still show. Nothing canned."""
     if not periods:
         return periods
     title = (goal.get("title") or goal.get("display_title") or "").strip()
@@ -1265,6 +1080,7 @@ def _kind_rules(profile):
             "goal itself, plus the small preparation that makes it happen. Keep it tasteful, warm and "
             "practical; never explicit. Vary the actions across sessions.\n"
         )
+    
     if kind == "habit":
         return (
             "THIS IS A PHYSICAL HABIT. Long slots (30+ min) are the person's own gym/exercise window: "
@@ -1290,12 +1106,8 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
                          detail_days=None, outline_out=None):
     today = today or date.today().isoformat()
     deadline = goal["deadline"]
-    # Cover every day from today THROUGH the deadline (inclusive). Using only
-    # the raw gap silently dropped the deadline day itself — a "1 day left"
-    # goal planned today and forgot tomorrow, which is the day that matters.
     span_days = min(max(days_remaining(deadline, today), 0) + 1, 121)
 
-    # Load questionnaire details (if any) — these make the schedule specific.
     details = {}
     try:
         details = json.loads(goal.get("details") or "{}")
@@ -1315,13 +1127,10 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         w = parse_time_window(c)
         if w:
             blocked.append(w)
-    # User-level "always busy" windows apply to EVERY goal in the same day.
     for w in (extra_blocked or []):
         if w:
             blocked.append(w)
 
-    # Sleep, meals and movement are not negotiable. Build around the times the
-    # user told us when filing; fall back to a sane default day if they skipped.
     _r = get_routine()
     if _r:
         from core import routine as _routine_mod
@@ -1332,12 +1141,9 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         if w:
             blocked.append(w)
 
-    # Intimate-night goals get a real arc instead of the generic grid:
-    # build-up days, THE EVENT EVENING the night before a free day (so she
-    # stays over), and a return-home / morning-after day. That is what the
-    # user actually asked for ("sex the night before, return home next day")
-    # instead of random days.
-    if _goal_kind(goal.get("title") or goal["display_title"]) == "hookup":
+    _alloc = get_allocation()
+    _owned = _alloc is not None and goal.get("id") in _alloc
+    if not _owned and _goal_kind(goal.get("title") or goal["display_title"]) == "hookup":
         return _hookup_arc(today, deadline, blocked, details,
                            goal.get("title") or goal["display_title"])
 
@@ -1347,13 +1153,10 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         _fixed_dated = _rt.dated_busy(get_routine(), today, deadline)
 
     def _day_bounds(day_date=None):
-        # convert blocked windows into a busy silhouette over one day (minutes
-        # 0-1439), splitting overnight windows across midnight, plus other
-        # goals' booked blocks
         busy = []
         for (s, e) in list(blocked) + list(_fixed_dated.get(day_date, [])):
             s = s % (24 * 60)
-            e = (e - s) % (24 * 60) + s  # normalize span, keep end in (s, s+24h]
+            e = (e - s) % (24 * 60) + s
             if e > 24 * 60:
                 busy.append((s, 24 * 60))
                 busy.append((0, e - 24 * 60))
@@ -1369,8 +1172,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         return merged
 
     def _free_from(busy, start, taken, span=90):
-        # earliest (s, e) window of `span` minutes starting >= start that
-        # avoids every busy block and every slot already taken this day
         obstacles = sorted(busy + list(taken))
         cur = start
         for (bs, be) in obstacles:
@@ -1383,19 +1184,14 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
             return None
         return (cur, cur + span)
 
-    # --- how much, and when: the human-nature engine (core/planner.py) -----
-    # Parse the user's own "hours per day I can commit" answer so the load
-    # follows THEIR life, not a fixed guess.
     commit_min = daily_commit_min(details)
-    if details.get("cap_min"):
-        commit_min = min(commit_min, int(details["cap_min"]))
 
     wake, bed = 7 * 60, 23 * 60
     _r = get_routine()
     sleep_times = list(_r["sleep"]) if _r else parse_clock_list(details.get("sleep_schedule") or "")
     if len(sleep_times) >= 2:
         b0, w0 = sleep_times[0], sleep_times[1]
-        if w0 > 13 * 60 and b0 < w0:      # typed backwards ("7am to 11pm")
+        if w0 > 13 * 60 and b0 < w0:
             b0, w0 = w0, b0
         nb = planner.normalize_sleep(b0, w0)
         if nb is not None:
@@ -1411,32 +1207,25 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     if profile["kind"] == "recurring":
         prefs.commit_min = min(prefs.commit_min, 90)
         prefs.chronotype = {"morning": "morning", "afternoon": "afternoon", "evening": "night", "night": "night"}.get(profile.get("best_time"), prefs.chronotype)
-    if profile["kind"] == "habit" and wins:
+    if _owned:
+        mine = _alloc.get(goal["id"], {})
+        start = date.fromisoformat(today)
+        horizon = [((start + timedelta(days=k)).isoformat(),
+                    list(mine.get((start + timedelta(days=k)).isoformat(), [])))
+                   for k in range(span_days)]
+    elif profile["kind"] == "habit" and wins:
         meals = [w for w in (human_windows or []) if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60]
-        # meal windows are the short ones in the routine (sleep is long); take their END
         meals = [w for w in meals if w not in wins]
-        mine = (get_allocation() or {}).get(goal.get("id"))
-        sdays = {d for d, m in mine.items() if m > 0} if mine is not None else _even_days(today, deadline, profile.get("per_week") or habit_sessions_per_week(goal))
-        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, sdays)
+        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, profile.get("per_week") or habit_sessions_per_week(goal))
     else:
-        alloc = get_allocation()
-        mine = alloc.get(goal.get("id")) if alloc else None
         horizon = planner.plan_horizon(
             today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
             shaped=profile["kind"] != "recurring",
-            day_budget=(lambda d: mine.get(d, 0)) if mine is not None else None,
         )
-        if mine is not None and not any(sl for _d, sl in horizon):
-            horizon = planner.plan_horizon(
-                today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
-                shaped=profile["kind"] != "recurring",
-            )
-            mine = None
         if profile["kind"] == "event":
             horizon = _apply_event_shape(horizon, today, deadline, profile["budget_min"], profile["active_days"])
-        elif profile["kind"] == "recurring" and mine is None:
-            keep = _even_days(today, deadline, profile.get("per_week") or 3)
-            horizon = [(d, sl if d in keep else []) for d, sl in horizon]
+        elif profile["kind"] == "recurring":
+            horizon = _thin_to_sessions(horizon, profile.get("per_week"))
     _state.profile = profile
     if outline_out is not None:
         outline_out["slot_minutes"] = {d: sum(e - s0 for s0, e in sl) for d, sl in horizon}
@@ -1446,10 +1235,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     day_list = [d for d, _ in horizon]
     day_slots_map = {d: s for d, s in horizon}
 
-    # Backwards packing: fill the LAST day first, walking back to today. If we
-    # run out of slots (blocked days, tiny windows), the EARLY days get left
-    # empty — never the day closest to the deadline, which is the one that
-    # actually decides whether the goal lands.
     entries = []
     split_topics = None
     for key in ("syllabus", "topic", "domain", "requirements"):
@@ -1467,9 +1252,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         for (s, e) in reversed(day_slots_map.get(d, [])):
             packed.append((d, s, e))
     if is_event and split_topics and len(packed) >= len(split_topics):
-        # An event is a short list of one-off jobs, not a syllabus you repeat.
-        # Take only the slots closest to the deadline so the arc builds up to
-        # the event, and schedule each task exactly once.
         packed = packed[:len(split_topics)]
     packed.reverse()
 
@@ -1495,11 +1277,6 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
 
 
 def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
-    """Deterministic schedule skeleton for an intimate-night goal. Guarantees:
-    every day is covered, blocks never overlap within a day, and the structure is a
-    real arc — prep days, then THE EVENT EVENING on the night before a free day,
-    then a morning-after return-home day. Titles below are concrete per-block
-    instructions (what to actually do in that hour), not canned filler."""
     details = details or {}
 
     def day_busy():
@@ -1538,14 +1315,9 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
     endd = date.fromisoformat(deadline)
     if endd < day0:
         endd = day0
-    # An intimate night is a 2-3 day arc (prep, the night, morning after), not a
-    # 20-day grind: only the final days are planned.
     n = min(endd.toordinal() - day0.toordinal() + 1, 3)
     dates = [endd - timedelta(days=n - 1 - i) for i in range(n)]
 
-    # Event evening = the night before a free day if one exists so she stays
-    # over and the user returns home the following morning. Favors the LAST
-    # such night.
     event_day = dates[-1]
     if n >= 2:
         for cand in reversed(dates[:-1]):
@@ -1590,7 +1362,6 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
                 if m:
                     taken.append(m)
                     add(day, m, "event", 0, i)
-            # the evening includes dinner: short meal windows must not break it up
             b_ev = [w for w in b if not (w[1] - w[0] <= 90 and 12 * 60 <= w[0] < 22 * 60)]
             ev = fit(b_ev, taken, 18 * 60, 240) or fit(b_ev, taken, 18 * 60, 180) or fit(b_ev, taken, 19 * 60, 150)
             add(day, ev or (19 * 60, 22 * 60), "event", 1, i)
@@ -1609,10 +1380,6 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
 
 
 def _fallback_task_label(phase, seq, goal_ref, ordinal=1):
-    """Minimal, NON-fabricated label for a scheduled slot, used ONLY when the model
-    can't be reached. It just names the slot from the user's OWN goal text (Eloise
-    never writes canned messages here — user's hard rule). The real, concrete
-    'what to do in this hour' wording always comes from the model when it's up."""
     label = {
         ("prep", 0): "Prep morning",
         ("prep", 1): "Prep evening",
@@ -1637,7 +1404,7 @@ def _overlaps(s, e, blocked):
 
 
 def _local_now(db, goal, user=None):
-    """The goal owner's wall-clock 'now' (their timezone, not the server's)."""
+    """The goal owner's wall-clock 'now' (their timezone, not the server's)"""
     from core.clock import now_for
     if user is None and db is not None and goal and goal.get("user_id"):
         try:
@@ -1648,14 +1415,6 @@ def _local_now(db, goal, user=None):
 
 
 def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False, busy_by_date=None):
-    """Generate a real schedule for a goal. Returns a list of action dicts from the LLM,
-    or None when no LLM can serve one. NEVER fabricates a hardcoded fill-in plan — the
-    user's hard rule: only real model-drawn tasks are ever shown on the board."""
-    # No liveness pre-probe here. A busy local CPU reads as "down" to a fast
-    # probe and that misreport used to spawn MORE competing calls instead of
-    # backing off. We just attempt the real call — it serializes on the
-    # app-wide ollama lock and gets its real timeout. A genuine failure
-    # returns None; the caller keeps the old plan.
     try:
         return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
                               busy_by_date=busy_by_date, user=user)
@@ -1665,9 +1424,6 @@ def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False, b
 
 def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=False,
                           busy_by_date=None):
-    """Like generate_plan but returns None (not the fallback) when no LLM can serve a
-    plan, so callers can keep a previously-drawn plan instead of overwriting it with the
-    same deterministic fallback. Used for background schedule upgrades."""
     try:
         return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
                               busy_by_date=busy_by_date, user=user)
@@ -1677,8 +1433,6 @@ def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=
 
 
 def _goal_kind(title):
-    """Classify the goal into 'hookup', 'romance', 'startup' or 'general' so the
-    scheduler can give each a real structure instead of the same generic grid."""
     t = (title or "").lower()
     if any(w in t for w in (
             "hookup", "hook up", "sex night", "night together", "sleep with",
@@ -1689,21 +1443,10 @@ def _goal_kind(title):
             "wife", "partner", "husband", "boyfriend", "bf", "proposal", "memorable",
             "date night", "surprise", "gift")):
         return "romance"
-    # Everything else — startup, exams, fitness, a trip, a project, whatever
-    # the user names — gets the SAME scheduling behavior: real concrete
-    # actions, right-sized to the deadline, one to two humanly-possible tasks
-    # per day. No per-title special cases, no startup-specific templates.
     return "general"
 
 
 def _plan_guidance(title, details_summary):
-    """Build an INSTRUCTION (not a schedule) that tells the LLM what kind of real,
-    concrete tasks this goal needs, so generation stays genuinely dynamic while
-    directed at the goal type. The LLM still writes every title itself, in real time.
-    The user's hard rule: every task title must be a COMPLETE concrete ACTION for that
-    hour — a verb plus the actual thing (what to buy, set up, text, when) — pulled
-    from the user's OWN answers and chat notes. Topic-words and vibe-words
-    ('ensure', 'aftercare', 'make it special') are rejected as titles."""
     kind = _goal_kind(title)
     s = details_summary or ""
     if kind == "hookup":
@@ -1728,11 +1471,6 @@ def _plan_guidance(title, details_summary):
             "it special', 'plan the surprise', 'discuss feelings') — those are NOT actions. The "
             "moment itself is named as the real plan from the notes. This is logistics, not a lecture."
         ) + (f" Details: {s}." if s else ".")
-    # Every other goal — startup, exams, fitness, a trip, a project — gets NO
-    # kind-specific text here: the SAME scheduling behavior applies to all of
-    # them (real concrete actions, right-sized to the deadline, as many slots
-    # as that day realistically has). That universal rule lives in
-    # _llm_plan_call so it reaches every goal the same way.
     return ""
 
 
@@ -1801,8 +1539,6 @@ def reorder_naturally(entries, title, db=None):
 
 
 def _extract_links(text):
-    """Pull any http(s) URLs the user shared in chat notes so the schedule can
-    reference the user's own resources instead of making new ones up."""
     if not text:
         return []
     out = []
@@ -1816,21 +1552,44 @@ def _extract_links(text):
 def daily_commit_min(details):
     commit_min = 120
     tp = (details.get("time_per_day") or "").strip().lower()
-    m = re.search(r"(\d+)", tp)
+    if re.search(r"\bhalf (an|a) hour\b", tp):
+        return 30
+    if re.search(r"\b(an|one) hour\b", tp) and not re.search(r"\d", tp):
+        return 60
+    m = re.search(r"(\d+(?:\.\d+)?)", tp)
     if m:
-        n = int(m.group(1))
-        unit = tp[m.end():m.end() + 2]
+        n = float(m.group(1))
+        unit = tp[m.end():m.end() + 3].strip()
         is_minutes = ("m" in unit and "h" not in unit) or n > 16
         if is_minutes:
-            commit_min = max(15, min(n, 16 * 60))
+            commit_min = max(15, min(int(n), 16 * 60))
         elif 1 <= n <= 16:
-            commit_min = n * 60
+            commit_min = int(round(n * 60))
+        elif 0 < n < 1:
+            commit_min = max(15, int(round(n * 60)))
     return commit_min
+
+
+# Time and size come from core.balance; the model only writes titles.
+def too_small_ratio():
+    n = getattr(_state, "slots_titled", 0)
+    return (getattr(_state, "too_small", 0) / n) if n else 0.0
+
+
+# A draw missing slots or titles must not overwrite the existing plan.
+def last_plan_complete():
+    total = getattr(_state, "slots_total", 0)
+    return getattr(_state, "failed_slices", 0) == 0 and total > 0 and \
+        getattr(_state, "slots_titled", 0) >= 0.85 * total
 
 
 def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False, busy_by_date=None,
                    user=None):
     _state.last_error = None
+    _state.slots_total = 0
+    _state.slots_titled = 0
+    _state.too_small = 0
+    _state.failed_slices = 0
     sys = BASE_SYSTEM_PROMPT
     deadline = goal["deadline"]
     title = (goal.get("title") or goal["display_title"]).strip()
@@ -1909,9 +1668,6 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         detail_line = f"\nClarified answers from the user: {details_summary}"
     guidance = _plan_guidance(title, details_summary)
     guidance_line = f"\n{guidance}" if guidance else ""
-    # The chat log is the user's working notes on this file. Read it so the
-    # schedule does not re-schedule things the user already said they did, and
-    # so it flows out of the actual conversation rather than a cold template.
     chat_log = _goal_chat_log(db, goal)
     chat_line = ""
     if chat_log:
@@ -1926,9 +1682,6 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             "Plan forward from what is still outstanding. Match real dates/times the user "
             "mentioned. Do not invent new topics unrelated to the goal."
         )
-    # Links the user shared in chat notes belong on their schedule: extract
-    # them so the plan can reference the user's actual resources instead of
-    # assuming new ones.
     links = _extract_links(chat_log)
     links_line = ""
     if links:
@@ -1971,9 +1724,6 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         periods = generate_outline_objectives(goal, periods, db)
         _state.outline = {"scope": scope, "periods": periods, "built": today}
     if not fallback:
-        # Zero usable slots, not a model failure. Say WHY, so the user fixes
-        # the cause (their blocked windows eat every usable hour) instead of
-        # the app retrying a model that was never the problem.
         _state.plan_blocked_reason = (
             "your fixed windows, plus the goals that outrank this one, leave no usable time "
             "before the deadline. Push this deadline out or relax a window and I'll redraw."
@@ -1981,14 +1731,6 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         return None
     _state.plan_blocked_reason = None
 
-    # One request can't carry the whole horizon: a month-long goal is 40-60+
-    # slots, the title budget blows past _MAX_PLAN_TOKENS, the model truncates
-    # mid-JSON, the parse fails wholesale, and the ENTIRE plan collapses to
-    # empty + infinite retries. Split the grid into small day-bucketed slices
-    # instead. Each request is short enough for a slow, weak, or rate-limited
-    # free model to FINISH, and a failed slice only costs itself — the
-    # surviving slices still produce a real, partial, honest schedule. Nothing
-    # is ever substituted or canned.
     n_slices = min(
         _PLAN_SLICE_MAX_CALLS,
         max(1, (len(fallback) + _PLAN_SLICE_TARGET_SLOTS - 1) // _PLAN_SLICE_TARGET_SLOTS),
@@ -2058,6 +1800,8 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             f"{slots_json}\n"
             "Return ONLY a JSON array with ONE object per slot, in the same order: "
             '{"date":"YYYY-MM-DD","start_time":"HH:MM","end_time":"HH:MM","title":"..."}. '
+            'If the real task cannot sensibly fit its slot (too short for the work), add "too_small":true '
+            "to that object and still title the slot with the most useful piece that does fit. "
             "Each title tells the user EXACTLY WHAT TO DO in that exact slot, that exact "
             "day: a verb + the real thing (what to buy, what to set up, what to text, what "
             "time, what to say). "
@@ -2079,12 +1823,6 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             "(people, chosen items, agreed times). Every title is a physical, concrete action "
             "the user does in that slot, not a lecture and not a vibe."
         )
-        # prefer_cloud controls WHICH box does the heavy lifting. Explicit
-        # user redraws (prefer_cloud=True) run on OpenRouter so a schedule
-        # draw is fast and parallel with chat. Auto/retry/checkin paths
-        # (prefer_cloud=False) stay on the free local model by default and
-        # only touch OpenRouter as a fallback when the local box genuinely
-        # fails.
         res = None
         try:
             res = get_manager(db).generate(
@@ -2093,6 +1831,8 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             )
         except Exception as exc:
             logger.warning("plan slice %s-%s failed: %r", first, last, exc)
+            _state.failed_slices += 1
+            _state.slots_total += len(chunk)
             continue
         if not res.ok and chat_line:
             logger.warning("plan slice %s-%s: model error %s, retrying lean", first, last, res.error)
@@ -2102,64 +1842,68 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
                     prefer_cloud=prefer_cloud, max_tokens=_MAX_PLAN_TOKENS)
             except Exception as exc:
                 logger.warning("plan slice %s-%s lean retry failed: %r", first, last, exc)
+                _state.failed_slices += 1
+                _state.slots_total += len(chunk)
                 continue
         if not res.ok:
             _state.last_error = (res.error or "no reply")[:160]
             logger.warning("plan slice %s-%s: model error %s", first, last, res.error)
+            _state.failed_slices += 1
+            _state.slots_total += len(chunk)
             continue
         _state.last_provider = res.provider or "llm"
         title_map = _parse_title_map(res.text)
+        missing = [e for e in chunk if not _title_ok(title_map.get((e["date"], e["start_time"])), goal_ref=title)]
+        if missing:
+            try:
+                sub_json = "[\n" + ",\n".join(_slot_json(e) for e in missing) + "\n]"
+                res2 = get_manager(db).generate(
+                    sys, user_prompt.replace(slots_json, sub_json) +
+                    "\nTitles for these slots were missing or rejected. Start each with a concrete verb "
+                    "(Solve, Write, Build, Call, Buy, Run, Draft...), name the exact material, give a quantity "
+                    "and a finish-test.", timeout=timeout, prefer_cloud=prefer_cloud, max_tokens=_MAX_PLAN_TOKENS)
+                if res2 is not None and getattr(res2, "ok", False):
+                    wanted = {(e["date"], e["start_time"]) for e in missing}
+                    title_map.update({k: v for k, v in _parse_title_map(res2.text).items() if k in wanted})
+            except Exception as exc:
+                logger.warning("plan slice %s-%s re-ask failed: %r", first, last, exc)
+        _state.slots_total += len(chunk)
         for e in chunk:
             t = title_map.get((e["date"], e["start_time"]))
             if not _title_ok(t, goal_ref=title):
-                # Never write a placeholder ("<goal> — day 1 part 1") or an
-                # unacceptable model title; that silent substitution is the
-                # hardcoded-junk bug. The slot is dropped and the honest,
-                # smaller plan is what the user sees.
                 continue
+            _state.slots_titled += 1
             out.append({**e, "title": t})
     return out or None
 
 
 _WEAK_STARTERS = {
     "ensure", "confirm", "consider", "review", "research", "prepare", "prep",
-    "discuss", "debate", "brainstorm", "decide", "check", "plan", "remember",
-    "think", "make", "brain-storm", "brainstorm",
+    "discuss", "debate", "brainstorm", "decide", "plan", "think", "brain-storm",
 }
 
 
 def _title_ok(title, goal_ref=None):
-    """Accept a model-written block title only if it's a real, concrete instruction
-    of up to two short lines describing what to do in that slot. Otherwise reject it
-    — the slot is DROPPED (never substituted with a canned placeholder: the user's
-    hard rule is that no deterministic filler is ever shown on the board)."""
     if not title:
         return False
     stripped = title.strip()
     if "\n" in stripped and stripped.count("\n") > 1:
         return False
+  
     if len(stripped) > 180:
         return False
     words = [w for w in re.split(r"\s+", stripped) if w.lower() not in
              ("the", "a", "an", "of", "to", "for", "and", "with")]
+  
     if len(words) < 3:
         return False
     low = stripped.lower()
     if any(w in low for w in ("consent & boundaries", "respect every no", "lecture")):
         return False
-    # Generic filler verbs banned as WORDS (a real task like 'polish the
-    # readme' or 'prepare the slides' is fine — but 'research x', 'polish y',
-    # 'prepare for z' as a bare activity is filler). Word-boundary, so
-    # 'polished deck' and 'research report' names aren't caught by a
-    # substring.
     if any(re.search(rf"\b{re.escape(v)}\b", low) for v in (
             "research", "polish", "prepare", "discuss the plan", "work on it",
             "brainstorm topics", "review the plan", "review the design")):
         return False
-    # The old grid placeholder ("<goal> — day 1 part 1") and recycled goal
-    # echoes are exactly the "hardcoded junk" the user bans. Reject them
-    # structurally so they can never be written, no matter what the weak model
-    # spits back.
     if re.search(r"\bday\s+\d+\b.{0,24}\bpart\s+\d+\b", low):
         return False
     if re.search(r"\bpart\s+\d+\b.{0,24}\bday\s+\d+\b", low):
@@ -2171,8 +1915,6 @@ def _title_ok(title, goal_ref=None):
     if any(v in low for v in ("start the next phase", "move to the next phase",
                               "go to the next phase", "next phase", "make progress on")):
         return False
-    # Exam/study meta-work is not studying. Reject plan-making and
-    # material-gathering dressed up as tasks.
     if any(p in low for p in (
             "study materials", "study guide", "study plan", "study timetable",
             "gather resources", "collect resources", "gather materials",
@@ -2180,9 +1922,6 @@ def _title_ok(title, goal_ref=None):
             "make a timetable", "create a timetable", "build a timetable",
             "organize notes", "organise notes", "compile notes")):
         return False
-    # A title that STARTS with a weak planning verb ("Ensure aftercare and
-    # safety", "Confirm way home") is a topic/vibe, not an action. Reject it
-    # so the user's schedule is concrete, never a brainstorm.
     first = re.split(r"[\s:]+", stripped, maxsplit=1)[0].lower().rstrip(".")
     if first in _WEAK_STARTERS:
         return False
@@ -2190,11 +1929,6 @@ def _title_ok(title, goal_ref=None):
 
 
 def _parse_title_map(text):
-    """Read the model's [ {...} ] array (Ollama often wraps it in markdown fences)
-    and map (date, start_time) -> title. Tolerates 'start'/'end' keys and missing times.
-    If the array is truncated mid-output (a slow model hitting the token cap), fall
-    back to parsing every complete object individually, so the slots the model DID
-    finish naming still land in the plan instead of the whole slice dying."""
     def _add(item):
         if isinstance(item, str):
             try:
@@ -2210,6 +1944,8 @@ def _parse_title_map(text):
         st = normalize_time(item.get("start_time") or item.get("start")) or ""
         if st:
             out[(d, st)] = str(t).strip()[:200]
+            if item.get("too_small") is True:
+                _state.too_small = getattr(_state, "too_small", 0) + 1
 
     out = {}
     m = re.search(r"\[.*\]", text, re.S)
@@ -2222,27 +1958,18 @@ def _parse_title_map(text):
             for item in data:
                 _add(item)
             return out
-    # Best-effort: the wrap didn't parse (truncated/partial). Extract whatever
-    # complete { } objects exist and rebuild the map from those that have all
-    # keys.
     for item in re.findall(r"\{[^{}]*\}", text):
         _add(item)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Goal completion detection
-# ---------------------------------------------------------------------------
 def completion_detected(message):
-    """Detect a genuine 'I finished the task' claim, guarding against questions
-    and vague statements like 'what do I have to do today' or 'I'm done with...'."""
     text = (message or "").strip()
     if not text or len(text.split()) > 16:
         return False
     lowered = " " + re.sub(r"[^a-z0-9\s]", " ", text.lower()) + " "
     if "?" in text:
         return False
-    # questions / ambiguous frames must never auto-close
     ambiguous = ["what", "how", "when", "do i", "am i", "should i", "whats", "what's",
                  "have to do", "need to do", "should do", "to do today", "schedule",
                  "today", "next", "now what", "anything"]
@@ -2258,9 +1985,6 @@ def completion_detected(message):
     return any(p in lowered for p in success)
 
 
-# ---------------------------------------------------------------------------
-# Progress / stats
-# ---------------------------------------------------------------------------
 def progress_stats(goal, actions, today=None):
     total_planned = sum((a.get("duration_min") or 60) for a in actions) / 60.0
     completed = sum((a.get("duration_min") or 60) for a in actions if a.get("status") == "done") / 60.0
@@ -2291,8 +2015,6 @@ def progress_stats(goal, actions, today=None):
 
 
 def pressure_rating(goal, actions, open_blockers=0, missed_days=0, today=None):
-    """A 1-10 'how much should you be panicking' score. Past 7 and Eloise starts shouting.
-    Driven by days-left vs remaining workload, slippage, blockers, and missed days."""
     today_iso = (today.isoformat() if isinstance(today, date) else date.today().isoformat())
     dl = days_remaining(goal.get("deadline", today_iso), today_iso)
     remaining = sum((a.get("duration_min") or 60) for a in actions if a.get("status") not in ("done", "missed")) / 60.0
@@ -2322,8 +2044,6 @@ def pressure_rating(goal, actions, open_blockers=0, missed_days=0, today=None):
 
 
 def momentum_stats(user_id, db=None, today=None):
-    """Streaks + burn rate derived from actual done work. Returns best streak, current
-    streak, today's completed hours, and a 0-100 momentum meter."""
     from core.database import get_connection
     from core.clock import today_for
     conn = db or get_connection()
@@ -2341,7 +2061,6 @@ def momentum_stats(user_id, db=None, today=None):
             done_days.add(date.fromisoformat(r["date"]))
         except Exception:
             continue
-    # best consecutive-days streak across all history
     best = 0
     cur = 0
     prev = None
@@ -2352,7 +2071,6 @@ def momentum_stats(user_id, db=None, today=None):
             cur = 1
         best = max(best, cur)
         prev = d
-    # current streak anchored to today/tomorrow
     current = 0
     probe = today
     if probe not in done_days:
@@ -2360,7 +2078,6 @@ def momentum_stats(user_id, db=None, today=None):
     while probe in done_days:
         current += 1
         probe -= timedelta(days=1)
-    # burn rate: avg completed hours/day over last 7 days
     week_ago = today - timedelta(days=6)
     done_hours = 0.0
     span_days = min((today - week_ago).days + 1, 7)
@@ -2383,9 +2100,7 @@ def momentum_stats(user_id, db=None, today=None):
 
 
 def classify_mood(text):
-    """Map an Eloise reply to a display mood for the console.
-    Deterministic keyword/character scan — no LLM needed. Returns one of
-    angry / warn / amused / calm / idle, plus a one-line status for the STATE bar."""
+    """Map an Eloise reply to a display mood for the console"""
     t = (text or "").lower()
     angry_kw = ["never", "lying", "dead", "fuck", "shut", "idiot", "coward", "delusional",
                 "embarrass", "slip", "gym", "slob", "sloppy", "pathetic"]

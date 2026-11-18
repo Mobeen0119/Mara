@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from core.database import get_connection, set_storage_dir
-from core.routes import auth_routes, checkin_routes, chat_routes, goal_routes, settings_routes
+from core.routes import auth_routes, checkin_routes, chat_routes, goal_routes, plan_routes, settings_routes
 from core.scheduler import eloise_scheduler
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,15 +28,19 @@ MAX_BODY_BYTES = 1_000_000  # no endpoint here needs more than a chat message / 
 @asynccontextmanager
 async def lifespan(_app):
     goal_routes.heal_stale_plans()
+    
     try:
         import asyncio
         from core.routes.settings_routes import bootstrap_llm_from_env
         await asyncio.to_thread(bootstrap_llm_from_env)
+    
     except Exception as exc:                      # a bad key must never stop the app booting
         logging.getLogger("eloise").warning("env LLM bootstrap skipped: %r", exc)
     eloise_scheduler.start()
+    
     try:
         yield
+    
     finally:
         eloise_scheduler.shutdown()
         goal_routes.shutdown_workers()
@@ -76,8 +80,7 @@ _CSP = (
 
 @app.exception_handler(Exception)
 async def _unhandled(request: Request, exc: Exception):
-    """Any crash is logged WITH its traceback and returned as JSON the UI can show,
-    naming the error type (never the message, which may hold user data)."""
+
     logging.getLogger("eloise").exception("unhandled error on %s %s", request.method, request.url.path)
     return JSONResponse(status_code=500, content={"detail": f"Server error ({type(exc).__name__}) - check the server console"})
 
@@ -85,24 +88,29 @@ async def _unhandled(request: Request, exc: Exception):
 @app.middleware("http")
 async def _guard(request: Request, call_next):
     cl = request.headers.get("content-length")
+  
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse({"detail": "request too large"}, status_code=413)
     resp = await call_next(request)
+  
     h = resp.headers
     h.setdefault("Content-Security-Policy", _CSP)
     h.setdefault("X-Content-Type-Options", "nosniff")
     h.setdefault("X-Frame-Options", "DENY")
+
     h.setdefault("Referrer-Policy", "no-referrer")
     h.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
+
     if request.url.path.startswith("/api/"):
         h.setdefault("Cache-Control", "no-store")
+
     return resp
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 for r in (auth_routes.router, goal_routes.router, chat_routes.router,
-          settings_routes.router, checkin_routes.router):
+          settings_routes.router, checkin_routes.router, plan_routes.router):
     app.include_router(r)
 
 
@@ -114,12 +122,14 @@ def healthz():
 
 @app.get("/{full_path:path}")
 def spa(full_path: str):
+   
     if full_path == "api" or full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail="not found")
+   
     if full_path:
         candidate = (STATIC_DIR / full_path).resolve()
         # containment check on the RESOLVED path: '..' segments, symlinks and
-        # encoded separators all collapse before this comparison.
+
         if STATIC_DIR in candidate.parents and candidate.is_file():
             return FileResponse(candidate)
     return FileResponse(STATIC_DIR / "index.html")

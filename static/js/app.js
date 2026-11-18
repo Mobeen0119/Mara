@@ -192,9 +192,6 @@ function askModal(title, placeholder) {
   });
 }
 
-/* ============================================================
-   24h check-in dialog
-   ============================================================ */
 let _checkinShown = false;
 async function pollCheckIn() {
   if (!token || _checkinShown) return;
@@ -236,9 +233,6 @@ async function respondCheckIn(done) {
   } catch (e) {}
 }
 
-/* ============================================================
-   Auth
-   ============================================================ */
 let _authTab = "signin";
 let _codeLogin = false;
 async function renderAuth(tab) {
@@ -402,9 +396,7 @@ async function syncTimezone() {
         method: "PUT",
         body: JSON.stringify({ timezone: tz }),
       });
-  } catch (e) {
-    /* the server falls back to UTC — harmless */
-  }
+  } catch (e) {}
 }
 function enterApp() {
   document.getElementById("auth-screen").classList.add("hidden");
@@ -430,23 +422,16 @@ async function refreshFootMomentum() {
     if (dn)
       dn.innerHTML = `${escHtml(userName || "")}<small>momentum ${escHtml(m.momentum)}</small>`;
     el.dataset.momentum = m.momentum;
-  } catch (e) {
-    /* silent */
-  }
+  } catch (e) {}
 }
 
-/* ============================================================
-   Cinematic onboarding — first-run seat & demo files
-   ============================================================ */
 async function maybeOnboarding() {
   if (!token) return;
   try {
     const goals = await api("/goals");
-    if (goals.length > 0) return; // already has real files
+    if (goals.length > 0) return;
     showOnboarding(onboardSeed);
-  } catch (e) {
-    /* board may be loading; skip */
-  }
+  } catch (e) {}
 }
 function showOnboarding(onDone) {
   closeModal();
@@ -518,10 +503,6 @@ async function onboardSeedGo() {
 }
 const onboardSeed = onboardSeedGo;
 
-/* ============================================================
-   Navigation & router — hash-backed so refresh keeps the page and
-   the browser back button works.
-   ============================================================ */
 const KNOWN_SCREENS = [
   "today",
   "board",
@@ -535,8 +516,6 @@ const KNOWN_SCREENS = [
 let _hashLock = false;
 
 function navigate(screen, param, fromHash) {
-  // The chat is a persistent side panel now, not a screen. Legacy #global-chat
-  // links and the rail button open it over whatever page you're on.
   if (screen === "global-chat") {
     openChatPanel();
     screen = "today";
@@ -562,7 +541,7 @@ function navigate(screen, param, fromHash) {
     .forEach((n) => n.classList.toggle("active", n.dataset.screen === screen));
   const main = document.getElementById("main-content");
   main.classList.remove("scene-in");
-  void main.offsetWidth; // restart the entrance animation
+  void main.offsetWidth;
   main.classList.add("scene-in");
   switch (screen) {
     case "today":
@@ -606,9 +585,59 @@ window.addEventListener("hashchange", () => {
   routeFromHash();
 });
 
-/* ============================================================
-   Today
-   ============================================================ */
+async function renderPlanCare(isoToday) {
+  const [notes, win] = await Promise.all([
+    api("/plan/notes?days=7"),
+    api("/windows"),
+  ]);
+  let h = `<div class="card" style="margin-bottom:22px;"><div class="kicker">How is today?</div>
+    <p style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;">
+      ${[
+        ["light", "Low energy"],
+        ["travel", "Travelling"],
+        ["sick", "Sick"],
+        ["off", "Day off"],
+        ["normal", "Normal"],
+      ]
+        .map(
+          ([m, t]) =>
+            `<button class="btn btn-sm btn-ghost" onclick="setDayMode('${isoToday}','${m}')">${t}</button>`,
+        )
+        .join("")}
+    </p>`;
+  const lines = [];
+  (notes.days || []).forEach(
+    (d) => d.note && lines.push(`${escHtml(d.date)}: ${escHtml(d.note)}`),
+  );
+  (notes.goals || []).forEach((g) => lines.push(escHtml(g.note)));
+  if (lines.length) {
+    h += `<details><summary>Why this plan</summary><ul>${lines.map((l) => `<li>${l}</li>`).join("")}</ul></details>`;
+  }
+  (win.ask || []).slice(0, 1).forEach((a) => {
+    const lab = JSON.stringify(a.label).replace(/"/g, "&quot;");
+    h += `<p style="margin-top:10px;">${escHtml(a.question)}
+      <button class="btn btn-sm btn-ghost" onclick="setWindowKind(${lab},'soft')">Yes, it can move</button>
+      <button class="btn btn-sm btn-ghost" onclick="setWindowKind(${lab},'hard')">No, keep it fixed</button></p>`;
+  });
+  return h + `</div>`;
+}
+
+async function setDayMode(iso, mode) {
+  await api("/day-mode", {
+    method: "PUT",
+    body: JSON.stringify({ date: iso, mode }),
+  });
+  navigate("today");
+}
+
+async function setWindowKind(label, kind) {
+  await api("/windows/kind", {
+    method: "PUT",
+    body: JSON.stringify({ label, kind }),
+  });
+  navigate("today");
+}
+
 async function renderToday(el) {
   el.innerHTML = `<div class="page-header"><div class="kicker">Today —</div><h1>…</h1></div>`;
   try {
@@ -652,14 +681,13 @@ async function renderToday(el) {
             .join("")}</div>
         </div>`;
       }
-    } catch (e) {
-      /* triage is optional */
-    }
+    } catch (e) {}
     try {
       html += await renderDayHero();
-    } catch (e) {
-      /* dial is optional */
-    }
+    } catch (e) {}
+    try {
+      html += await renderPlanCare(today.date);
+    } catch (e) {}
     html += `<div class="schedule-grid">`;
     if (today.items.length === 0) {
       html += `<div class="empty-state compose"><div class="big">&#x2737;</div><h3>Nothing booked today.</h3><p>File a goal and Eloise draws the lines.</p></div>`;
@@ -682,7 +710,6 @@ async function renderToday(el) {
     }
     html += `</div>`;
 
-    // Risk board
     try {
       const sb = await api("/scoreboard");
       if (sb.goals && sb.goals.length) {
@@ -697,7 +724,6 @@ async function renderToday(el) {
       }
     } catch (e) {}
 
-    // model status footer
     html += `<div style="margin-top:auto;padding-top:40px;display:flex;align-items:center;gap:10px;color:var(--bone-mute);font-size:12px;flex-wrap:wrap;">
       <span class="ember-dot"></span>
       ${
@@ -708,7 +734,7 @@ async function renderToday(el) {
       <span>${status.cloud_error && !status.cloud_configured ? escHtml(status.cloud_error) : ""}</span>
       ${status.local_model_available ? '<span class="chip hot">local live</span>' : ""}
     </div>
-    </div>`; // close .screen-fill
+    </div>`;
 
     el.innerHTML = html;
     staggerIn(el, ".schedule-day");
@@ -730,7 +756,7 @@ function _hm(t) {
   return (h || 0) * 60 + (m || 0);
 }
 function _pt(cx, cy, r, min) {
-  const a = (min / 1440) * 2 * Math.PI - Math.PI / 2; // midnight at the top
+  const a = (min / 1440) * 2 * Math.PI - Math.PI / 2;
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
 }
 function _arc(cx, cy, r, m0, m1) {
@@ -848,7 +874,6 @@ async function renderBoard(el) {
       <div class="header-rule"></div>
     </div>`;
 
-    // momentum dial
     const m = mom;
     const momCls = m.momentum >= 70 ? "ok" : m.momentum >= 40 ? "hot" : "bad";
     html += `<div class="card momentum-card">
@@ -869,7 +894,6 @@ async function renderBoard(el) {
       </div>
     </div>`;
 
-    // pressure ranked list
     html += `<div class="page-header" style="margin-top:36px;"><div class="kicker">Pressure ranking</div>
       <h1>Who's sliding.</h1><div class="header-rule"></div></div>`;
     const withP = goals
@@ -899,7 +923,7 @@ async function renderBoard(el) {
       html += `</div>`;
     }
 
-    html += `</div>`; // close .screen-fill
+    html += `</div>`;
     el.innerHTML = html;
   } catch (e) {
     el.innerHTML = `<div class="page-header"><div class="kicker">Board</div><h1>Nothing loads.</h1><p class="sub">${escHtml(e.message)}</p></div>`;
@@ -958,7 +982,7 @@ async function renderGoals(el) {
       });
       html += `</div>`;
     }
-    html += `</div>`; // close .screen-fill
+    html += `</div>`;
     el.innerHTML = html;
   } catch (e) {
     el.innerHTML = `<div class="page-header"><div class="kicker">Goals</div><h1>Nothing loads.</h1><p class="sub">${escHtml(e.message)}</p></div>`;
@@ -976,14 +1000,12 @@ async function renderGoalDetail(el, id) {
       <div class="header-rule"></div>
     </div>`;
 
-    // actions
     html += `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;">
       <button class="btn btn-sm btn-ghost" onclick="regenPlan(${g.id})">Redraw schedule</button>
       <button class="btn btn-sm btn-ghost" onclick="completeGoalFlow(${g.id})">Mark done</button>
       <button class="btn btn-sm btn-ghost" onclick="cancelGoalFlow(${g.id})">Cancel / Delay</button>
     </div>`;
 
-    // pressure meter header strip
     if (g.pressure) {
       const pc = g.pressure.score;
       const pcl = pc >= 8 ? "bad" : pc >= 6 ? "hot" : pc >= 4 ? "warn" : "ok";
@@ -1003,9 +1025,7 @@ async function renderGoalDetail(el, id) {
     try {
       const rt = await api("/routine");
       html += routineCardHtml(rt);
-    } catch (e) {
-      /* optional */
-    }
+    } catch (e) {}
 
     try {
       const ro = await api(`/outline/${g.id}`);
@@ -1062,7 +1082,6 @@ async function renderGoalDetail(el, id) {
     }
     html += `</div></div>`;
 
-    // progress (hidden)
     const p = g.progress;
     html += `<div id="detail-progress" style="display:none;">
       <div class="card" style="margin-bottom:16px;"><p style="font-size:14px;line-height:1.7;color:var(--bone-dim);">${escHtml(p.narrative)}</p></div>
@@ -1074,7 +1093,6 @@ async function renderGoalDetail(el, id) {
       </div>
     </div>`;
 
-    // constraints (hidden)
     html += `<div id="detail-constraints" style="display:none;">`;
     const cons = g.constraints || [];
     if (cons.length === 0) {
@@ -1165,7 +1183,7 @@ async function completeGoalFlow(id) {
     "Mark done?",
     "Confirm this goal is actually complete. No lies — the next check-in will find out.",
   );
-  if (reason === null) return; // user cancelled
+  if (reason === null) return;
   try {
     await api(`/goals/${id}/complete`, {
       method: "POST",
@@ -1408,9 +1426,7 @@ async function createGoal() {
         showQuestionnaire(r.id, title, c.questions);
         return;
       }
-    } catch (qe) {
-      /* model unreachable: no questions, assumptions below */
-    }
+    } catch (qe) {}
     showToast(
       assumed.length
         ? `Filed. No questions (model offline), so I assumed ${assumed.join("; ")}. Tell Eloise in chat to change it.`
@@ -1481,7 +1497,6 @@ async function renderSchedule(el) {
         );
       }
     }
-    // Past-due first (most recent miss on top), today, then the future.
     const sorted = Object.keys(dates).sort((a, b) => {
       const ap = a < today,
         bp = b < today;
@@ -1588,7 +1603,6 @@ async function toggleTask(id, btn) {
     const head = day && day.querySelector(".sdh-right");
     if (!head) return;
     const bar = head.querySelector(".prog-bar>span");
-    // refetch to recompute counters
     const items = Array.from(
       row.parentElement.querySelectorAll(".schedule-row"),
     );
@@ -1722,8 +1736,6 @@ async function mountChatPanel() {
   }
 }
 
-/* Live model/provider line in the panel header — so "is chat even on?" is
-   answerable at a glance instead of guessing from a dead screen. */
 async function refreshPanelModel() {
   const el = document.getElementById("panel-model");
   if (!el) return;
@@ -1772,8 +1784,6 @@ function appendChatMsg(container, role, text, source) {
   return div;
 }
 
-/* Progress card: only steps that really happened. Server stage frames tick the
-   board step and name the model; the timer is the real wait. */
 function addTyping(container, opts) {
   const o = Object.assign({ llm: true }, opts || {});
   const div = document.createElement("div");
@@ -2306,13 +2316,11 @@ async function renderSettings(el) {
       const inp = document.getElementById("set-checkin-time");
       if (me.checkin_time && inp) inp.value = me.checkin_time;
     } catch (e) {}
-    // Always-busy windows list
     window._busyWindows = [];
     try {
       const bw = await api("/settings/blocked-windows");
       window._busyWindows = bw.blocked_windows || [];
     } catch (e) {}
-    // Email channel section + on-demand digest
     let em = null;
     try {
       em = await api("/email/status");
@@ -2350,7 +2358,6 @@ async function renderSettings(el) {
   }
   html += `<div class="settings-section"><div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;"><span style="font-size:14px;color:var(--bone-dim);">Signed in as <strong style="color:var(--bone);">${escHtml(userName || "")}</strong></span><button class="btn btn-danger" style="width:auto;color:#fff;" onclick="logout()">Sign out</button></div></div>`;
   el.innerHTML = html;
-  // populate LLM provider fields
   const llmState = window._lastLlm;
   if (llmState) {
     const sel = document.getElementById("set-provider");
@@ -2382,7 +2389,6 @@ function _detectProviderFromKey() {
   ).trim();
   const sel = document.getElementById("set-provider");
   if (!key || !sel) return;
-  // Longest prefixes first: sk-or- must win over the generic sk- of OpenAI.
   const probes = ["sk-or-", "AIza", "gsk_", "csk-", "sk-"];
   const ids = ["openrouter", "gemini", "groq", "cerebras", "openai"];
   const idx = probes.findIndex((p) => key.startsWith(p));
@@ -2400,11 +2406,9 @@ function _detectProviderFromKey() {
 function applyProviderPreset() {
   const sel = document.getElementById("set-provider");
   const preset = _presetById((sel && sel.value) || "");
-  if (!preset) return; // custom endpoint: the operator owns both fields
+  if (!preset) return;
   const bl = document.getElementById("set-base-url");
   const ml = document.getElementById("set-model");
-  // Always overwrite: a provider switch must never inherit the previous
-  // provider's endpoint or model.
   if (bl) bl.value = preset.url;
   if (ml) ml.value = preset.model;
 }
@@ -2616,7 +2620,6 @@ window.addEventListener("DOMContentLoaded", () => {
     const ru = document.getElementById("orbit-user");
     if (ru) ru.textContent = (userName || "?").slice(0, 1).toUpperCase();
     enterApp();
-    // Restore the page from the URL hash (refresh keeps your place).
     if (!routeFromHash()) navigate("today");
   } else {
     document.getElementById("auth-screen").classList.remove("hidden");

@@ -69,14 +69,19 @@ class Spec:
     floor: int = TOUCH
     max_block: int = 90
     min_block: int = 30
+   
     per_week: int = 3  # habit / recurring sessions per week
     best_time: str = ""
     important: bool = False
     budget: int = 0
+    
     active_days: int = 3
     windows: List[Seg] = field(default_factory=list)
     uses_soft: bool = False
     touch: int = 0
+    skip_days: set = field(default_factory=set)
+    
+    pin_days: Dict[str, int] = field(default_factory=dict)
     title: str = ""
     backlog: int = 0
     scale: float = 1.0
@@ -91,6 +96,7 @@ def _demand(g: Spec, day: date, d0: date):
     total = (dl - d0).days + 1
     i = (day - d0).days
     floor = max(g.floor, g.min_block)
+  
     if g.kind == "event":
         if left < g.active_days:
             share = P.round15(g.budget * g.scale / max(1, min(g.active_days, total))) if g.budget else g.ideal
@@ -104,7 +110,9 @@ def _demand(g: Spec, day: date, d0: date):
         ideal = g.ideal if day.weekday() in days else 0
         return ideal, min(floor, g.ideal), True, None
 
+   
     latest = None
+   
     if total == 1:
         frac = 1.0
     elif left == 0:
@@ -361,8 +369,15 @@ def _solve(
         for g in specs:
             if (date.fromisoformat(g.deadline) - day).days < 0:
                 continue
+            if iso in g.skip_days:
+                last_served[g.id] = i
+                continue
             ideal, floor, strict, latest = _demand(g, day, d0)
-            owed = strict and (i - last_served[g.id]) >= 2  # missed yesterday -> must be served today
+            owed = strict and (i - last_served[g.id]) >= 2
+            if iso in g.pin_days:
+                ideal = max(ideal, g.pin_days[iso])
+                floor = max(floor, min(ideal, g.pin_days[iso]))
+                strict = owed = True  # missed yesterday -> must be served today
             if ideal == 0 and owed:
                 ideal = g.touch or max(g.min_block, min(max(floor, g.floor), g.ideal))  # a rest-day touch
                 floor = min(floor or ideal, ideal)

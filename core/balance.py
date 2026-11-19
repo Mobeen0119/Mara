@@ -20,6 +20,7 @@ def _jl(raw, default):
 
 
 def _split(w):
+    """One (start, end) window -> pieces inside a single day (overnight spans split at midnight)."""
     s, e = int(w[0]) % 1440, int(w[1])
     if e > 1440:
         e %= 1440
@@ -161,6 +162,8 @@ def build_specs(conn, user, rt, today):
                 )
             else:
                 spec = allocator.Spec(kind="project", ideal=commit, floor=30, max_block=90, **base)
+            spec.skip_days = {x for x in d.get("skip_days", []) if x >= today}
+            spec.pin_days = {k: int(v) for k, v in (d.get("pin_days") or {}).items() if k >= today}
             if spec.kind in ("project", "event"):
                 try:
                     spec.scale = max(

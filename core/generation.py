@@ -31,6 +31,7 @@ _MAX_PLAN_TOKENS = 1536
 _PLAN_SLICE_TARGET_SLOTS = 8
 _PLAN_SLICE_MAX_CALLS = 8
 
+
 def _chat_model_override():
     try:
         return os.environ.get("OLLAMA_CHAT_MODEL") or None
@@ -40,6 +41,7 @@ def _chat_model_override():
 
 def _chat_lock_wait():
     return 30
+
 
 _state = threading.local()
 
@@ -145,10 +147,27 @@ _STEP_DONE_RE = re.compile(
     re.I,
 )
 _GOAL_DONE_STRONG = [
-    "the goal", "this goal", "whole thing", "the website", "the site", "the startup",
-    "shipped", "launched", "submitted", "published", "released", "deployed",
-    "the phase", "the project", "goal is done", "goal's done", "goal is complete",
-    "deadline", "finished the goal", "done with the goal", "completed the goal",
+    "the goal",
+    "this goal",
+    "whole thing",
+    "the website",
+    "the site",
+    "the startup",
+    "shipped",
+    "launched",
+    "submitted",
+    "published",
+    "released",
+    "deployed",
+    "the phase",
+    "the project",
+    "goal is done",
+    "goal's done",
+    "goal is complete",
+    "deadline",
+    "finished the goal",
+    "done with the goal",
+    "completed the goal",
 ]
 
 
@@ -189,8 +208,12 @@ GUARDRAIL_REFUSAL = (
 
 def _chat_llm(sys_prompt, user_prompt, db, user_message=""):
     result = get_manager(db).generate(
-        sys_prompt, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
-        model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
+        sys_prompt,
+        user_prompt,
+        timeout=90,
+        max_tokens=_MAX_CHAT_TOKENS,
+        model_override=_chat_model_override(),
+        lock_wait=_chat_lock_wait(),
     )
     if not result.ok:
         return "", "offline"
@@ -209,43 +232,157 @@ def _word_re(words):
     return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
 
 
-_FAMILY_RE = _word_re([
-    "sister", "brother", "sibling", "mom", "mum", "mother", "dad", "father", "daughter",
-    "son", "aunt", "uncle", "niece", "nephew", "stepmom", "stepdad", "step-sister",
-    "step-brother", "cousin",
-])
-_MINOR_RE = _word_re([
-    "child", "children", "kid", "kids", "minor", "underage", "teen", "teens", "teenage",
-    "infant", "baby", "schoolgirl", "school-girl", "school boy", "schoolboy", "gril",
-    "years old", "year old", "year-old", "years-old",
-])
-_PARTNER_RE = _word_re([
-    "girlfriend", "gf", "wife", "wifey", "husband", "boyfriend", "bf", "partner",
-    "spouse", "fiance", "fiancé", "fiancee", "fiancée", "lover",
-])
+_FAMILY_RE = _word_re(
+    [
+        "sister",
+        "brother",
+        "sibling",
+        "mom",
+        "mum",
+        "mother",
+        "dad",
+        "father",
+        "daughter",
+        "son",
+        "aunt",
+        "uncle",
+        "niece",
+        "nephew",
+        "stepmom",
+        "stepdad",
+        "step-sister",
+        "step-brother",
+        "cousin",
+    ]
+)
+_MINOR_RE = _word_re(
+    [
+        "child",
+        "children",
+        "kid",
+        "kids",
+        "minor",
+        "underage",
+        "teen",
+        "teens",
+        "teenage",
+        "infant",
+        "baby",
+        "schoolgirl",
+        "school-girl",
+        "school boy",
+        "schoolboy",
+        "gril",
+        "years old",
+        "year old",
+        "year-old",
+        "years-old",
+    ]
+)
+_PARTNER_RE = _word_re(
+    [
+        "girlfriend",
+        "gf",
+        "wife",
+        "wifey",
+        "husband",
+        "boyfriend",
+        "bf",
+        "partner",
+        "spouse",
+        "fiance",
+        "fiancé",
+        "fiancee",
+        "fiancée",
+        "lover",
+    ]
+)
 _PARTNER_PHRASES = ["my girl", "my man", "babe", "bae"]
-_SEXUAL_RE = _word_re([
-    "dick", "penis", "fuck", "fucking", "sex", "sexual", "rape", "raping", "raped",
-    "pussy", "vagina", "blowjob", "handjob", "cum", "cumming", "orgasm", "masturbate",
-    "masturbation", "naked", "nude", "boobs", "breasts", "ejaculate", "incest",
-    "molest", "creampie", "porn",
-])
+_SEXUAL_RE = _word_re(
+    [
+        "dick",
+        "penis",
+        "fuck",
+        "fucking",
+        "sex",
+        "sexual",
+        "rape",
+        "raping",
+        "raped",
+        "pussy",
+        "vagina",
+        "blowjob",
+        "handjob",
+        "cum",
+        "cumming",
+        "orgasm",
+        "masturbate",
+        "masturbation",
+        "naked",
+        "nude",
+        "boobs",
+        "breasts",
+        "ejaculate",
+        "incest",
+        "molest",
+        "creampie",
+        "porn",
+    ]
+)
 _SEXUAL_PHRASES = [
-    "sleep with", "make love", "have sex", "sex with", "intimate with", "in bed with",
-    "first night", "wedding night", "honeymoon", "hook up", "hookup",
+    "sleep with",
+    "make love",
+    "have sex",
+    "sex with",
+    "intimate with",
+    "in bed with",
+    "first night",
+    "wedding night",
+    "honeymoon",
+    "hook up",
+    "hookup",
 ]
-_COERCION_RE = _word_re([
-    "rape", "raping", "raped", "drugged", "knock out", "knocked out", "blackmail",
-    "blackmailed", "threaten", "threatened",
-])
+_COERCION_RE = _word_re(
+    [
+        "rape",
+        "raping",
+        "raped",
+        "drugged",
+        "knock out",
+        "knocked out",
+        "blackmail",
+        "blackmailed",
+        "threaten",
+        "threatened",
+    ]
+)
 _COERCION_PHRASES = [
-    "force her", "force him", "force you", "without her consent", "without his consent",
-    "no consent", "drug her", "drug him", "hold her down", "hold him down",
-    "tie her up", "tie him up", "tied up",
+    "force her",
+    "force him",
+    "force you",
+    "without her consent",
+    "without his consent",
+    "no consent",
+    "drug her",
+    "drug him",
+    "hold her down",
+    "hold him down",
+    "tie her up",
+    "tie him up",
+    "tied up",
 ]
-_VIOLENCE_RE = _word_re([
-    "murder", "stab", "stabbing", "bomb", "poison", "assault", "strangle", "choke",
-])
+_VIOLENCE_RE = _word_re(
+    [
+        "murder",
+        "stab",
+        "stabbing",
+        "bomb",
+        "poison",
+        "assault",
+        "strangle",
+        "choke",
+    ]
+)
 _VIOLENCE_PHRASES = ["kill my", "shoot my", "beat up", "hurt my"]
 
 
@@ -257,15 +394,20 @@ def _is_truly_harmful(msg, context=""):
     """Detect requests Eloise must refuse. Returns True for:"""
     t = (msg or "").lower()
     user_lines = [
-        ln for ln in (context or "").split("\n")
+        ln
+        for ln in (context or "").split("\n")
         if not ln.strip().lower().startswith(("eloise:", "assistant:"))
     ]
     full = ("\n".join(user_lines) + "\n" + t).lower()
     has_partner = bool(_PARTNER_RE.search(full)) or _has_phrase(full, _PARTNER_PHRASES)
     has_family = bool(_FAMILY_RE.search(full))
     has_minor = bool(_MINOR_RE.search(full))
-    has_sex = bool(_SEXUAL_RE.search(t)) or _has_phrase(t, _SEXUAL_PHRASES) \
-        or bool(_SEXUAL_RE.search(full)) or _has_phrase(full, _SEXUAL_PHRASES)
+    has_sex = (
+        bool(_SEXUAL_RE.search(t))
+        or _has_phrase(t, _SEXUAL_PHRASES)
+        or bool(_SEXUAL_RE.search(full))
+        or _has_phrase(full, _SEXUAL_PHRASES)
+    )
 
     if _COERCION_RE.search(t) or _has_phrase(t, _COERCION_PHRASES):
         return True
@@ -390,8 +532,7 @@ def _clean_local_stream(stream_iter, user_message="", user_lines=None):
     yield "", (source or "ollama")
 
 
-def generate_global_chat_reply(user_name, goals_summary, history, message, db=None, persona="",
-                               location=""):
+def generate_global_chat_reply(user_name, goals_summary, history, message, db=None, persona="", location=""):
     sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
     user_prompt = _global_chat_prompt(summary, history, user_name, message)
@@ -400,20 +541,26 @@ def generate_global_chat_reply(user_name, goals_summary, history, message, db=No
     return _chat_llm(sys, user_prompt, db, user_message=message)
 
 
-def stream_global_chat_reply(user_name, goals_summary, history, message, db=None, persona="",
-                             location=""):
+def stream_global_chat_reply(user_name, goals_summary, history, message, db=None, persona="", location=""):
     sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     summary = "; ".join(goals_summary) if goals_summary else "no goals on the board yet"
     user_prompt = _global_chat_prompt(summary, history, user_name, message)
-   
+
     if _is_truly_harmful(message, context=history):
         yield GUARDRAIL_REFUSAL, "guardrail"
         return
-   
-    yield from _clean_local_stream(get_manager(db).stream_generate(
-        sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
-        model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
-    ), user_message=message)
+
+    yield from _clean_local_stream(
+        get_manager(db).stream_generate(
+            sys,
+            user_prompt,
+            timeout=90,
+            max_tokens=_MAX_CHAT_TOKENS,
+            model_override=_chat_model_override(),
+            lock_wait=_chat_lock_wait(),
+        ),
+        user_message=message,
+    )
 
 
 def _plan_section(plan_lines):
@@ -428,12 +575,11 @@ def _plan_section(plan_lines):
 
 def _with_persona(base, persona, location=""):
     sys = base
-   
+
     if persona:
         sys += (
             "\n\nYou have a standing personality contract with this user that they set "
-            "explicitly. It OVERRIDES the default tone above. Follow it to the letter:\n"
-            + persona
+            "explicitly. It OVERRIDES the default tone above. Follow it to the letter:\n" + persona
         )
     loc = (location or "").strip()
     if loc:
@@ -445,7 +591,7 @@ def _with_persona(base, persona, location=""):
             "the local currency when natural. If a real-world step depends on local "
             "infrastructure, adapt it to theirs."
         )
-   
+
     else:
         sys += (
             "\n\nLOCATION: the user's country is not set. Never assume US-only "
@@ -455,41 +601,49 @@ def _with_persona(base, persona, location=""):
     return sys
 
 
-def generate_chat_reply(user_name, goal_name, history, message, db=None, plan_lines="",
-                        persona="", step_done=False, location=""):
+def generate_chat_reply(
+    user_name, goal_name, history, message, db=None, plan_lines="", persona="", step_done=False, location=""
+):
     sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     plan_section = _plan_section(plan_lines)
-    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
-                                    step_done=step_done)
-    
+    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message, step_done=step_done)
+
     if _is_truly_harmful(message, context=history):
         return GUARDRAIL_REFUSAL, "guardrail"
     return _chat_llm(sys, user_prompt, db, user_message=message)
 
 
-def stream_chat_reply(user_name, goal_name, history, message, db=None, plan_lines="",
-                      persona="", step_done=False, location=""):
+def stream_chat_reply(
+    user_name, goal_name, history, message, db=None, plan_lines="", persona="", step_done=False, location=""
+):
     sys = _with_persona(BASE_SYSTEM_PROMPT, persona, location=location)
     plan_section = _plan_section(plan_lines)
-    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message,
-                                    step_done=step_done)
-  
+    user_prompt = _goal_chat_prompt(goal_name, plan_section, history, user_name, message, step_done=step_done)
+
     if _is_truly_harmful(message, context=history):
         yield GUARDRAIL_REFUSAL, "guardrail"
         return
-    
-    yield from _clean_local_stream(get_manager(db).stream_generate(
-        sys, user_prompt, timeout=90, max_tokens=_MAX_CHAT_TOKENS,
-        model_override=_chat_model_override(), lock_wait=_chat_lock_wait(),
-    ), user_message=message, user_lines=_history_user_lines(history))
+
+    yield from _clean_local_stream(
+        get_manager(db).stream_generate(
+            sys,
+            user_prompt,
+            timeout=90,
+            max_tokens=_MAX_CHAT_TOKENS,
+            model_override=_chat_model_override(),
+            lock_wait=_chat_lock_wait(),
+        ),
+        user_message=message,
+        user_lines=_history_user_lines(history),
+    )
 
 
 def _history_user_lines(history):
     out = []
-   
+
     if not history:
         return out
-   
+
     for ln in history.split("\n"):
         if ln.strip().lower().startswith(("user:", "user|")):
             out.append(ln.split(":", 1)[1].strip()[:200])
@@ -502,7 +656,7 @@ def generate_opening_message(user_name, goal_summary, db=None):
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: OPENING_FALLBACK
     )
-   
+
     return text, source
 
 
@@ -512,17 +666,19 @@ def generate_nudge(user_name, goal_summary, nearest, db=None):
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: NUDGE_FALLBACK
     )
-   
+
     return text, source
 
 
 def generate_check_in_prompt(user_name, goals_summary, db=None):
     sys = CHECK_IN_SYSTEM_PROMPT
-    user_prompt = f"User: {user_name}\nActive goals: {'; '.join(goals_summary) or 'none'}\nAsk the check-in question."
+    user_prompt = (
+        f"User: {user_name}\nActive goals: {'; '.join(goals_summary) or 'none'}\nAsk the check-in question."
+    )
     text, source = get_manager(db).generate_with_fallback(
         sys, user_prompt, fallback_fn=lambda: _pick(FALLBACK_CHECK_IN_PROMPT)
     )
-   
+
     return text, source
 
 
@@ -530,17 +686,19 @@ def generate_check_in_response(user_name, done, db=None):
     if done:
         sys = CHECK_IN_YES_SYSTEM_PROMPT
         text, source = get_manager(db).generate_with_fallback(
-            sys, f"User: {user_name} says they finished. React and set the next move.",
+            sys,
+            f"User: {user_name} says they finished. React and set the next move.",
             fallback_fn=lambda: FALLBACK_CHECK_IN_YES,
         )
-  
+
     else:
         sys = CHECK_IN_NO_SYSTEM_PROMPT
         text, source = get_manager(db).generate_with_fallback(
-            sys, f"User: {user_name} says they did NOT finish. Insult lightly, then redirect.",
+            sys,
+            f"User: {user_name} says they did NOT finish. Insult lightly, then redirect.",
             fallback_fn=lambda: _pick(NO_INSULTS) + " I've redrawn the board so the gap is undeniable.",
         )
-  
+
     return text, source
 
 
@@ -550,7 +708,7 @@ TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 def normalize_time(t):
     t = (t or "").strip()
     m = TIME_RE.match(t)
-  
+
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
     return None
@@ -560,7 +718,7 @@ def parse_time_window(text):
     text = text or ""
     low = text.lower()
     m = re.findall(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", low)
-  
+
     if len(m) < 2:
         return None
     entries = [(int(n), int(mm) if mm else 0, mer) for n, mm, mer in m]
@@ -587,7 +745,7 @@ def parse_time_window(text):
             if entries[j][2]:
                 inh = entries[j][2]
                 break
-     
+
         if inh is None:
             for j in range(i - 1, -1, -1):
                 if entries[j][2]:
@@ -597,7 +755,7 @@ def parse_time_window(text):
         times[i] = _hh_12_to_24(entries[i][0], inh) * 60 + entries[i][1]
 
     start, end = times[0], times[-1]
- 
+
     if not entries[0][2] and entries[-1][2] == "pm" and entries[0][0] >= entries[-1][0]:
         start = _hh_12_to_24(entries[0][0], "pm" if entries[0][0] == 12 else "am") * 60 + entries[0][1]
     if end < start:
@@ -769,11 +927,53 @@ def _is_event_goal(text):
     return bool(b and b.get("kind") == "event")
 
 
-_HABIT_WORDS = ("gym", "workout", "work out", "six pack", "six-pack", "6 pack", "6-pack", "abs",
-                "fitness", "get fit", "lose weight", "weight loss", "fat loss", "muscle", "bulk",
-                "cut ", "run ", "running", "marathon", "yoga", "diet", "walk daily", "stretch",
-                "pushup", "push-up", "pull-up", "body", "lose ", "slim", "stamina", "cardio", "jogging", "calisthenic")
-_WORKOUT_LABELS = ("gym", "workout", "work out", "run", "jog", "yoga", "swim", "training", "exercise", "sport")
+_HABIT_WORDS = (
+    "gym",
+    "workout",
+    "work out",
+    "six pack",
+    "six-pack",
+    "6 pack",
+    "6-pack",
+    "abs",
+    "fitness",
+    "get fit",
+    "lose weight",
+    "weight loss",
+    "fat loss",
+    "muscle",
+    "bulk",
+    "cut ",
+    "run ",
+    "running",
+    "marathon",
+    "yoga",
+    "diet",
+    "walk daily",
+    "stretch",
+    "pushup",
+    "push-up",
+    "pull-up",
+    "body",
+    "lose ",
+    "slim",
+    "stamina",
+    "cardio",
+    "jogging",
+    "calisthenic",
+)
+_WORKOUT_LABELS = (
+    "gym",
+    "workout",
+    "work out",
+    "run",
+    "jog",
+    "yoga",
+    "swim",
+    "training",
+    "exercise",
+    "sport",
+)
 _EVENT_BUDGET_MIN = {"hookup": 360, "romance": 300, "event": 420}
 _EVENT_ACTIVE_DAYS = 3
 _state_workout = threading.local()
@@ -801,16 +1001,18 @@ def set_brief(b):
 
 
 def goal_brief(title, db=None, deadline=""):
-    sys = ("You size real-life goals the way a sensible person would. Reply with ONLY JSON: "
-           '{"kind":"event|habit|project","total_hours":number,"active_days":number,'
-           '"physical":true|false,"per_week":number,"best_time":"morning|afternoon|evening|night"}. '
-           "event = a one-off occasion needing a few hours near the date; habit = repeated "
-           "practice (exercise, language, diet, relationship time); project = sustained build/study. "
-           "total_hours is the whole realistic effort, active_days how many separate days it needs. "
-           "physical is true ONLY when the goal itself is exercise, sport or body training done in a "
-           "gym or workout slot; false for everything else, including couple time, study, hobbies. "
-           "per_week is how many sessions a week a habit sensibly needs (1-6). best_time is when this "
-           "activity naturally happens in a person's day.")
+    sys = (
+        "You size real-life goals the way a sensible person would. Reply with ONLY JSON: "
+        '{"kind":"event|habit|project","total_hours":number,"active_days":number,'
+        '"physical":true|false,"per_week":number,"best_time":"morning|afternoon|evening|night"}. '
+        "event = a one-off occasion needing a few hours near the date; habit = repeated "
+        "practice (exercise, language, diet, relationship time); project = sustained build/study. "
+        "total_hours is the whole realistic effort, active_days how many separate days it needs. "
+        "physical is true ONLY when the goal itself is exercise, sport or body training done in a "
+        "gym or workout slot; false for everything else, including couple time, study, hobbies. "
+        "per_week is how many sessions a week a habit sensibly needs (1-6). best_time is when this "
+        "activity naturally happens in a person's day."
+    )
     try:
         r = get_manager(db).generate(sys, f"Goal: {title}\nDeadline: {deadline}", timeout=25, max_tokens=80)
     except Exception:
@@ -821,11 +1023,18 @@ def goal_brief(title, db=None, deadline=""):
     try:
         b = json.loads(m.group(0)) if m else None
         if b and b.get("kind") in ("event", "habit", "project"):
-            return {"kind": b["kind"], "total_hours": max(0.25, min(float(b.get("total_hours") or 0) or 0.25, 400)),
-                    "active_days": max(1, min(int(b.get("active_days") or 1), 60)),
-                    "physical": bool(b.get("physical")),
-                    "per_week": max(1, min(int(b.get("per_week") or 3), 6)),
-                    "best_time": b.get("best_time") if b.get("best_time") in ("morning", "afternoon", "evening", "night") else ""}
+            return {
+                "kind": b["kind"],
+                "total_hours": max(0.25, min(float(b.get("total_hours") or 0) or 0.25, 400)),
+                "active_days": max(1, min(int(b.get("active_days") or 1), 60)),
+                "physical": bool(b.get("physical")),
+                "per_week": max(1, min(int(b.get("per_week") or 3), 6)),
+                "best_time": (
+                    b.get("best_time")
+                    if b.get("best_time") in ("morning", "afternoon", "evening", "night")
+                    else ""
+                ),
+            }
     except Exception:
         pass
     return None
@@ -833,30 +1042,42 @@ def goal_brief(title, db=None, deadline=""):
 
 def effort_profile(goal, days_left):
     brief = getattr(_state_brief, "b", None)
-   
+
     if brief and brief["kind"] == "event":
-        return {"kind": "event", "event_kind": "event", "budget_min": int(brief["total_hours"] * 60),
-                "active_days": min(brief["active_days"], max(days_left + 1, 1))}
-   
+        return {
+            "kind": "event",
+            "event_kind": "event",
+            "budget_min": int(brief["total_hours"] * 60),
+            "active_days": min(brief["active_days"], max(days_left + 1, 1)),
+        }
+
     if brief and brief["kind"] == "habit":
         if brief.get("physical"):
             return {"kind": "habit", "per_week": brief.get("per_week")}
         return {"kind": "recurring", "per_week": brief.get("per_week"), "best_time": brief.get("best_time")}
-   
-    if brief and brief["kind"] == "project" and _goal_kind(goal.get("title") or "") not in ("hookup", "romance"):
+
+    if (
+        brief
+        and brief["kind"] == "project"
+        and _goal_kind(goal.get("title") or "") not in ("hookup", "romance")
+    ):
         return {"kind": "project"}
-    title = (goal.get("title") or goal.get("display_title") or "")
+    title = goal.get("title") or goal.get("display_title") or ""
     low = title.lower() + " "
     kind = _goal_kind(title)
- 
+
     if kind == "hookup" or kind == "romance" or _is_event_goal(title):
         ek = "hookup" if kind == "hookup" else "romance" if kind == "romance" else "event"
-        return {"kind": "event", "event_kind": ek, "budget_min": _EVENT_BUDGET_MIN[ek],
-                "active_days": min(_EVENT_ACTIVE_DAYS if ek != "event" else 4, max(days_left + 1, 1))}
- 
+        return {
+            "kind": "event",
+            "event_kind": ek,
+            "budget_min": _EVENT_BUDGET_MIN[ek],
+            "active_days": min(_EVENT_ACTIVE_DAYS if ek != "event" else 4, max(days_left + 1, 1)),
+        }
+
     if any(w in low for w in _HABIT_WORDS):
         return {"kind": "habit"}
- 
+
     return {"kind": "project"}
 
 
@@ -885,7 +1106,7 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
     last_days = [d for d, sl in horizon if sl][-active_days:]
     keep = {d: sl for d, sl in horizon if d in set(last_days)}
     lead = None
-  
+
     if len(horizon) > active_days + 3:
         cutoff = (date.fromisoformat(deadline) - timedelta(days=lead_days)).isoformat()
         cands = [(d, sl) for d, sl in horizon if d <= cutoff and d not in keep and sl]
@@ -894,10 +1115,10 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
             lead = (d, [min(sl, key=lambda x: -(x[1] - x[0]))][:1])
     out = []
     spent = 0
-   
+
     if lead:
         budget_min -= min(lead[1][0][1] - lead[1][0][0], 60)
-   
+
     for d in reversed(sorted(keep)):
         slots = []
         for sl in sorted(keep[d], key=lambda x: x[0])[:3]:
@@ -908,7 +1129,7 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
             spent += dur
         out.append((d, slots))
     out.sort()
-   
+
     if lead:
         d, sl = lead
         dur = min(sl[0][1] - sl[0][0], 60)
@@ -918,13 +1139,28 @@ def _apply_event_shape(horizon, today, deadline, budget_min, active_days, lead_d
 
 def habit_sessions_per_week(goal):
     low = ((goal.get("title") or "") + " " + (goal.get("display_title") or "")).lower()
-  
+
     if any(w in low for w in ("marathon", "yoga", "walk", "stretch")):
         return 5
-  
-    if any(w in low for w in ("six pack", "6 pack", "abs", "muscle", "bulk", "gym", "lose weight", "weight loss", "fat loss", "fitness", "get fit")):
+
+    if any(
+        w in low
+        for w in (
+            "six pack",
+            "6 pack",
+            "abs",
+            "muscle",
+            "bulk",
+            "gym",
+            "lose weight",
+            "weight loss",
+            "fat loss",
+            "fitness",
+            "get fit",
+        )
+    ):
         return 4
-  
+
     return 3
 
 
@@ -938,35 +1174,42 @@ def _habit_horizon(today, deadline, windows, now_min, others_for, meal_windows, 
     t0 = date.fromisoformat(today)
     end = date.fromisoformat(deadline)
     span = min((end - t0).days + 1, 121)
-   
+
     if detail_days:
         span = min(span, detail_days)
     train = _SESSION_DAYS.get(per_week, _SESSION_DAYS[4])
-    after = sorted(meal_windows, key=lambda w: w[1] % 1440)[1:3] if len(meal_windows) > 2 else sorted(meal_windows, key=lambda w: w[1] % 1440)[-2:]
+    after = (
+        sorted(meal_windows, key=lambda w: w[1] % 1440)[1:3]
+        if len(meal_windows) > 2
+        else sorted(meal_windows, key=lambda w: w[1] % 1440)[-2:]
+    )
     out = []
-   
+
     for i in range(span):
         day = t0 + timedelta(days=i)
         d = day.isoformat()
         busy = list(others_for(d) or [])
         slots = []
         is_train = day.weekday() in train
-     
+
         if is_train:
-            for (ws, we) in windows[:1]:
+            for ws, we in windows[:1]:
                 we = min(we, ws + SESSION_MAX_MIN)
                 if we <= ws or (i == 0 and now_min is not None and ws < now_min + LEAD_TODAY_MIN):
                     continue
                 if not any(ws < be and bs < we for bs, be in busy):
                     slots.append((ws, we))
-      
+
         else:
-            for (ms, me) in after[:SNACKS_PER_DAY]:
+            for ms, me in after[:SNACKS_PER_DAY]:
                 a, b = me % 1440, me % 1440 + SNACK_MIN
                 if i == 0 and now_min is not None and a < now_min + LEAD_TODAY_MIN:
                     continue
-                if b <= 23 * 60 and not any(a < be and bs < b for bs, be in busy) \
-                        and not any(a < we and ws < b for ws, we in windows):
+                if (
+                    b <= 23 * 60
+                    and not any(a < be and bs < b for bs, be in busy)
+                    and not any(a < we and ws < b for ws, we in windows)
+                ):
                     slots.append((a, b))
         if slots:
             out.append((d, sorted(slots)))
@@ -984,13 +1227,13 @@ _PHASES = ((0.25, "Foundations"), (0.60, "Build"), (0.85, "Pressure test"), (1.0
 
 def scope_for(days_left):
     """'daily' | 'weekly' | 'monthly' from how far away the deadline is"""
-    
+
     if days_left > MONTHLY_AT:
         return "monthly"
-    
+
     if days_left > WEEKLY_AT:
         return "weekly"
-    
+
     return "daily"
 
 
@@ -1016,11 +1259,16 @@ def build_outline_periods(today, deadline, scope, slot_minutes_by_date):
         last = min(cur + timedelta(days=step - 1), end)
         mins = sum(m for d, m in slot_minutes_by_date.items() if cur.isoformat() <= d <= last.isoformat())
         mid = ((cur - t0).days + (last - cur).days / 2) / total
-        periods.append({
-            "kind": "month" if scope == "monthly" else "week",
-            "start": cur.isoformat(), "end": last.isoformat(),
-            "phase": _phase_at(mid), "hours": round(mins / 60, 1), "objective": "",
-        })
+        periods.append(
+            {
+                "kind": "month" if scope == "monthly" else "week",
+                "start": cur.isoformat(),
+                "end": last.isoformat(),
+                "phase": _phase_at(mid),
+                "hours": round(mins / 60, 1),
+                "objective": "",
+            }
+        )
         cur = last + timedelta(days=1)
     return periods
 
@@ -1062,7 +1310,19 @@ def generate_outline_objectives(goal, periods, db=None):
     return periods
 
 
+_SEQUENCE_RULE = (
+    "SEQUENCE LIKE A PERSON: order the tasks the way real life needs them. Prerequisites come first, "
+    "and anything that spoils, wilts or goes stale (flowers, food, a cake, a fresh outfit) is done as "
+    "close to the moment it is used as possible - never days ahead. Steps of one errand or preparation "
+    "sit close together in time, not scattered across the calendar.\n"
+)
+
+
 def _kind_rules(profile):
+    return _kind_rules_core(profile) + _SEQUENCE_RULE
+
+
+def _kind_rules_core(profile):
     kind = (profile or {}).get("kind")
     if kind == "event":
         return (
@@ -1080,7 +1340,7 @@ def _kind_rules(profile):
             "goal itself, plus the small preparation that makes it happen. Keep it tasteful, warm and "
             "practical; never explicit. Vary the actions across sessions.\n"
         )
-    
+
     if kind == "habit":
         return (
             "THIS IS A PHYSICAL HABIT. Long slots (30+ min) are the person's own gym/exercise window: "
@@ -1102,8 +1362,9 @@ def period_for(outline, day_iso):
     return None
 
 
-def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None, now_min=None,
-                         detail_days=None, outline_out=None):
+def _build_fallback_plan(
+    goal, today=None, extra_blocked=None, busy_by_date=None, now_min=None, detail_days=None, outline_out=None
+):
     today = today or date.today().isoformat()
     deadline = goal["deadline"]
     span_days = min(max(days_remaining(deadline, today), 0) + 1, 121)
@@ -1121,19 +1382,21 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         constraints = []
     blocked = []
     from core import routine as _rtm
+
     for c in constraints:
         if get_routine() and _rtm.weekdays_in(c):
             continue
         w = parse_time_window(c)
         if w:
             blocked.append(w)
-    for w in (extra_blocked or []):
+    for w in extra_blocked or []:
         if w:
             blocked.append(w)
 
     _r = get_routine()
     if _r:
         from core import routine as _routine_mod
+
         human_windows = _routine_mod.human_windows(_r)
     else:
         human_windows = parse_routine_windows(details) or _DEFAULT_HUMAN_WINDOWS
@@ -1144,17 +1407,17 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     _alloc = get_allocation()
     _owned = _alloc is not None and goal.get("id") in _alloc
     if not _owned and _goal_kind(goal.get("title") or goal["display_title"]) == "hookup":
-        return _hookup_arc(today, deadline, blocked, details,
-                           goal.get("title") or goal["display_title"])
+        return _hookup_arc(today, deadline, blocked, details, goal.get("title") or goal["display_title"])
 
     _fixed_dated = {}
     if get_routine():
         from core import routine as _rt
+
         _fixed_dated = _rt.dated_busy(get_routine(), today, deadline)
 
     def _day_bounds(day_date=None):
         busy = []
-        for (s, e) in list(blocked) + list(_fixed_dated.get(day_date, [])):
+        for s, e in list(blocked) + list(_fixed_dated.get(day_date, [])):
             s = s % (24 * 60)
             e = (e - s) % (24 * 60) + s
             if e > 24 * 60:
@@ -1164,7 +1427,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
                 busy.append((s, e))
         busy.sort()
         merged = []
-        for (s, e) in busy:
+        for s, e in busy:
             if merged and s < merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], e))
             else:
@@ -1174,7 +1437,7 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
     def _free_from(busy, start, taken, span=90):
         obstacles = sorted(busy + list(taken))
         cur = start
-        for (bs, be) in obstacles:
+        for bs, be in obstacles:
             if be <= cur:
                 continue
             if bs >= cur + span:
@@ -1197,33 +1460,64 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
         if nb is not None:
             bed, wake = nb, w0
     prefs = planner.Prefs(
-        wake=wake, bed=bed, commit_min=commit_min,
+        wake=wake,
+        bed=bed,
+        commit_min=commit_min,
         chronotype=planner.infer_chronotype((_r or {}).get("peak") or details.get("peak_energy"), wake, bed),
     )
-    others_for = (lambda d: list((busy_by_date or {}).get(d, [])))
-    habit_others = (lambda d: others_for(d) + list(_fixed_dated.get(d, [])))
+    others_for = lambda d: list((busy_by_date or {}).get(d, []))
+    habit_others = lambda d: others_for(d) + list(_fixed_dated.get(d, []))
     profile = effort_profile(goal, max(days_remaining(deadline, today), 0))
     wins = workout_windows()
     if profile["kind"] == "recurring":
         prefs.commit_min = min(prefs.commit_min, 90)
-        prefs.chronotype = {"morning": "morning", "afternoon": "afternoon", "evening": "night", "night": "night"}.get(profile.get("best_time"), prefs.chronotype)
+        prefs.chronotype = {
+            "morning": "morning",
+            "afternoon": "afternoon",
+            "evening": "night",
+            "night": "night",
+        }.get(profile.get("best_time"), prefs.chronotype)
     if _owned:
         mine = _alloc.get(goal["id"], {})
         start = date.fromisoformat(today)
-        horizon = [((start + timedelta(days=k)).isoformat(),
-                    list(mine.get((start + timedelta(days=k)).isoformat(), [])))
-                   for k in range(span_days)]
+        horizon = [
+            (
+                (start + timedelta(days=k)).isoformat(),
+                list(mine.get((start + timedelta(days=k)).isoformat(), [])),
+            )
+            for k in range(span_days)
+        ]
     elif profile["kind"] == "habit" and wins:
-        meals = [w for w in (human_windows or []) if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60]
+        meals = [
+            w
+            for w in (human_windows or [])
+            if w and (w[1] - w[0]) % 1440 <= 120 and 6 * 60 <= w[0] % 1440 <= 21 * 60
+        ]
         meals = [w for w in meals if w not in wins]
-        horizon = _habit_horizon(today, deadline, wins, now_min, habit_others, meals, detail_days, profile.get("per_week") or habit_sessions_per_week(goal))
+        horizon = _habit_horizon(
+            today,
+            deadline,
+            wins,
+            now_min,
+            habit_others,
+            meals,
+            detail_days,
+            profile.get("per_week") or habit_sessions_per_week(goal),
+        )
     else:
         horizon = planner.plan_horizon(
-            today, deadline, prefs, _day_bounds, now_min=now_min, others_for=others_for,
+            today,
+            deadline,
+            prefs,
+            _day_bounds,
+            now_min=now_min,
+            others_for=others_for,
             shaped=profile["kind"] != "recurring",
         )
         if profile["kind"] == "event":
-            horizon = _apply_event_shape(horizon, today, deadline, profile["budget_min"], profile["active_days"])
+            horizon = _apply_event_shape(
+                horizon, today, deadline, profile["budget_min"], profile["active_days"]
+            )
         elif profile["kind"] == "recurring":
             horizon = _thin_to_sessions(horizon, profile.get("per_week"))
     _state.profile = profile
@@ -1249,30 +1543,32 @@ def _build_fallback_plan(goal, today=None, extra_blocked=None, busy_by_date=None
 
     packed = []
     for d in reversed(day_list):
-        for (s, e) in reversed(day_slots_map.get(d, [])):
+        for s, e in reversed(day_slots_map.get(d, [])):
             packed.append((d, s, e))
     if is_event and split_topics and len(packed) >= len(split_topics):
-        packed = packed[:len(split_topics)]
+        packed = packed[: len(split_topics)]
     packed.reverse()
 
     topic_seq = None
     if split_topics:
         if is_event and len(split_topics) <= len(packed):
-            topic_seq = list(split_topics[:len(packed)])
+            topic_seq = list(split_topics[: len(packed)])
         else:
             topic_seq = [split_topics[i % len(split_topics)] for i in range(len(packed))]
 
     for idx, (d, s, e) in enumerate(packed):
         day_i = day_list.index(d)
         title = topic_seq[idx] if topic_seq else f"{full_title} — day {day_i + 1}"
-        entries.append({
-            "date": d,
-            "title": title,
-            "start_time": f"{s // 60:02d}:{s % 60:02d}",
-            "end_time": f"{e // 60:02d}:{e % 60:02d}",
-            "duration_min": e - s,
-            "status": "pending",
-        })
+        entries.append(
+            {
+                "date": d,
+                "title": title,
+                "start_time": f"{s // 60:02d}:{s % 60:02d}",
+                "end_time": f"{e // 60:02d}:{e % 60:02d}",
+                "duration_min": e - s,
+                "status": "pending",
+            }
+        )
     return entries
 
 
@@ -1281,7 +1577,7 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
 
     def day_busy():
         busy = []
-        for (bs, be) in blocked:
+        for bs, be in blocked:
             s = bs % (24 * 60)
             e = (be - s) % (24 * 60) + s
             if e > 24 * 60:
@@ -1291,7 +1587,7 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
                 busy.append((s, e))
         busy.sort()
         merged = []
-        for (s, e) in busy:
+        for s, e in busy:
             if merged and s < merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], e))
             else:
@@ -1301,7 +1597,7 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
     def fit(busy, taken, start, dur):
         obstacles = sorted(list(busy) + list(taken))
         cur = start
-        for (bs, be) in obstacles:
+        for bs, be in obstacles:
             if be <= cur:
                 continue
             if bs >= cur + dur:
@@ -1333,13 +1629,15 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
     def add(d, win, phase, seq, day_idx):
         key = (phase, seq)
         ords[key] = ords.get(key, 0) + 1
-        entries.append({
-            "date": d,
-            "title": _fallback_task_label(phase, seq, goal_ref, ords[key]),
-            "start_time": f"{win[0] // 60:02d}:{win[0] % 60:02d}",
-            "end_time": f"{win[1] // 60:02d}:{win[1] % 60:02d}",
-            "status": "pending",
-        })
+        entries.append(
+            {
+                "date": d,
+                "title": _fallback_task_label(phase, seq, goal_ref, ords[key]),
+                "start_time": f"{win[0] // 60:02d}:{win[0] % 60:02d}",
+                "end_time": f"{win[1] // 60:02d}:{win[1] % 60:02d}",
+                "status": "pending",
+            }
+        )
 
     for i, d in enumerate(dates):
         day = d.isoformat()
@@ -1363,7 +1661,11 @@ def _hookup_arc(today, deadline, blocked, details, goal_ref=None):
                     taken.append(m)
                     add(day, m, "event", 0, i)
             b_ev = [w for w in b if not (w[1] - w[0] <= 90 and 12 * 60 <= w[0] < 22 * 60)]
-            ev = fit(b_ev, taken, 18 * 60, 240) or fit(b_ev, taken, 18 * 60, 180) or fit(b_ev, taken, 19 * 60, 150)
+            ev = (
+                fit(b_ev, taken, 18 * 60, 240)
+                or fit(b_ev, taken, 18 * 60, 180)
+                or fit(b_ev, taken, 19 * 60, 150)
+            )
             add(day, ev or (19 * 60, 22 * 60), "event", 1, i)
         else:
             m = fit(b, taken, 9 * 60, 60) or fit(b, taken, 8 * 60, 60)
@@ -1397,7 +1699,7 @@ def _fallback_task_label(phase, seq, goal_ref, ordinal=1):
 
 
 def _overlaps(s, e, blocked):
-    for (bs, be) in blocked:
+    for bs, be in blocked:
         if s < be and bs < e:
             return True
     return False
@@ -1406,6 +1708,7 @@ def _overlaps(s, e, blocked):
 def _local_now(db, goal, user=None):
     """The goal owner's wall-clock 'now' (their timezone, not the server's)"""
     from core.clock import now_for
+
     if user is None and db is not None and goal and goal.get("user_id"):
         try:
             user = db.execute("SELECT timezone FROM users WHERE id=?", (goal["user_id"],)).fetchone()
@@ -1416,17 +1719,28 @@ def _local_now(db, goal, user=None):
 
 def generate_plan(goal, user, db=None, extra_blocked=None, prefer_cloud=False, busy_by_date=None):
     try:
-        return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
-                              busy_by_date=busy_by_date, user=user)
+        return _llm_plan_call(
+            goal,
+            db,
+            extra_blocked=extra_blocked,
+            prefer_cloud=prefer_cloud,
+            busy_by_date=busy_by_date,
+            user=user,
+        )
     except Exception:
         return None
 
 
-def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=False,
-                          busy_by_date=None):
+def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=False, busy_by_date=None):
     try:
-        return _llm_plan_call(goal, db, extra_blocked=extra_blocked, prefer_cloud=prefer_cloud,
-                              busy_by_date=busy_by_date, user=user)
+        return _llm_plan_call(
+            goal,
+            db,
+            extra_blocked=extra_blocked,
+            prefer_cloud=prefer_cloud,
+            busy_by_date=busy_by_date,
+            user=user,
+        )
     except Exception as exc:
         logger.warning("plan call failed: %r", exc)
         return None
@@ -1434,14 +1748,43 @@ def generate_plan_or_none(goal, user, db=None, extra_blocked=None, prefer_cloud=
 
 def _goal_kind(title):
     t = (title or "").lower()
-    if any(w in t for w in (
-            "hookup", "hook up", "sex night", "night together", "sleep with",
-            "sexual", "intimate night", "fuck", "bedroom")):
+    if any(
+        w in t
+        for w in (
+            "hookup",
+            "hook up",
+            "sex night",
+            "night together",
+            "sleep with",
+            "sexual",
+            "intimate night",
+            "fuck",
+            "bedroom",
+        )
+    ):
         return "hookup"
-    if any(w in t for w in (
-            "romantic", "romance", "date", "anniversary", "valentine", "girlfriend", "gf",
-            "wife", "partner", "husband", "boyfriend", "bf", "proposal", "memorable",
-            "date night", "surprise", "gift")):
+    if any(
+        w in t
+        for w in (
+            "romantic",
+            "romance",
+            "date",
+            "anniversary",
+            "valentine",
+            "girlfriend",
+            "gf",
+            "wife",
+            "partner",
+            "husband",
+            "boyfriend",
+            "bf",
+            "proposal",
+            "memorable",
+            "date night",
+            "surprise",
+            "gift",
+        )
+    ):
         return "romance"
     return "general"
 
@@ -1491,7 +1834,8 @@ def _goal_chat_log(db, goal):
     try:
         rows = db.execute(
             "SELECT content FROM (SELECT id, content FROM general_chat WHERE user_id=? AND role='user' "
-            "ORDER BY id DESC LIMIT 15) ORDER BY id ASC", (uid,),
+            "ORDER BY id DESC LIMIT 15) ORDER BY id ASC",
+            (uid,),
         ).fetchall()
         if rows:
             out.append("(from the main chat, use only what concerns this goal)")
@@ -1510,15 +1854,21 @@ def reorder_naturally(entries, title, db=None):
     ordered = sorted(entries, key=lambda e: (e["date"], e.get("start_time") or ""))
     if len(ordered) < 2 or len({e["date"] for e in ordered}) < 2:
         return entries
-    listing = "\n".join(f"{i}. {e['date']} {e.get('start_time') or ''} - {e.get('title')}" for i, e in enumerate(ordered))
-    sys = ("You sanity-check a schedule the way a sensible person would. Tasks keep their slots, "
-           "but you may reorder which task sits in which slot so the sequence is realistic: "
-           "things that spoil or go stale happen close to when they are used, prerequisites come "
-           "before what depends on them, nothing is done too early to still matter or too late to help. "
-           "Reply with ONLY a JSON array containing every index exactly once, in the new order. "
-           "If the order is already realistic return it unchanged.")
+    listing = "\n".join(
+        f"{i}. {e['date']} {e.get('start_time') or ''} - {e.get('title')}" for i, e in enumerate(ordered)
+    )
+    sys = (
+        "You sanity-check a schedule the way a sensible person would. Tasks keep their slots, "
+        "but you may reorder which task sits in which slot so the sequence is realistic: "
+        "things that spoil or go stale happen close to when they are used, prerequisites come "
+        "before what depends on them, nothing is done too early to still matter or too late to help. "
+        "Reply with ONLY a JSON array containing every index exactly once, in the new order. "
+        "If the order is already realistic return it unchanged."
+    )
     try:
-        r = get_manager(db).generate(sys, f"Goal: {title}\nSlots in time order:\n{listing}", timeout=40, max_tokens=300)
+        r = get_manager(db).generate(
+            sys, f"Goal: {title}\nSlots in time order:\n{listing}", timeout=40, max_tokens=300
+        )
     except Exception:
         return entries
     if not (r is not None and getattr(r, "ok", False) and r.text):
@@ -1559,7 +1909,7 @@ def daily_commit_min(details):
     m = re.search(r"(\d+(?:\.\d+)?)", tp)
     if m:
         n = float(m.group(1))
-        unit = tp[m.end():m.end() + 3].strip()
+        unit = tp[m.end() : m.end() + 3].strip()
         is_minutes = ("m" in unit and "h" not in unit) or n > 16
         if is_minutes:
             commit_min = max(15, min(int(n), 16 * 60))
@@ -1579,12 +1929,16 @@ def too_small_ratio():
 # A draw missing slots or titles must not overwrite the existing plan.
 def last_plan_complete():
     total = getattr(_state, "slots_total", 0)
-    return getattr(_state, "failed_slices", 0) == 0 and total > 0 and \
-        getattr(_state, "slots_titled", 0) >= 0.85 * total
+    return (
+        getattr(_state, "failed_slices", 0) == 0
+        and total > 0
+        and getattr(_state, "slots_titled", 0) >= 0.85 * total
+    )
 
 
-def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False, busy_by_date=None,
-                   user=None):
+def _llm_plan_call(
+    goal, db, timeout=180, extra_blocked=None, prefer_cloud=False, busy_by_date=None, user=None
+):
     _state.last_error = None
     _state.slots_total = 0
     _state.slots_titled = 0
@@ -1611,6 +1965,7 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
     _rr = get_routine()
     if _rr:
         from core import routine as _routine_mod
+
         _routine = _routine_mod.human_windows(_rr)
     else:
         _routine = parse_routine_windows(_details)
@@ -1715,9 +2070,18 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
     )
     scope = scope_for(days_left)
     ol = {}
-    fallback = _build_fallback_plan(goal, today=today, extra_blocked=extra_blocked,
-                                    busy_by_date=busy_by_date, now_min=now_min,
-                                    detail_days=detail_days_for(days_left), outline_out=ol) or []
+    fallback = (
+        _build_fallback_plan(
+            goal,
+            today=today,
+            extra_blocked=extra_blocked,
+            busy_by_date=busy_by_date,
+            now_min=now_min,
+            detail_days=detail_days_for(days_left),
+            outline_out=ol,
+        )
+        or []
+    )
     _state.outline = None
     if fallback and scope != "daily":
         periods = build_outline_periods(today, deadline, scope, ol.get("slot_minutes", {}))
@@ -1759,8 +2123,8 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         "Together, the separate requests for this window cover every day in the detailed "
         "window — never drop, merge, shift, or cut the slots you were given, and never add "
         "slots that were not listed.\n"
-        + _kind_rules(getattr(_state, "profile", None)) +
-        "TASK WORDING STANDARD (this is what makes a plan usable): every title must name "
+        + _kind_rules(getattr(_state, "profile", None))
+        + "TASK WORDING STANDARD (this is what makes a plan usable): every title must name "
         "(1) the exact material or deliverable, (2) a quantity or size, and (3) the "
         "finish-test that proves it is done. Good: 'Solve 10 subnetting problems from "
         "Professor Messer's sheet; redo every miss until 10/10'. Good: 'Build the pricing "
@@ -1770,24 +2134,31 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
     )
     out = []
     for i in range(0, len(fallback), slice_size):
-        chunk = fallback[i:i + slice_size]
+        chunk = fallback[i : i + slice_size]
         first, last = chunk[0]["date"], chunk[-1]["date"]
         slots_json = "[\n" + ",\n".join(_slot_json(e) for e in chunk) + "\n]"
         ctx = ""
         per = period_for(getattr(_state, "outline", None), first)
         if per:
-            ctx += (f"ROADMAP: this stretch is the \"{per['phase']}\" phase "
-                    f"({per['start']}..{per['end']}, {per['hours']}h available)."
-                    + (f" Target for it: {per['objective']}." if per['objective'] else "") + "\n")
+            ctx += (
+                f"ROADMAP: this stretch is the \"{per['phase']}\" phase "
+                f"({per['start']}..{per['end']}, {per['hours']}h available)."
+                + (f" Target for it: {per['objective']}." if per["objective"] else "")
+                + "\n"
+            )
         else:
             total = max(days_remaining(deadline, today), 1)
             ctx += f"PHASE: {_phase_at(max(0, days_between(today, first)) / total)}.\n"
         if out:
-            ctx += "ALREADY PLANNED EARLIER (go deeper, do not repeat): " + " | ".join(e["title"] for e in out[-6:]) + "\n"
+            ctx += (
+                "ALREADY PLANNED EARLIER (go deeper, do not repeat): "
+                + " | ".join(e["title"] for e in out[-6:])
+                + "\n"
+            )
         base_head_slice = base_head + ctx
         user_prompt = (
             f"{base_head_slice}This request covers ONLY {first} .. {last}. Other requests fill the rest of "
-            "the calendar — do NOT plan any day outside this range, and do NOT move any "        
+            "the calendar — do NOT plan any day outside this range, and do NOT move any "
             "slot to a different date, start_time, or end_time than the ones below.\n"
             "Below are the EXACT day/time slots in THIS range the plan must fill (each slot "
             "is one task; EVERY slot listed must appear in your output, in the same order, "
@@ -1826,7 +2197,10 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
         res = None
         try:
             res = get_manager(db).generate(
-                sys, user_prompt, timeout=timeout, prefer_cloud=prefer_cloud,
+                sys,
+                user_prompt,
+                timeout=timeout,
+                prefer_cloud=prefer_cloud,
                 max_tokens=_MAX_PLAN_TOKENS,
             )
         except Exception as exc:
@@ -1838,8 +2212,12 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             logger.warning("plan slice %s-%s: model error %s, retrying lean", first, last, res.error)
             try:
                 res = get_manager(db).generate(
-                    sys, user_prompt.replace(chat_line, "").replace(links_line, ""), timeout=timeout,
-                    prefer_cloud=prefer_cloud, max_tokens=_MAX_PLAN_TOKENS)
+                    sys,
+                    user_prompt.replace(chat_line, "").replace(links_line, ""),
+                    timeout=timeout,
+                    prefer_cloud=prefer_cloud,
+                    max_tokens=_MAX_PLAN_TOKENS,
+                )
             except Exception as exc:
                 logger.warning("plan slice %s-%s lean retry failed: %r", first, last, exc)
                 _state.failed_slices += 1
@@ -1853,15 +2231,22 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
             continue
         _state.last_provider = res.provider or "llm"
         title_map = _parse_title_map(res.text)
-        missing = [e for e in chunk if not _title_ok(title_map.get((e["date"], e["start_time"])), goal_ref=title)]
+        missing = [
+            e for e in chunk if not _title_ok(title_map.get((e["date"], e["start_time"])), goal_ref=title)
+        ]
         if missing:
             try:
                 sub_json = "[\n" + ",\n".join(_slot_json(e) for e in missing) + "\n]"
                 res2 = get_manager(db).generate(
-                    sys, user_prompt.replace(slots_json, sub_json) +
-                    "\nTitles for these slots were missing or rejected. Start each with a concrete verb "
+                    sys,
+                    user_prompt.replace(slots_json, sub_json)
+                    + "\nTitles for these slots were missing or rejected. Start each with a concrete verb "
                     "(Solve, Write, Build, Call, Buy, Run, Draft...), name the exact material, give a quantity "
-                    "and a finish-test.", timeout=timeout, prefer_cloud=prefer_cloud, max_tokens=_MAX_PLAN_TOKENS)
+                    "and a finish-test.",
+                    timeout=timeout,
+                    prefer_cloud=prefer_cloud,
+                    max_tokens=_MAX_PLAN_TOKENS,
+                )
                 if res2 is not None and getattr(res2, "ok", False):
                     wanted = {(e["date"], e["start_time"]) for e in missing}
                     title_map.update({k: v for k, v in _parse_title_map(res2.text).items() if k in wanted})
@@ -1878,8 +2263,20 @@ def _llm_plan_call(goal, db, timeout=180, extra_blocked=None, prefer_cloud=False
 
 
 _WEAK_STARTERS = {
-    "ensure", "confirm", "consider", "review", "research", "prepare", "prep",
-    "discuss", "debate", "brainstorm", "decide", "plan", "think", "brain-storm",
+    "ensure",
+    "confirm",
+    "consider",
+    "review",
+    "research",
+    "prepare",
+    "prep",
+    "discuss",
+    "debate",
+    "brainstorm",
+    "decide",
+    "plan",
+    "think",
+    "brain-storm",
 }
 
 
@@ -1889,20 +2286,33 @@ def _title_ok(title, goal_ref=None):
     stripped = title.strip()
     if "\n" in stripped and stripped.count("\n") > 1:
         return False
-  
+
     if len(stripped) > 180:
         return False
-    words = [w for w in re.split(r"\s+", stripped) if w.lower() not in
-             ("the", "a", "an", "of", "to", "for", "and", "with")]
-  
+    words = [
+        w
+        for w in re.split(r"\s+", stripped)
+        if w.lower() not in ("the", "a", "an", "of", "to", "for", "and", "with")
+    ]
+
     if len(words) < 3:
         return False
     low = stripped.lower()
     if any(w in low for w in ("consent & boundaries", "respect every no", "lecture")):
         return False
-    if any(re.search(rf"\b{re.escape(v)}\b", low) for v in (
-            "research", "polish", "prepare", "discuss the plan", "work on it",
-            "brainstorm topics", "review the plan", "review the design")):
+    if any(
+        re.search(rf"\b{re.escape(v)}\b", low)
+        for v in (
+            "research",
+            "polish",
+            "prepare",
+            "discuss the plan",
+            "work on it",
+            "brainstorm topics",
+            "review the plan",
+            "review the design",
+        )
+    ):
         return False
     if re.search(r"\bday\s+\d+\b.{0,24}\bpart\s+\d+\b", low):
         return False
@@ -1912,15 +2322,38 @@ def _title_ok(title, goal_ref=None):
         return False
     if goal_ref and re.match(re.escape(goal_ref.strip().lower()) + r"\s*[—–\-]?\s*(day|part)", low):
         return False
-    if any(v in low for v in ("start the next phase", "move to the next phase",
-                              "go to the next phase", "next phase", "make progress on")):
+    if any(
+        v in low
+        for v in (
+            "start the next phase",
+            "move to the next phase",
+            "go to the next phase",
+            "next phase",
+            "make progress on",
+        )
+    ):
         return False
-    if any(p in low for p in (
-            "study materials", "study guide", "study plan", "study timetable",
-            "gather resources", "collect resources", "gather materials",
-            "build a schedule", "make a schedule", "create a schedule",
-            "make a timetable", "create a timetable", "build a timetable",
-            "organize notes", "organise notes", "compile notes")):
+    if any(
+        p in low
+        for p in (
+            "study materials",
+            "study guide",
+            "study plan",
+            "study timetable",
+            "gather resources",
+            "collect resources",
+            "gather materials",
+            "build a schedule",
+            "make a schedule",
+            "create a schedule",
+            "make a timetable",
+            "create a timetable",
+            "build a timetable",
+            "organize notes",
+            "organise notes",
+            "compile notes",
+        )
+    ):
         return False
     first = re.split(r"[\s:]+", stripped, maxsplit=1)[0].lower().rstrip(".")
     if first in _WEAK_STARTERS:
@@ -1970,17 +2403,48 @@ def completion_detected(message):
     lowered = " " + re.sub(r"[^a-z0-9\s]", " ", text.lower()) + " "
     if "?" in text:
         return False
-    ambiguous = ["what", "how", "when", "do i", "am i", "should i", "whats", "what's",
-                 "have to do", "need to do", "should do", "to do today", "schedule",
-                 "today", "next", "now what", "anything"]
+    ambiguous = [
+        "what",
+        "how",
+        "when",
+        "do i",
+        "am i",
+        "should i",
+        "whats",
+        "what's",
+        "have to do",
+        "need to do",
+        "should do",
+        "to do today",
+        "schedule",
+        "today",
+        "next",
+        "now what",
+        "anything",
+    ]
     if any((" " + a + " ") in lowered for a in ambiguous):
         return False
     success = [
-        " all done ", " i'm done ", " i am done ", " i m done ", " im done ",
-        " all finished ", " it's done ", " its done ", " it is done ", " it's finished ",
-        " done with it ", " finished it ", " completed it ", " i completed ",
-        " i finished ", " wrapped up ", " closed it out ", " got it done ",
-        " finished ", " completed ",
+        " all done ",
+        " i'm done ",
+        " i am done ",
+        " i m done ",
+        " im done ",
+        " all finished ",
+        " it's done ",
+        " its done ",
+        " it is done ",
+        " it's finished ",
+        " done with it ",
+        " finished it ",
+        " completed it ",
+        " i completed ",
+        " i finished ",
+        " wrapped up ",
+        " closed it out ",
+        " got it done ",
+        " finished ",
+        " completed ",
     ]
     return any(p in lowered for p in success)
 
@@ -2015,9 +2479,12 @@ def progress_stats(goal, actions, today=None):
 
 
 def pressure_rating(goal, actions, open_blockers=0, missed_days=0, today=None):
-    today_iso = (today.isoformat() if isinstance(today, date) else date.today().isoformat())
+    today_iso = today.isoformat() if isinstance(today, date) else date.today().isoformat()
     dl = days_remaining(goal.get("deadline", today_iso), today_iso)
-    remaining = sum((a.get("duration_min") or 60) for a in actions if a.get("status") not in ("done", "missed")) / 60.0
+    remaining = (
+        sum((a.get("duration_min") or 60) for a in actions if a.get("status") not in ("done", "missed"))
+        / 60.0
+    )
     total = sum((a.get("duration_min") or 60) for a in actions) / 60.0
     if total <= 0:
         base = 1
@@ -2035,10 +2502,9 @@ def pressure_rating(goal, actions, open_blockers=0, missed_days=0, today=None):
     base += min(missed_days, 3) * 0.5
     score = min(max(round(base), 1), 10)
     label = (
-        "everything else is cancelled" if score >= 8 else
-        "lights are on" if score >= 6 else
-        "manageable" if score >= 4 else
-        "coasting"
+        "everything else is cancelled"
+        if score >= 8
+        else "lights are on" if score >= 6 else "manageable" if score >= 4 else "coasting"
     )
     return {"score": score, "label": label, "days_left": dl, "remaining_hours": round(remaining, 1)}
 
@@ -2046,6 +2512,7 @@ def pressure_rating(goal, actions, open_blockers=0, missed_days=0, today=None):
 def momentum_stats(user_id, db=None, today=None):
     from core.database import get_connection
     from core.clock import today_for
+
     conn = db or get_connection()
     if not isinstance(today, date):
         try:
@@ -2053,9 +2520,7 @@ def momentum_stats(user_id, db=None, today=None):
         except Exception:
             today = date.today()
     done_days = set()
-    rows = conn.execute(
-        "SELECT date FROM actions WHERE user_id=? AND status='done'", (user_id,)
-    ).fetchall()
+    rows = conn.execute("SELECT date FROM actions WHERE user_id=? AND status='done'", (user_id,)).fetchall()
     for r in rows:
         try:
             done_days.add(date.fromisoformat(r["date"]))
@@ -2102,10 +2567,35 @@ def momentum_stats(user_id, db=None, today=None):
 def classify_mood(text):
     """Map an Eloise reply to a display mood for the console"""
     t = (text or "").lower()
-    angry_kw = ["never", "lying", "dead", "fuck", "shut", "idiot", "coward", "delusional",
-                "embarrass", "slip", "gym", "slob", "sloppy", "pathetic"]
-    warn_kw = ["fire", "urgent", "pressure", "watch", "overdue", "cancelled", "crisis",
-               "on the line", "sliding", "stake", "debt"]
+    angry_kw = [
+        "never",
+        "lying",
+        "dead",
+        "fuck",
+        "shut",
+        "idiot",
+        "coward",
+        "delusional",
+        "embarrass",
+        "slip",
+        "gym",
+        "slob",
+        "sloppy",
+        "pathetic",
+    ]
+    warn_kw = [
+        "fire",
+        "urgent",
+        "pressure",
+        "watch",
+        "overdue",
+        "cancelled",
+        "crisis",
+        "on the line",
+        "sliding",
+        "stake",
+        "debt",
+    ]
     amused_kw = ["charm", "cute", "impressive", "cool", "darling", "sweet", "fun"]
     calm_kw = ["good", "right", "fine", "okay", "ok", "clear", "solid", "exact"]
 

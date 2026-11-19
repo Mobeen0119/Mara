@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -230,7 +230,54 @@ def _place(
     return sorted(blocks)
 
 
+def _sleep_margins(prefs, wake_lead, wind_down):
+    """No work just after waking or just before sleeping, wherever in the 24 hours the person sleeps."""
+    bed, wake = prefs.bed % 1440, prefs.wake % 1440
+    out = []
+    for start, end in ((wake, wake + wake_lead), (bed - wind_down, bed)):
+        if start < 0:
+            out += [(start + 1440, 1440), (0, end)]
+        elif end > 1440:
+            out += [(start, 1440), (0, end - 1440)]
+        elif end > start:
+            out.append((start, end))
+    return out
+
+
+def _starved(alloc, report, specs, today):
+    """Goals that still have time to run but got nothing, or were missed two days in a row."""
+    return [
+        s.id
+        for s in specs
+        if s.deadline >= today and (not alloc.get(s.id) or report[s.id]["missed_pairs"] > 0)
+    ]
+
+
 def allocate(
+    specs: List[Spec],
+    today: str,
+    prefs: "P.Prefs",
+    hard_busy_for: Callable[[str], List[Seg]],
+    soft_busy_for: Optional[Callable[[str], List[Seg]]] = None,
+    **kwargs,
+):
+    """Solve once normally; if any goal is left with no time, relax step by step and keep the best result.
+    1) negotiable windows (gym, movie night) open to everyone  2) minimum blocks 15 min, no rest gap,
+    no spare capacity  3) no buffers around busy time, no wake-up or wind-down margin.
+    Sleep, meals, class and work are never touched."""
+    best = None
+    for level in range(4):
+        alloc, report = _solve(specs, today, prefs, hard_busy_for, soft_busy_for, level=level, **kwargs)
+        starved = _starved(alloc, report, specs, today) if specs else []
+        report["relaxed"] = level
+        if best is None or len(starved) < best[0]:
+            best = (len(starved), alloc, report)
+        if not starved:
+            break
+    return best[1], best[2]
+
+
+def _solve(
     specs: List[Spec],
     today: str,
     prefs: "P.Prefs",
@@ -239,12 +286,22 @@ def allocate(
     *,
     now_min: Optional[int] = None,
     max_days: int = 121,
-    tuning: Optional[Tuning] = None
+    tuning: Optional[Tuning] = None,
+    level: int = 0,
 ):
     """-> (alloc, report). alloc[goal_id][date_iso] = [(start, end), ...].
     report[goal_id] = {ideal, got, short, missed_pairs, borrowed, backlog} in minutes / counts.
     report["days"][date_iso] = {mode, total, light, why, rest} explains each day."""
     tuning = tuning or Tuning()
+    if level >= 1:
+        soft_busy_for = None
+    if level >= 2:
+        tuning = replace(tuning, rest=False)
+        specs = [replace(sp, min_block=min(sp.min_block, 15), floor=min(sp.floor, 15)) for sp in specs]
+    fill = 1.0 if level >= 2 else FILL
+    pad_by = P.BUFFER if level < 2 else (5 if level == 2 else 0)
+    wake_lead, wind_down = (P.WAKE_LEAD, P.WIND_DOWN) if level < 3 else (0, 0)
+    margins = _sleep_margins(prefs, wake_lead, wind_down)
     rates = tuning.bucket_rate or {}
     d0 = date.fromisoformat(today)
     if not specs:
@@ -275,13 +332,13 @@ def allocate(
         weekend_cut = day.weekday() >= 5 and tuning.weekend_factor < 1.0
         if day.weekday() >= 5:
             factor *= tuning.weekend_factor
-        lo = prefs.wake + P.WAKE_LEAD
-        hi = min(prefs.bed - P.WIND_DOWN, LAST_MIN)
+        lo, hi = 0, LAST_MIN
         if i == 0 and now_min is not None:
             lo = max(lo, P.ceil15(now_min + P.LEAD_TODAY))
         hard = P.merge(hard_busy_for(iso))
+        shut = P.merge(P.pad(hard, pad_by) + margins)
         soft = P.merge(soft_busy_for(iso)) if soft_busy_for else []
-        general = P.subtract((lo, hi), P.pad(hard)) if hi - lo >= TOUCH else []
+        general = P.subtract((lo, hi), shut) if hi - lo >= TOUCH else []
         with_soft = list(general)
         if soft:
             soft_free = []
@@ -359,7 +416,7 @@ def allocate(
         )
         heavy_rest = heavy_run >= HEAVY_STREAK and not eve
         day_cap = LIGHT_CAP if heavy_rest else DAY_CAP
-        cap = int(min(day_cap, free_total) * FILL * factor)
+        cap = int(min(day_cap, free_total) * fill * factor)
         minutes = {c["g"].id: 0 for c in order}
         left = cap
         for c in order:  # 1) floors, best-ranked first

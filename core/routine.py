@@ -84,6 +84,7 @@ def merged(conn, user):
              "soft": [], "dated_soft": []}
     urow = conn.execute("SELECT routine, blocked_windows FROM users WHERE id=?", (uid,)).fetchone()
     mine = _jl(urow["routine"] if urow and "routine" in urow.keys() else "", {})
+   
     if mine.get("sleep"):
         _apply(state, "sleep", tuple(mine["sleep"]), "you told me")
     for k, v in (mine.get("meals") or {}).items():
@@ -98,7 +99,7 @@ def merged(conn, user):
     for g in conn.execute("SELECT id, constraints, details FROM goals WHERE user_id=? AND status='active' ORDER BY id DESC", (uid,)).fetchall():
         d = _jl(g["details"], {})
         t = generation.parse_clock_list(d.get("sleep_schedule") or "")
-        if len(t) >= 2:
+        if len(t) >= 2 and _plausible_sleep(t[0], t[1]):
             _apply(state, "sleep", (t[0], t[1]), f"goal #{g['id']}")
         mt = generation.parse_clock_list(d.get("meal_times") or "")
         for name, tm in zip(("breakfast", "lunch", "dinner"), mt):

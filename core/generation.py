@@ -1042,6 +1042,34 @@ def goal_brief(title, db=None, deadline=""):
     return None
 
 
+_DELIVERABLE_PHASES = [
+    (
+        r"presentation|pptx|slides?|speech|talk|pitch|demo|lecture|seminar|debate",
+        [
+            "Research and outline",
+            "Build the content",
+            "Polish and practise",
+            "Rehearse out loud and final check",
+        ],
+    ),
+    (
+        r"exam|test|quiz|viva|interview",
+        ["Learn the material", "Practise questions", "Mock run and fix weak spots", "Light review and rest"],
+    ),
+    (
+        r"report|essay|assignment|thesis|proposal|paper|submission",
+        ["Research and outline", "Write the draft", "Revise and cite", "Proofread and submit"],
+    ),
+]
+
+
+def deliverable_phases(title):
+    for pattern, names in _DELIVERABLE_PHASES:
+        if re.search(rf"\b({pattern})\b", title or "", re.I):
+            return names
+    return ["Foundations", "Core build", "Refine", "Final check"]
+
+
 _DELIVERABLE = re.compile(
     r"\b(presentation|pptx|slides?|debate|speech|talk|pitch|demo|interview|viva|exam|test|quiz|report|"
     r"essay|assignment|thesis|proposal|submission|project|paper|lecture|seminar)\b",
@@ -2114,10 +2142,21 @@ def _llm_plan_call(
     )
     slice_size = (len(fallback) + n_slices - 1) // n_slices
 
+    phases = (
+        deliverable_phases(title)
+        if (getattr(_state, "profile", None) or {}).get("kind") == "project"
+        else None
+    )
+    span = max(days_remaining(deadline, today), 1)
+
     def _slot_json(e):
+        tag = ""
+        if phases:
+            frac = min(max(days_between(today, e["date"]), 0) / span, 0.999)
+            tag = f', "phase": "{phases[int(frac * len(phases))]}"'
         return (
             f'  {{"date": "{e["date"]}", "start_time": "{(e["start_time"] or "09:00")}", '
-            f'"end_time": "{(e["end_time"] or "10:30")}"}}'
+            f'"end_time": "{(e["end_time"] or "10:30")}"{tag}}}'
         )
 
     base_head = (
@@ -2199,7 +2238,9 @@ def _llm_plan_call(
             "Forbidden ANYWHERE in a title (they are topics, not actions): ensure, confirm, "
             "consider, review, research, prepare, discuss, debate, decide, brainstorm, "
             "'make sure', 'plan the'. 'Ensure aftercare and safety' is REJECTED. "
-            "Each slot gets a different, specific task. Never schedule the same conversation "
+            'When a slot has a "phase", its title is a concrete step that belongs to THAT phase; slots on the '
+            "same day are consecutive steps of one working session (not repeats), and the last slots are "
+            "rehearsal or final checks. Each slot gets a different, specific task. Never schedule the same conversation "
             "topic on separate days. Do not schedule anything the chat notes say is already "
             "done. "
             "If a slot is on an evening and the next day is free, that slot is THE EVENT "

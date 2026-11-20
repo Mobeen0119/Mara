@@ -20,6 +20,8 @@ CATALOG = """Actions (reply ONLY JSON {"action": name, "args": {...}} or {"actio
 - set_deadline {goal_id, deadline YYYY-MM-DD}
 - replan {goal_id}  (redraw that goal's schedule)
 - set_checkin {time HH:MM}  (daily check-in and email time)
+- set_reminder {goal_id, time HH:MM}  (that goal's own reminder and email time; "3" with no am/pm means 15:00 if
+  it is afternoon where the person is, else 03:00 - say so in the label)
 - add_constraint {goal_id, text}  (a recurring busy window or rule, e.g. "class 9-11am")
 - move_task {task_id, date YYYY-MM-DD}  (use it for ANY wish to do a task on another day: "she's busy today",
   "can't make it tonight", "not free", "later in the week", "after my exam", "some other evening", "next monday".
@@ -83,7 +85,6 @@ def _recent_move(conn, goal_id):
 def reschedule(conn, user_id, message, today, goal_id=None):
     """'reschedule to tomorrow', 'redraw to 2026-11-22': move the task being discussed to that day."""
     text = (message or "").strip()
-    
     if not text or "?" in text or len(text.split()) > 20 or not _MOVE_WORD.search(text):
         return None
     target = parse_day(text, today)
@@ -94,7 +95,6 @@ def reschedule(conn, user_id, message, today, goal_id=None):
         "WHERE a.user_id=? AND a.status='pending' AND g.status='active' AND a.date>=?"
     )
     args = [user_id, today]
-  
     if goal_id:
         sql += " AND a.goal_id=?"
         args.append(goal_id)
@@ -103,7 +103,6 @@ def reschedule(conn, user_id, message, today, goal_id=None):
         return None
     best = max(tasks, key=lambda t: intents._score(text, t["title"]), default=None)
     task = best if intents._score(text, best["title"]) >= 1 else tasks[0]
- 
     if intents._score(text, task["title"]) < 1 and goal_id:
         recent = _recent_move(conn, goal_id)
         task = next((t for t in tasks if t["date"] == recent), task)
@@ -216,6 +215,15 @@ def _validate(conn, user_id, today, action, a, goals, tasks, note=""):
             {"note": (note or "")[:400]},
             f"Redraw the schedule for \"{gids[gid()]['display_title']}\"?",
         )
+    if action == "set_reminder" and gid() and _TIME.match(str(a.get("time") or "")):
+        return intents._store(
+            conn,
+            user_id,
+            "set_reminder",
+            gid(),
+            {"time": a["time"]},
+            f"Remind and email you about \"{gids[gid()]['display_title']}\" every day at {a['time']}?",
+        )
     if action == "set_checkin" and _TIME.match(str(a.get("time") or "")):
         return intents._store(
             conn,
@@ -321,6 +329,10 @@ def execute(conn, user, row, payload):
             conn.commit()
         goal_routes.submit_plan(user, gid, prefer_cloud=True)
         return {"message": "Redrawing it now.", "goal_id": gid}
+    if kind == "set_reminder":
+        conn.execute("UPDATE goals SET reminder_time=? WHERE id=? AND user_id=?", (payload["time"], gid, uid))
+        conn.commit()
+        return {"message": f"Reminder and email for this goal at {payload['time']}.", "goal_id": gid}
     if kind == "set_checkin":
         conn.execute("UPDATE users SET checkin_time=? WHERE id=?", (payload["time"], uid))
         conn.commit()

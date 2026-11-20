@@ -52,7 +52,7 @@ def wanted_repo(message):
         return f"{m.group(1)}/{m.group(2)}"
     if not _ASK.search(message or ""):
         return None
-    words = re.findall(r"[A-Za-z0-9_.-]+", message)
+    words = re.findall(r"[A-Za-z0-9_./-]+", message)
     after = False
     for w in words:
         if _ASK.fullmatch(w):
@@ -96,6 +96,7 @@ def lookup(name):
 
 
 def looks_done(task_title, files):
+    """A task names a file (boot.asm, Makefile, linker.ld) that now exists in the repo."""
     named = {f.lower() for f in _FILE.findall(task_title or "")}
     have = {p.lower() for p in files} | {p.lower().rsplit("/", 1)[-1] for p in files}
     return sorted(f for f in named if f in have)

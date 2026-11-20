@@ -125,57 +125,63 @@ def _answer(message, query, results, repo, goal_title, tasks, db):
     return None
 
 
+def _goal_text(conn, goal_id):
+    if not goal_id:
+        return ""
+    row = conn.execute("SELECT title, display_title, details FROM goals WHERE id=?", (goal_id,)).fetchone()
+    return " ".join(str(v or "") for v in row).lower() if row else ""
+
+
+def _repo_name(query, results, remembered):
+    """owner/name from a link or query, else the first GitHub result, else the plain name."""
+    if remembered:
+        return remembered
+    link = Repo_Check._URL.search(query)
+    if link:
+        return f"{link.group(1)}/{link.group(2)}"
+    for r in results:
+        m = Repo_Check._URL.search(r["url"])
+        if m:
+            return f"{m.group(1)}/{m.group(2)}"
+    return query.split()[0]
+
+
 def reply(conn, user_id, message, goal_id=None, remembered=None):
     query = wanted_query(message)
     code_ask = Repo_Check.wanted_repo(message)
-    if (
-        not query
-        and remembered
-        and _VERB.search(message or "")
-        and re.search(r"\b(progress|status|stats|done|state)\b", message, re.I)
-    ):
-        query = remembered
-    if not query and code_ask and ("/" in code_ask or re.search(r"\b(repo|github)\b", message, re.I)):
+    in_goal = bool(code_ask) and code_ask.lower() in _goal_text(conn, goal_id)
+    repo_ask = bool(re.search(r"\b(repo|github|code|source)\b", message or "", re.I))
+    is_repo = bool(code_ask and ("/" in code_ask or repo_ask or in_goal))
+    if not query and remembered and _VERB.search(message or ""):
+        if re.search(r"\b(progress|status|stats|done|state)\b", message, re.I):
+            query = remembered
+    if not query and is_repo:
         query = code_ask
     if not query:
         return None
-    try:
-        results = web(query)
-    except Exception as exc:
-        results, err = [], type(exc).__name__
-    else:
-        err = ""
-    repo = None
-    wants_repo = bool(
-        remembered
-        or "/" in query
-        or any("github.com" in r["url"] for r in results)
-        or re.search(r"\b(repo|github|code|source)\b", message, re.I)
-    )
-    if wants_repo:
-        name = remembered or next(
-            (
-                re.sub(r"^https?://github\.com/", "", r["url"]).strip("/").split("#")[0]
-                for r in results
-                if "github.com/" in r["url"]
-            ),
-            query,
-        )
-        name = "/".join(name.split("/")[:2]) if "/" in name else name
-        found = Repo_Check.lookup(name)
-        repo = None if found.get("error") else found
+
+    exact_repo = bool(re.fullmatch(r"[\w.-]+/[\w.-]+", query) or Repo_Check._URL.search(query))
+    results, web_err = [], ""
+    if not exact_repo:
+        try:
+            results = web(query)
+        except Exception as exc:
+            web_err = f"{type(exc).__name__}: {str(exc)[:80]}"
+    repo, repo_err = None, ""
+    if exact_repo or is_repo or remembered or repo_ask or any("github.com/" in r["url"] for r in results):
+        found = Repo_Check.lookup(_repo_name(query, results, remembered))
+        repo, repo_err = (None, found["error"]) if found.get("error") else (found, "")
     if not results and not repo:
-        reason = f" ({err})" if err else ""
-        return {
-            "reply": f"I couldn't get any search results for '{query}'{reason}. Check the server's internet access.",
-            "source": "search",
-        }
+        why = repo_err or (f"Search failed ({web_err})." if web_err else "The search returned nothing.")
+        return {"reply": f"I couldn't find anything for '{query}'. {why}", "source": "search"}
     title, tasks = _context(conn, goal_id)
     text = _answer(message, query, results, repo, title, tasks, conn)
     if not text:
-        lines = [f"Top results for {query}:"] + [
-            f"{i + 1}. {r['title']} - {r['url']}" for i, r in enumerate(results[:5])
-        ]
+        lines = []
+        if results:
+            lines = [f"Top results for {query}:"] + [
+                f"{i + 1}. {r['title']} - {r['url']}" for i, r in enumerate(results[:5])
+            ]
         if repo:
             lines.append(
                 f"GitHub {repo['full_name']}: {len(repo['files'])} files, last push {repo['pushed_at'][:10]}. Recent: "
@@ -189,7 +195,7 @@ def reply(conn, user_id, message, goal_id=None, remembered=None):
         ticked = [(t, hit) for t, hit in ticked if hit]
         if ticked:
             names = ", ".join(f"\"{t['title'][:60]}\" ({', '.join(hit)} exists)" for t, hit in ticked[:4])
-            prop = intents._store(
+            out["proposal"] = intents._store(
                 conn,
                 user_id,
                 "complete_task",
@@ -197,5 +203,4 @@ def reply(conn, user_id, message, goal_id=None, remembered=None):
                 [t["id"] for t, _ in ticked],
                 f"These look already done: {names}. Mark them done?",
             )
-            out["proposal"] = prop
     return out

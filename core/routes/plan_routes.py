@@ -68,6 +68,7 @@ def put_window_kind(body: WindowKindRequest, user=Depends(require_user)):
    
     if not label or len(label) > 120:
         raise HTTPException(400, "label required (max 120 chars)")
+    
     conn = get_connection()
     routine.set_window_kind(conn, user["id"], label, body.kind)
     rebalance_user(user)

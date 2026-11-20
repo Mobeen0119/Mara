@@ -14,6 +14,8 @@ def _check_hhmm(v):
 
 
 def _check_deadline(v):
+    if v in (None, ""):
+        return ""
     try:
         d = date.fromisoformat(v)
     except (TypeError, ValueError):
@@ -51,8 +53,8 @@ class LoginRequest(BaseModel):
 
 
 class GoalCreateRequest(BaseModel):
-    title: str = Field(min_length=1, max_length=120)
-    deadline: str
+    title: str = Field(min_length=1, max_length=400)
+    deadline: str = ""
     reminder_time: str = "09:00"
     constraints: List[str] = Field(default_factory=list, max_length=20)
 
@@ -62,11 +64,11 @@ class GoalCreateRequest(BaseModel):
     @field_validator("constraints")
     @classmethod
     def _cons(cls, v):
-        return [c.strip()[:120] for c in v if c and c.strip()]
+        return [c.strip()[:400] for c in v if c and c.strip()]
 
 
 class GoalUpdateRequest(BaseModel):
-    title: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    title: Optional[str] = Field(default=None, min_length=1, max_length=400)
     deadline: Optional[str] = None
     reminder_time: Optional[str] = None
     constraints: Optional[List[str]] = Field(default=None, max_length=20)
@@ -128,6 +130,7 @@ class CheckinRespondRequest(BaseModel):
 class LLMSettingsRequest(BaseModel):
     """Any OpenAI-compatible endpoint: paste a key + pick a model. Provider and
     base URL optional (a sensible default endpoint is used when blank)."""
+
     provider: Optional[str] = None
     base_url: Optional[str] = None
     model: Optional[str] = None
@@ -145,6 +148,7 @@ class LLMSettingsRequest(BaseModel):
 class LLMTestRequest(BaseModel):
     """Probe the provider with a one-word generation. Any field left blank is
     resolved from saved settings, then .env — so you can test before saving."""
+
     provider: Optional[str] = None
     base_url: Optional[str] = None
     model: Optional[str] = None
@@ -173,6 +177,7 @@ class PersonaRequest(BaseModel):
 class LocationRequest(BaseModel):
     """Where the user actually lives — chat and plans only suggest services
     that exist there (Pakistan by default, change it in Settings)."""
+
     location: str = Field(default="", max_length=80)
 
 

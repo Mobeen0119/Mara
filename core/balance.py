@@ -166,7 +166,9 @@ def build_specs(conn, user, rt, today):
                     kind="project",
                     ideal=commit if has_time or not urgent else max(commit, 240),
                     floor=30,
-                    max_block=60 if urgent else 90,
+                    max_block=(
+                        60 if urgent or left <= 14 or generation._DELIVERABLE.search(base["title"]) else 90
+                    ),
                     **base,
                 )
             spec.skip_days = {x for x in d.get("skip_days", []) if x >= today}

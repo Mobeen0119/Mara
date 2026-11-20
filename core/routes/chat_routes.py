@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from core import ratelimit
+from core import Web_Search
+
 from core.clock import today_for
 from core.database import get_connection
 from core.deps import require_user
@@ -23,29 +25,43 @@ def eloise_state(user: dict = Depends(require_user)):
     conn = get_connection()
     today_d = today_for(user)
     today = today_d.isoformat()
-    goals = [dict(g) for g in conn.execute(
-        "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
-    ).fetchall()]
+    goals = [
+        dict(g)
+        for g in conn.execute(
+            "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
+        ).fetchall()
+    ]
     top = None
     for g in goals:
         acts = [dict(a) for a in conn.execute("SELECT * FROM actions WHERE goal_id=?", (g["id"],)).fetchall()]
-        blk = conn.execute("SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)).fetchone()["c"]
+        blk = conn.execute(
+            "SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)
+        ).fetchone()["c"]
         miss = sum(1 for a in acts if a["status"] == "missed")
         pr = generation.pressure_rating(g, acts, open_blockers=blk, missed_days=miss, today=today_d)
         if top is None or pr["score"] > top["score"]:
-            top = {"goal": g["display_title"], "score": pr["score"], "label": pr["label"],
-                   "days_left": pr["days_left"], "remaining_hours": pr["remaining_hours"]}
+            top = {
+                "goal": g["display_title"],
+                "score": pr["score"],
+                "label": pr["label"],
+                "days_left": pr["days_left"],
+                "remaining_hours": pr["remaining_hours"],
+            }
     mom = generation.momentum_stats(user["id"], db=conn, today=today_d)
     stakes = conn.execute(
         "SELECT s.id, s.punishment, g.display_title FROM stakes s JOIN goals g ON g.id=s.goal_id "
-        "WHERE s.user_id=? AND s.status='active'", (user["id"],)
+        "WHERE s.user_id=? AND s.status='active'",
+        (user["id"],),
     ).fetchall()
     # boot/uptime feel
-    created_at = conn.execute("SELECT created_at FROM users WHERE id=?", (user["id"],)).fetchone()["created_at"]
+    created_at = conn.execute("SELECT created_at FROM users WHERE id=?", (user["id"],)).fetchone()[
+        "created_at"
+    ]
     boot = created_at or "seated"
     # mood from the last Eloise line
     last_row = conn.execute(
-        "SELECT content FROM general_chat WHERE user_id=? AND role='eloise' ORDER BY id DESC LIMIT 1", (user["id"],)
+        "SELECT content FROM general_chat WHERE user_id=? AND role='eloise' ORDER BY id DESC LIMIT 1",
+        (user["id"],),
     ).fetchone()
     mood = generation.classify_mood(last_row["content"] if last_row else "")
     return {
@@ -63,6 +79,7 @@ def eloise_state(user: dict = Depends(require_user)):
 def _triage_line(conn, user_id, today):
     try:
         from core import triage
+
         u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         return triage.summary_line(conn, dict(u), today) if u else ""
     except Exception:
@@ -73,7 +90,8 @@ def _active_board_snapshot(conn, user_id, today=None):
     """A compact, live digest of the user's current board: active goals with their
     deadlines, today's pending/done tasks, and any unresolved open flags."""
     rows = conn.execute(
-        "SELECT display_title, deadline, constraints, details FROM goals WHERE user_id=? AND status='active'", (user_id,)
+        "SELECT display_title, deadline, constraints, details FROM goals WHERE user_id=? AND status='active'",
+        (user_id,),
     ).fetchall()
     today = today or date.today().isoformat()
     goals = []
@@ -108,6 +126,7 @@ def _active_board_snapshot(conn, user_id, today=None):
     upcoming = []
     try:
         from datetime import date as _d, timedelta as _td
+
         t0 = _d.fromisoformat(today)
         ahead = conn.execute(
             "SELECT a.date, a.title, a.start_time, g.display_title FROM actions a "
@@ -115,7 +134,10 @@ def _active_board_snapshot(conn, user_id, today=None):
             "AND a.status='pending' AND g.status='active' ORDER BY a.date, a.start_time LIMIT 12",
             (user_id, today, (t0 + _td(days=3)).isoformat()),
         ).fetchall()
-        upcoming = [f"{r['date']} {r['start_time'] or ''} {r['display_title']}: {r['title']}".replace("  ", " ") for r in ahead]
+        upcoming = [
+            f"{r['date']} {r['start_time'] or ''} {r['display_title']}: {r['title']}".replace("  ", " ")
+            for r in ahead
+        ]
     except Exception:
         upcoming = []
     powers = conn.execute(
@@ -204,23 +226,53 @@ def _act_before_llm(conn, user, goal_id, message):
     if patch:
         routine.save_override(conn, user["id"], patch)
         from core.routes.goal_routes import submit_plan
-        for g in conn.execute("SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall():
+
+        for g in conn.execute(
+            "SELECT id FROM goals WHERE user_id=? AND status='active'", (user["id"],)
+        ).fetchall():
             submit_plan(user, g["id"])
         bits = []
         if patch.get("sleep"):
-            bits.append(f"sleep {generation.fmt_min(patch['sleep'][0])}-{generation.fmt_min(patch['sleep'][1])}")
+            bits.append(
+                f"sleep {generation.fmt_min(patch['sleep'][0])}-{generation.fmt_min(patch['sleep'][1])}"
+            )
         for k, v in (patch.get("meals") or {}).items():
             bits.append(f"{k} {generation.fmt_min(v[0])}")
         if patch.get("workout"):
-            bits.append(f"workout {generation.fmt_min(patch['workout'][0])}-{generation.fmt_min(patch['workout'][1])}")
-        return {"reply": "Noted for every goal, not just this one: " + ", ".join(bits) + ". Redrawing your plans around it.",
-                "source": "routine"}
+            bits.append(
+                f"workout {generation.fmt_min(patch['workout'][0])}-{generation.fmt_min(patch['workout'][1])}"
+            )
+        return {
+            "reply": "Noted for every goal, not just this one: "
+            + ", ".join(bits)
+            + ". Redrawing your plans around it.",
+            "source": "routine",
+        }
+
+    remembered = None
+    if goal_id:
+        row = conn.execute("SELECT details FROM goals WHERE id=?", (goal_id,)).fetchone()
+        remembered = (json.loads(row["details"] or "{}") if row else {}).get("repo")
+    if Web_Search.wanted_query(message):
+        ratelimit.enforce(f"search:{user['id']}", 12, 60, "slow down on searches")
+    found = Web_Search.reply(conn, user["id"], message, goal_id, remembered)
+    if found:
+        if goal_id and found.get("repo"):
+            row = conn.execute("SELECT details FROM goals WHERE id=?", (goal_id,)).fetchone()
+            details = json.loads(row["details"] or "{}")
+            details["repo"] = found["repo"]
+            conn.execute("UPDATE goals SET details=? WHERE id=?", (json.dumps(details), goal_id))
+            conn.commit()
+        return found
     nav = intents.navigate(conn, user["id"], message)
     if nav:
         return {"reply": nav["reply"], "ui": nav["ui"], "source": "nav"}
-    prop = intents.detect(conn, user["id"], message, today_for(user).isoformat(), goal_id)
+    from core import actions
+
+    prop = actions.reschedule(conn, user["id"], message, today_for(user).isoformat(), goal_id)
     if not prop:
-        from core import actions
+        prop = intents.detect(conn, user["id"], message, today_for(user).isoformat(), goal_id)
+    if not prop:
         prop = actions.propose(conn, user["id"], message, today_for(user).isoformat(), goal_id)
     if prop:
         return {"reply": prop["label"], "proposal": prop, "source": "proposal"}
@@ -230,6 +282,7 @@ def _act_before_llm(conn, user, goal_id, message):
 def _model_label(conn):
     try:
         from core.llm.manager import LLMManager
+
         cloud = next((p for n, p in LLMManager()._providers().items() if n != "ollama"), None)
         return f"{cloud.name} - {cloud.model}" if cloud else "the model"
     except Exception:
@@ -243,8 +296,27 @@ def chat_confirm(body: ConfirmRequest, user: dict = Depends(require_user)):
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("detail", "failed"))
     gid = res.get("goal_id")
-    _add_message(conn, user["id"], gid if res.get("kind") in ("complete_goal", "cancel_goal", "complete_task", "delete_task", "replan", "set_deadline", "add_constraint", "move_task") else None,
-                 "eloise", res["message"])
+    _add_message(
+        conn,
+        user["id"],
+        (
+            gid
+            if res.get("kind")
+            in (
+                "complete_goal",
+                "cancel_goal",
+                "complete_task",
+                "delete_task",
+                "replan",
+                "set_deadline",
+                "add_constraint",
+                "move_task",
+            )
+            else None
+        ),
+        "eloise",
+        res["message"],
+    )
     return res
 
 
@@ -257,9 +329,7 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
     message = _msg
     goal = None
     if goal_id:
-        goal = conn.execute(
-            "SELECT * FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])
-        ).fetchone()
+        goal = conn.execute("SELECT * FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])).fetchone()
         if not goal:
             raise HTTPException(status_code=404, detail="goal not found")
         goal = dict(goal)
@@ -284,7 +354,9 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         return acted
 
     history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
-    goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
+    goal_name = (
+        goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
+    )
 
     # Content safety: refuse harmful requests before they reach the LLM.
     # Context-aware: "sister" alone is fine, but as a follow-up to an incest
@@ -304,17 +376,27 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
             "SELECT date, title, start_time FROM actions WHERE goal_id=? AND status!='done' ORDER BY date, start_time LIMIT 12",
             (goal_id,),
         ).fetchall()
-        plan_lines = "\n".join(
-            f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows
-        )
+        plan_lines = "\n".join(f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows)
         text, source = generation.generate_chat_reply(
-            user["name"], goal_name, history, message, db=conn, plan_lines=plan_lines,
-            persona=persona, step_done=step_done, location=location,
+            user["name"],
+            goal_name,
+            history,
+            message,
+            db=conn,
+            plan_lines=plan_lines,
+            persona=persona,
+            step_done=step_done,
+            location=location,
         )
     else:
         board = _active_board_snapshot(conn, user["id"], today_for(user).isoformat())
         text, source = generation.generate_global_chat_reply(
-            user["name"], [board], history, message, db=conn, persona=persona,
+            user["name"],
+            [board],
+            history,
+            message,
+            db=conn,
+            persona=persona,
             location=location,
         )
     if source == "offline" or not text:
@@ -322,9 +404,9 @@ def chat(body: ChatRequest, user: dict = Depends(require_user)):
         raise HTTPException(
             status_code=503,
             detail="The model didn't give a usable reply — it may be unreachable, or it only "
-                   "echoed back the question. Open Settings > LLM Provider, paste an API key "
-                   "and hit Test connection: the test shows the real error. Once it answers, "
-                   "send that again.",
+            "echoed back the question. Open Settings > LLM Provider, paste an API key "
+            "and hit Test connection: the test shows the real error. Once it answers, "
+            "send that again.",
         )
     text = _freshen(conn, goal_id, user["id"], text)
     # Duplicate gate: a weak model that just said the same thing will say it
@@ -358,7 +440,10 @@ def _last_eloise_reply(conn, goal_id, user_id):
         return ""
 
 
-_SHRUG = re.compile(r"\b(who(?:'s| is| will|'ll)?\s+(?:going|gonna|will)\s+to?\s*remember|who(?:'ll| will) remember|nobody(?:'ll| will)? remember|no one(?:'ll| will)? remember|who remembers|not like anyone(?:'ll| will)? remember)\b", re.I)
+_SHRUG = re.compile(
+    r"\b(who(?:'s| is| will|'ll)?\s+(?:going|gonna|will)\s+to?\s*remember|who(?:'ll| will) remember|nobody(?:'ll| will)? remember|no one(?:'ll| will)? remember|who remembers|not like anyone(?:'ll| will)? remember)\b",
+    re.I,
+)
 
 
 def _sentences(text):
@@ -368,9 +453,15 @@ def _sentences(text):
 def _recent_lines(conn, goal_id, user_id, n=8):
     try:
         if goal_id:
-            rows = conn.execute("SELECT content FROM chat_messages WHERE goal_id=? AND user_id=? AND role='eloise' ORDER BY id DESC LIMIT ?", (goal_id, user_id, n)).fetchall()
+            rows = conn.execute(
+                "SELECT content FROM chat_messages WHERE goal_id=? AND user_id=? AND role='eloise' ORDER BY id DESC LIMIT ?",
+                (goal_id, user_id, n),
+            ).fetchall()
         else:
-            rows = conn.execute("SELECT content FROM general_chat WHERE user_id=? AND role='eloise' ORDER BY id DESC LIMIT ?", (user_id, n)).fetchall()
+            rows = conn.execute(
+                "SELECT content FROM general_chat WHERE user_id=? AND role='eloise' ORDER BY id DESC LIMIT ?",
+                (user_id, n),
+            ).fetchall()
     except Exception:
         return []
     return [x for r in rows for x in _sentences(r["content"])]
@@ -378,6 +469,7 @@ def _recent_lines(conn, goal_id, user_id, n=8):
 
 def _freshen(conn, goal_id, user_id, text):
     import difflib
+
     sents = _sentences(text)
     if len(sents) < 2:
         return text
@@ -395,6 +487,7 @@ def _freshen(conn, goal_id, user_id, text):
 
 def _is_near_dup(a, b):
     import difflib
+
     a = (a or "").strip()
     b = (b or "").strip()
     if not a or not b or len(a) < 20 or len(b) < 20:
@@ -411,6 +504,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
     """SSE variant of /chat: reply tokens are pushed as they're generated so the
     frontend can render text live instead of staring at a spinner for up to 90s."""
     import json as _json
+
     ratelimit.enforce(f"llm:{user['id']}", 30, 60, "easy - you're sending faster than I can think")
 
     def send(data: dict) -> str:
@@ -421,9 +515,7 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
     message = (body.message or "").strip()[:2000]
     goal = None
     if goal_id:
-        goal = conn.execute(
-            "SELECT * FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])
-        ).fetchone()
+        goal = conn.execute("SELECT * FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])).fetchone()
         if not goal:
             raise HTTPException(status_code=404, detail="goal not found")
         goal = dict(goal)
@@ -443,10 +535,14 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
             done["proposal"] = acted["proposal"]
         if acted.get("ui"):
             done["ui"] = acted["ui"]
-        return StreamingResponse(iter([send({"delta": acted["reply"]}), send(done)]), media_type="text/event-stream")
+        return StreamingResponse(
+            iter([send({"delta": acted["reply"]}), send(done)]), media_type="text/event-stream"
+        )
 
     history = "\n".join(_history(conn, goal_id, user["id"], drop_reply_to=message))
-    goal_name = goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
+    goal_name = (
+        goal["title"] if (goal and goal.get("title")) else (goal["display_title"] if goal else "general")
+    )
 
     if generation._is_truly_harmful(message, context=history):
         refusal = generation.GUARDRAIL_REFUSAL
@@ -473,17 +569,27 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
                 "SELECT date, title, start_time FROM actions WHERE goal_id=? AND status!='done' ORDER BY date, start_time LIMIT 12",
                 (goal_id,),
             ).fetchall()
-            plan_lines = "\n".join(
-                f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows
-            )
+            plan_lines = "\n".join(f"- {r['date']} {r['start_time'] or ''}: {r['title']}" for r in plan_rows)
             stream = generation.stream_chat_reply(
-                user["name"], goal_name, history, message, db=gconn, plan_lines=plan_lines,
-                persona=persona, step_done=step_done, location=location,
+                user["name"],
+                goal_name,
+                history,
+                message,
+                db=gconn,
+                plan_lines=plan_lines,
+                persona=persona,
+                step_done=step_done,
+                location=location,
             )
         else:
             board = _active_board_snapshot(gconn, user["id"], today_for(user).isoformat())
             stream = generation.stream_global_chat_reply(
-                user["name"], [board], history, message, db=gconn, persona=persona,
+                user["name"],
+                [board],
+                history,
+                message,
+                db=gconn,
+                persona=persona,
                 location=location,
             )
         source = None
@@ -504,8 +610,14 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
                     joined = cleaned
                 prev = _last_eloise_reply(gconn, goal_id, user["id"])
                 if prev and _is_near_dup(joined, prev):
-                    yield _json.dumps({"error": True, "done": True, "source": source or "offline",
-                                       "detail": "The model repeated its previous reply verbatim instead of answering. That's on the model — send it again and it should give a fresh answer."})
+                    yield _json.dumps(
+                        {
+                            "error": True,
+                            "done": True,
+                            "source": source or "offline",
+                            "detail": "The model repeated its previous reply verbatim instead of answering. That's on the model — send it again and it should give a fresh answer.",
+                        }
+                    )
                     return
                 try:
                     _add_message(gconn, user["id"], goal_id, "eloise", joined)
@@ -513,8 +625,14 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
                     pass
             yield _json.dumps({"done": True, "source": source or "offline"})
         except Exception:
-            yield _json.dumps({"error": True, "done": True, "source": "offline",
-                               "detail": "The model didn't give a usable reply — it may be unreachable, or it only echoed back the question. Open Settings > LLM Provider and hit Test connection: that shows the real error. Fix it there, then send that again."})
+            yield _json.dumps(
+                {
+                    "error": True,
+                    "done": True,
+                    "source": "offline",
+                    "detail": "The model didn't give a usable reply — it may be unreachable, or it only echoed back the question. Open Settings > LLM Provider and hit Test connection: that shows the real error. Fix it there, then send that again.",
+                }
+            )
 
     return StreamingResponse(
         (f"data: {frame}\n\n" for frame in generate()),
@@ -527,9 +645,13 @@ def chat_stream(body: ChatRequest, user: dict = Depends(require_user)):
 def chat_history(user: dict = Depends(require_user)):
     conn = get_connection()
     goal_id = None
-    rows = list(reversed(conn.execute(
-        "SELECT * FROM general_chat WHERE user_id=? ORDER BY id DESC LIMIT 200", (user["id"],)
-    ).fetchall()))
+    rows = list(
+        reversed(
+            conn.execute(
+                "SELECT * FROM general_chat WHERE user_id=? ORDER BY id DESC LIMIT 200", (user["id"],)
+            ).fetchall()
+        )
+    )
     msgs = [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
     if rows:
         goal_id = None
@@ -539,15 +661,17 @@ def chat_history(user: dict = Depends(require_user)):
 @router.get("/chat/goals/{goal_id}")
 def goal_chat_history(goal_id: int, user: dict = Depends(require_user)):
     conn = get_connection()
-    goal = conn.execute(
-        "SELECT * FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])
-    ).fetchone()
+    goal = conn.execute("SELECT * FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])).fetchone()
     if not goal:
         raise HTTPException(status_code=404, detail="goal not found")
-    rows = list(reversed(conn.execute(
-        "SELECT * FROM chat_messages WHERE goal_id=? AND user_id=? ORDER BY id DESC LIMIT 200",
-        (goal_id, user["id"]),
-    ).fetchall()))
+    rows = list(
+        reversed(
+            conn.execute(
+                "SELECT * FROM chat_messages WHERE goal_id=? AND user_id=? ORDER BY id DESC LIMIT 200",
+                (goal_id, user["id"]),
+            ).fetchall()
+        )
+    )
     msgs = [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
     return {"goal_id": goal_id, "messages": msgs}
 
@@ -558,6 +682,7 @@ def quick_command(body: QuickCommandRequest, user: dict = Depends(require_user))
     chips in the chat so Eloise answers about the live board the moment you tap."""
     import re as _re
     from datetime import date as _d
+
     cmd = (body.command or "").strip().lower()
     conn = get_connection()
     today_d = today_for(user)
@@ -571,18 +696,33 @@ def quick_command(body: QuickCommandRequest, user: dict = Depends(require_user))
             (user["id"], today),
         ).fetchall()
         if not items:
-            return {"reply": "Nothing booked today. That's a red flag or a lie — file something real.", "source": "quick"}
-        lines = [f"{t['start_time'] or 'anytime'} {t['display_title']} — {t['title']} [{t['status']}]" for t in items]
+            return {
+                "reply": "Nothing booked today. That's a red flag or a lie — file something real.",
+                "source": "quick",
+            }
+        lines = [
+            f"{t['start_time'] or 'anytime'} {t['display_title']} — {t['title']} [{t['status']}]"
+            for t in items
+        ]
         return {"reply": "Today's plate:\n" + "\n".join(lines), "source": "quick"}
 
     if cmd in ("score", "pressure", "crisis"):
-        goals = [dict(g) for g in conn.execute("SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall()]
+        goals = [
+            dict(g)
+            for g in conn.execute(
+                "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
+            ).fetchall()
+        ]
         if not goals:
             return {"reply": "No active files. No pressure. Suspiciously calm in here.", "source": "quick"}
         out = []
         for g in goals:
-            acts = [dict(a) for a in conn.execute("SELECT * FROM actions WHERE goal_id=?", (g["id"],)).fetchall()]
-            blk = conn.execute("SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)).fetchone()["c"]
+            acts = [
+                dict(a) for a in conn.execute("SELECT * FROM actions WHERE goal_id=?", (g["id"],)).fetchall()
+            ]
+            blk = conn.execute(
+                "SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)
+            ).fetchone()["c"]
             miss = sum(1 for a in acts if a["status"] == "missed")
             pr = generation.pressure_rating(g, acts, open_blockers=blk, missed_days=miss, today=today_d)
             out.append(f"{g['display_title']}: {pr['score']}/10 — {pr['label']} ({pr['days_left']}d left)")
@@ -590,11 +730,20 @@ def quick_command(body: QuickCommandRequest, user: dict = Depends(require_user))
         return {"reply": "Pressure board:\n" + "\n".join(out), "source": "quick"}
 
     if cmd in ("urgent", "fire"):
-        goals = [dict(g) for g in conn.execute("SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall()]
+        goals = [
+            dict(g)
+            for g in conn.execute(
+                "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
+            ).fetchall()
+        ]
         best = None
         for g in goals:
-            acts = [dict(a) for a in conn.execute("SELECT * FROM actions WHERE goal_id=?", (g["id"],)).fetchall()]
-            blk = conn.execute("SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)).fetchone()["c"]
+            acts = [
+                dict(a) for a in conn.execute("SELECT * FROM actions WHERE goal_id=?", (g["id"],)).fetchall()
+            ]
+            blk = conn.execute(
+                "SELECT COUNT(*) c FROM blockers WHERE goal_id=? AND status='open'", (g["id"],)
+            ).fetchone()["c"]
             miss = sum(1 for a in acts if a["status"] == "missed")
             pr = generation.pressure_rating(g, acts, open_blockers=blk, missed_days=miss, today=today_d)
             if best is None or pr["score"] > best[0]:
@@ -607,52 +756,74 @@ def quick_command(body: QuickCommandRequest, user: dict = Depends(require_user))
             (g["id"], today),
         ).fetchone()
         urgent = act["title"] if act else g["display_title"]
-        return {"reply": f"Fire at {pr['score']}/10: '{g['display_title']}'. Crack open '{urgent}' now.", "source": "quick"}
+        return {
+            "reply": f"Fire at {pr['score']}/10: '{g['display_title']}'. Crack open '{urgent}' now.",
+            "source": "quick",
+        }
 
     if cmd in ("momentum", "streak"):
         m = generation.momentum_stats(user["id"], db=conn, today=today_d)
         verdict = "on fire" if m["momentum"] >= 70 else "ticking" if m["momentum"] >= 40 else "stalled"
-        return {"reply":
-            f"Momentum {m['momentum']}/100 — {verdict}. Best run: {m['best_streak']} straight days. "
+        return {
+            "reply": f"Momentum {m['momentum']}/100 — {verdict}. Best run: {m['best_streak']} straight days. "
             f"Current streak: {m['current_streak']}. Averaging {m['burn_hours_per_day']}h/day of done work.",
-            "source": "quick"}
+            "source": "quick",
+        }
 
     if cmd in ("reschedule", "fuckit", "fuck it", "f-it", "f*ckit", "shove it"):
-        ids = [r["id"] for r in conn.execute(
-            "SELECT a.id FROM actions a JOIN goals g ON g.id=a.goal_id WHERE a.user_id=? AND g.status='active' AND a.status='pending'",
-            (user["id"],)).fetchall()]
+        ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT a.id FROM actions a JOIN goals g ON g.id=a.goal_id WHERE a.user_id=? AND g.status='active' AND a.status='pending'",
+                (user["id"],),
+            ).fetchall()
+        ]
         if not ids:
-            return {"reply": "Nothing to reschedule. 'Fuck it' only counts when there's work to dodge.", "source": "quick"}
-        prop = intents._store(conn, user["id"], "slide_all", None, ids, "Push every pending task one day later?")
+            return {
+                "reply": "Nothing to reschedule. 'Fuck it' only counts when there's work to dodge.",
+                "source": "quick",
+            }
+        prop = intents._store(
+            conn, user["id"], "slide_all", None, ids, "Push every pending task one day later?"
+        )
         return {"reply": prop["label"], "proposal": prop, "source": "quick"}
 
     if cmd in ("stakes", "debt"):
         stakes = conn.execute(
             "SELECT s.punishment, s.status, g.display_title FROM stakes s JOIN goals g ON g.id=s.goal_id "
-            "WHERE s.user_id=? AND s.status='active'", (user["id"],)
+            "WHERE s.user_id=? AND s.status='active'",
+            (user["id"],),
         ).fetchall()
         if not stakes:
-            return {"reply": "Nothing staked. Play it safe if you want — I respect a coward who at least admits it.", "source": "quick"}
-        return {"reply": "On the line:\n" + "\n".join(f"- {s['punishment']} (if {s['display_title']} slips)" for s in stakes), "source": "quick"}
+            return {
+                "reply": "Nothing staked. Play it safe if you want — I respect a coward who at least admits it.",
+                "source": "quick",
+            }
+        return {
+            "reply": "On the line:\n"
+            + "\n".join(f"- {s['punishment']} (if {s['display_title']} slips)" for s in stakes),
+            "source": "quick",
+        }
 
     if cmd in ("awesome", "cool", "nice", "impressive", "how"):
         return {
             "reply": "Because it's not magic, it's a ledger you can't lie to: live pressure scores, sawed-streak "
-                     "momentum, stakes pinned to deadlines, and a schedule that redraws around what's actually blocked. "
-                     "The polish is just fear wearing mascara.",
+            "momentum, stakes pinned to deadlines, and a schedule that redraws around what's actually blocked. "
+            "The polish is just fear wearing mascara.",
             "source": "quick",
         }
 
-    return {"reply": "I don't know that command. Try Today, Score, Fire, Momentum, Reschedule, or Stakes.", "source": "quick"}
+    return {
+        "reply": "I don't know that command. Try Today, Score, Fire, Momentum, Reschedule, or Stakes.",
+        "source": "quick",
+    }
 
 
 @router.post("/chat/nudge")
 def nudge(body: NudgeRequest, user: dict = Depends(require_user)):
     ratelimit.enforce(f"llm:{user['id']}", 30, 60)
     conn = get_connection()
-    goal = conn.execute(
-        "SELECT * FROM goals WHERE id=? AND user_id=?", (body.goal_id, user["id"])
-    ).fetchone()
+    goal = conn.execute("SELECT * FROM goals WHERE id=? AND user_id=?", (body.goal_id, user["id"])).fetchone()
     if not goal:
         raise HTTPException(status_code=404, detail="goal not found")
     goals_summary = [
@@ -661,7 +832,9 @@ def nudge(body: NudgeRequest, user: dict = Depends(require_user)):
             "SELECT display_title FROM goals WHERE user_id=? AND status='active'", (user["id"],)
         ).fetchall()
     ]
-    text, source = generation.generate_nudge(user["name"], "; ".join(goals_summary), goal["display_title"], db=conn)
+    text, source = generation.generate_nudge(
+        user["name"], "; ".join(goals_summary), goal["display_title"], db=conn
+    )
     conn.execute(
         "INSERT INTO interventions (user_id, goal_id, type, message) VALUES (?,?,?,?)",
         (user["id"], body.goal_id, "nudge", text),

@@ -1005,8 +1005,10 @@ def goal_brief(title, db=None, deadline=""):
         "You size real-life goals the way a sensible person would. Reply with ONLY JSON: "
         '{"kind":"event|habit|project","total_hours":number,"active_days":number,'
         '"physical":true|false,"per_week":number,"best_time":"morning|afternoon|evening|night"}. '
-        "event = a one-off occasion needing a few hours near the date; habit = repeated "
-        "practice (exercise, language, diet, relationship time); project = sustained build/study. "
+        "event = a one-off SOCIAL occasion (a date, a party, a surprise) needing a few hours near the date; "
+        "habit = repeated practice (exercise, language, diet, relationship time); project = anything "
+        "with something to prepare or deliver (presentation, debate, speech, exam, interview, report, "
+        "build, study), even when the date is close. "
         "total_hours is the whole realistic effort, active_days how many separate days it needs. "
         "physical is true ONLY when the goal itself is exercise, sport or body training done in a "
         "gym or workout slot; false for everything else, including couple time, study, hobbies. "
@@ -1040,8 +1042,19 @@ def goal_brief(title, db=None, deadline=""):
     return None
 
 
+_DELIVERABLE = re.compile(
+    r"\b(presentation|pptx|slides?|debate|speech|talk|pitch|demo|interview|viva|exam|test|quiz|report|"
+    r"essay|assignment|thesis|proposal|submission|project|paper|lecture|seminar)\b",
+    re.I,
+)
+
+
 def effort_profile(goal, days_left):
     brief = getattr(_state_brief, "b", None)
+    title = (goal or {}).get("title") or (goal or {}).get("display_title") or ""
+
+    if brief and brief["kind"] == "event" and _DELIVERABLE.search(title):
+        return {"kind": "project"}
 
     if brief and brief["kind"] == "event":
         return {

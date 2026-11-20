@@ -161,7 +161,14 @@ def build_specs(conn, user, rt, today):
                     **base,
                 )
             else:
-                spec = allocator.Spec(kind="project", ideal=commit, floor=30, max_block=90, **base)
+                urgent = left <= 1
+                spec = allocator.Spec(
+                    kind="project",
+                    ideal=commit if has_time or not urgent else max(commit, 240),
+                    floor=30,
+                    max_block=60 if urgent else 90,
+                    **base,
+                )
             spec.skip_days = {x for x in d.get("skip_days", []) if x >= today}
             spec.pin_days = {k: int(v) for k, v in (d.get("pin_days") or {}).items() if k >= today}
             if spec.kind in ("project", "event"):

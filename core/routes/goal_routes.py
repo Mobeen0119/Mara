@@ -942,7 +942,7 @@ def _clean_details(answers):
 @router.post("/goals")
 def create_goal(body: GoalCreateRequest, user: dict = Depends(require_user)):
     conn = get_connection()
-    title = body.title.strip()[:120]
+    title = body.title.strip()[:400]
     _guard_title(title)
     open_ended = 0
     deadline = body.deadline
@@ -1164,9 +1164,9 @@ def update_goal(goal_id: int, body: GoalUpdateRequest, user: dict = Depends(requ
         raise HTTPException(status_code=400, detail="that deadline has already passed")
     if body.title is not None:
         fields.append("title=?")
-        vals.append(body.title.strip()[:120])
+        vals.append(body.title.strip()[:400])
         fields.append("display_title=?")
-        d = body.title.strip()[:120]
+        d = body.title.strip()[:400]
         vals.append(d if len(d) <= 60 else d[:57] + "...")
     if body.deadline is not None:
         fields.append("deadline=?")

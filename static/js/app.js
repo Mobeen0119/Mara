@@ -1363,8 +1363,11 @@ async function deleteGoal(id) {
 function renderNewGoal(el) {
   let html = `<div class="page-header"><div class="kicker">New file</div><h1>What's on the table.</h1><p class="sub">Give it a name, a date if it has one, and what's off-limits.</p><div class="header-rule"></div></div>
     <div class="card">
-      <div class="field"><label>What needs to get done?</label><input type="text" id="new-goal-title" placeholder="e.g. Study networking exam"></div>
-      <div class="field"><label>Deadline <small style="opacity:.7">(optional)</small></label><input type="date" id="new-goal-deadline"><p class="field-hint">Leave it blank if it never really ends, like gym or guitar. I plan a few weeks ahead, keep rolling it forward, and it stays open until you mark it done.</p></div>
+      <div class="field"><label>What needs to get done?</label><input type="text" id="new-goal-title" maxlength="400" placeholder="e.g. Study networking exam"></div>
+      <div class="field"><label>Deadline</label>
+        <input type="date" id="new-goal-deadline">
+        <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-weight:400;cursor:pointer;"><input type="checkbox" id="new-goal-open" style="width:auto;margin:0;" onchange="toggleOpenGoal(this.checked)"> No fixed deadline - whenever it's done</label>
+        <p class="field-hint">Tick this for things that never really end, like gym or guitar. I plan a few weeks ahead, keep rolling it forward, and it stays open until you mark it done.</p></div>
       <div class="field"><label>Daily reminder time</label><input type="time" id="new-goal-reminder" value="08:00"></div>
       <div class="field"><label>Constraints</label>
         <div id="constraints-list"></div>
@@ -1377,6 +1380,11 @@ function renderNewGoal(el) {
     </div>`;
   window._constraints = [];
   el.innerHTML = html;
+}
+function toggleOpenGoal(on) {
+  const d = document.getElementById("new-goal-deadline");
+  d.disabled = on;
+  if (on) d.value = "";
 }
 function addConstraint() {
   const inp = document.getElementById("new-constraint");
@@ -1402,10 +1410,17 @@ function removeConstraint(i) {
 }
 async function createGoal() {
   const title = document.getElementById("new-goal-title").value;
-  const deadline = document.getElementById("new-goal-deadline").value;
+  const open = document.getElementById("new-goal-open").checked;
+  const deadline = open
+    ? ""
+    : document.getElementById("new-goal-deadline").value;
   const reminder = document.getElementById("new-goal-reminder").value;
   if (!title) {
     showToast("Give it a name first", "error");
+    return;
+  }
+  if (!open && !deadline) {
+    showToast("Pick a deadline, or tick 'No fixed deadline'", "error");
     return;
   }
   try {

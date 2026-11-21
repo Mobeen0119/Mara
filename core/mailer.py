@@ -6,9 +6,6 @@ import os
 
 logger = logging.getLogger("eloise")
 
-# Env var aliases: code historically read SMTP_PASSWORD/MAIL_FROM but .env and
-# .env.example ship SMTP_PASS/FROM_EMAIL. Read both, preferring the shorter
-# names that match the shipped config.
 _PASSWORD_KEYS = ("SMTP_PASS", "SMTP_PASSWORD")
 _FROM_KEYS = ("FROM_EMAIL", "MAIL_FROM")
 _NAME_KEYS = ("FROM_NAME", "MAIL_FROM_NAME")
@@ -31,8 +28,9 @@ def smtp_password():
 
 
 def smtp_from():
-    """Every mail leaves from the one account the server owner configured."""
-    return _cfg("SMTP_USER") or "eloise@localhost"
+    """Every mail leaves from the one address the server owner configured, whoever triggers it.
+    FROM_EMAIL overrides the login name (needed by relays such as Brevo or SendGrid)."""
+    return _cfg_any(_FROM_KEYS) or _cfg("SMTP_USER") or "eloise@localhost"
 
 
 def smtp_from_name():
@@ -58,9 +56,7 @@ def smtp_diag():
     if not user:
         problems.append("SMTP_USER is not set.")
     if not password:
-        problems.append(
-            "No password found — set SMTP_PASS (16-char Gmail App Password) in your .env."
-        )
+        problems.append("No password found — set SMTP_PASS (16-char Gmail App Password) in your .env.")
     elif host and "gmail" in host.lower() and len(password) != 16:
         problems.append(
             f"Gmail password is {len(password)} chars — Gmail needs a 16-char App Password "
@@ -119,7 +115,11 @@ def send_email_detailed(to, subject, text="", html=None):
             smtp.sendmail(_from, [to], msg.as_string())
         return True, ""
     except smtplib.SMTPAuthenticationError as exc:
-        detail = (exc.smtp_error or b"").decode("utf-8", "replace") if isinstance(exc.smtp_error, bytes) else str(exc)
+        detail = (
+            (exc.smtp_error or b"").decode("utf-8", "replace")
+            if isinstance(exc.smtp_error, bytes)
+            else str(exc)
+        )
         hint = ""
         if host and "gmail" in host.lower():
             hint = " — Gmail rejects normal passwords; use a 16-char App Password."
@@ -127,3 +127,11 @@ def send_email_detailed(to, subject, text="", html=None):
     except Exception as exc:
         logger.warning("mail to %s failed: %s", to, exc)
         return False, f"{type(exc).__name__}: {exc}"
+
+
+if __name__ == "__main__":
+    import sys
+
+    target = sys.argv[1] if len(sys.argv) > 1 else smtp_from()
+    ok, err = send_email_detailed(target, "Eloise test mail", "If you can read this, Eloise can send mail.")
+    print(f"sent from {smtp_from()} to {target}" if ok else f"FAILED: {err}")

@@ -24,7 +24,14 @@ from core.llm.openai_provider import (
     preset_for_base_url,
 )
 from core.llm.ollama_provider import DEFAULT_MODEL as DEFAULT_OLLAMA_MODEL
-from core.models import BlockedWindowsRequest, CheckinTimeRequest, LLMSettingsRequest, LLMTestRequest, LocationRequest, PersonaRequest
+from core.models import (
+    BlockedWindowsRequest,
+    CheckinTimeRequest,
+    LLMSettingsRequest,
+    LLMTestRequest,
+    LocationRequest,
+    PersonaRequest,
+)
 from core.routes.goal_routes import submit_plan
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -70,6 +77,7 @@ def _resolve_setting(cfg, field, env_names, default=""):
 def _clean_ollama_url(raw):
     """Strip any path (e.g. /api/generate) from an Ollama URL."""
     from urllib.parse import urlparse
+
     raw = (raw or "").strip()
     if not raw:
         return "http://localhost:11434"
@@ -82,6 +90,7 @@ def _clean_ollama_url(raw):
 
 def _host(url):
     from urllib.parse import urlparse
+
     return (urlparse(url or "").hostname or "").lower()
 
 
@@ -101,6 +110,7 @@ def status(user: dict = Depends(require_user)):
     mgr = LLMManager()
     s = mgr.status_dict()
     from core.mailer import smtp_configured
+
     s["email_configured"] = smtp_configured()
     if not user.get("is_admin"):
         for k in ("base_url", "ollama_url", "cloud_error", "openrouter_error", "ollama_error"):
@@ -121,7 +131,7 @@ def get_llm(user: dict = Depends(require_user)):
         "api_key_set": bool(eff["saved_key"] or eff["env_key"]),
     }
     if not user.get("is_admin"):
-        return base          # no endpoint, no key source, no presets: nothing to change here
+        return base  # no endpoint, no key source, no presets: nothing to change here
     return {
         **base,
         "base_url": eff["base_url"],
@@ -130,7 +140,9 @@ def get_llm(user: dict = Depends(require_user)):
         "presets": PROVIDER_PRESETS,
         "models": cfg.get("models") or [],
         "enable_local": cfg.get("enable_local", False),
-        "ollama_url": _clean_ollama_url(cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434")),
+        "ollama_url": _clean_ollama_url(
+            cfg.get("ollama_url") or os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        ),
         "ollama_model": cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
         "openrouter_model": eff["model"],
     }
@@ -145,7 +157,7 @@ def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_admin)):
     conn = get_connection()
     cfg = _load_cfg(conn)
     eff = _effective(cfg)
-    new_key = ((body.api_key or "").strip() or (body.openrouter_key or "").strip())
+    new_key = (body.api_key or "").strip() or (body.openrouter_key or "").strip()
     provider = (body.provider or "").strip()
     detected = None
 
@@ -154,11 +166,15 @@ def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_admin)):
         cfg.pop("openrouter_key", None)
     elif new_key:
         detected = autoconfigure(
-            new_key, base_url=(body.base_url or None), provider=(provider or None),
+            new_key,
+            base_url=(body.base_url or None),
+            provider=(provider or None),
             model=((body.model or body.openrouter_model or "").strip() or None),
         )
         if not detected["ok"]:
-            raise HTTPException(status_code=400, detail={"error": detected["error"], "tried": detected["tried"]})
+            raise HTTPException(
+                status_code=400, detail={"error": detected["error"], "tried": detected["tried"]}
+            )
         cfg["api_key"] = new_key
         cfg.pop("openrouter_key", None)
         cfg.update({k: detected[k] for k in ("provider", "protocol", "base_url", "model")})
@@ -182,7 +198,7 @@ def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_admin)):
             cfg["provider"] = provider
             if preset:
                 cfg["protocol"] = preset.get("protocol", "openai")
-        model = ((body.model or body.openrouter_model or "").strip())
+        model = (body.model or body.openrouter_model or "").strip()
         if model:
             cfg["model"] = model
         elif preset and _host(preset["url"]) == _host(eff["base_url"]) and not cfg.get("model"):
@@ -197,7 +213,12 @@ def put_llm(body: LLMSettingsRequest, user: dict = Depends(require_admin)):
     _save_cfg(conn, cfg)
     out = {"ok": True}
     if detected:
-        out.update({k: detected[k] for k in ("provider", "label", "protocol", "base_url", "model", "models", "verified")})
+        out.update(
+            {
+                k: detected[k]
+                for k in ("provider", "label", "protocol", "base_url", "model", "models", "verified")
+            }
+        )
     return out
 
 
@@ -214,47 +235,86 @@ def test_llm(body: LLMTestRequest, user: dict = Depends(require_admin)):
     detection = None
 
     if typed_key:
-        detection = autoconfigure(typed_key, base_url=(base_in or None),
-                                  provider=((body.provider or "").strip() or None),
-                                  model=((body.model or "").strip() or None))
+        detection = autoconfigure(
+            typed_key,
+            base_url=(base_in or None),
+            provider=((body.provider or "").strip() or None),
+            model=((body.model or "").strip() or None),
+        )
         if not detection["ok"]:
-            return {"ok": False, "provider": "unknown", "model": body.model or "", "base_url": base_in,
-                    "error": detection["error"], "tried": detection["tried"]}
+            return {
+                "ok": False,
+                "provider": "unknown",
+                "model": body.model or "",
+                "base_url": base_in,
+                "error": detection["error"],
+                "tried": detection["tried"],
+            }
         api_key, base_url, protocol = typed_key, detection["base_url"], detection["protocol"]
         model, label = detection["model"], detection["provider"]
     else:
         base_url = clean_base_url(base_in or eff["base_url"])
         if base_in and _host(base_url) != _host(eff["base_url"]):
-            return {"ok": False, "provider": "custom", "model": body.model or eff["model"], "base_url": base_url,
-                    "error": "To test a different endpoint, paste its API key - the saved key is never sent to it."}
+            return {
+                "ok": False,
+                "provider": "custom",
+                "model": body.model or eff["model"],
+                "base_url": base_url,
+                "error": "To test a different endpoint, paste its API key - the saved key is never sent to it.",
+            }
         try:
             validate_outbound_url(base_url)
         except UnsafeURL as exc:
-            return {"ok": False, "provider": "custom", "model": eff["model"], "base_url": base_url, "error": str(exc)}
+            return {
+                "ok": False,
+                "provider": "custom",
+                "model": eff["model"],
+                "base_url": base_url,
+                "error": str(exc),
+            }
         api_key = eff["saved_key"] or eff["env_key"]
         model = (body.model or "").strip() or eff["model"]
-        label = ((body.provider or "").strip() or (cfg.get("provider") or "").strip()
-                 or preset_for_base_url(base_url) or "cloud")
+        label = (
+            (body.provider or "").strip()
+            or (cfg.get("provider") or "").strip()
+            or preset_for_base_url(base_url)
+            or "cloud"
+        )
         protocol = cfg.get("protocol") or (PRESET_BY_ID.get(label) or {}).get("protocol", "openai")
     if not api_key:
-        return {"ok": False, "provider": label, "model": model, "base_url": base_url,
-                "error": "No API key - paste one above, then test again."}
+        return {
+            "ok": False,
+            "provider": label,
+            "model": model,
+            "base_url": base_url,
+            "error": "No API key - paste one above, then test again.",
+        }
 
     if protocol == "anthropic":
         provider = AnthropicProvider(api_key=api_key, model=model, base_url=base_url, name=label)
     else:
         provider = OpenAICompatProvider(api_key=api_key, model=model, base_url=base_url, name=label)
     result = provider.generate(
-        "You are a connectivity probe. Reply with exactly one word.", "ping", timeout=25, max_tokens=16,
+        "You are a connectivity probe. Reply with exactly one word.",
+        "ping",
+        timeout=25,
+        max_tokens=16,
     )
     out = {
-        "ok": result.ok, "provider": provider.name, "model": provider.model,
-        "protocol": protocol, "base_url": provider.base_url, "latency_ms": result.latency_ms,
+        "ok": result.ok,
+        "provider": provider.name,
+        "model": provider.model,
+        "protocol": protocol,
+        "base_url": provider.base_url,
+        "latency_ms": result.latency_ms,
         "error": (None if result.ok else (result.error or "no reply from provider")),
     }
     if detection:
-        out["detected"] = {"provider": detection["provider"], "verified": detection["verified"],
-                           "models": detection["models"]}
+        out["detected"] = {
+            "provider": detection["provider"],
+            "verified": detection["verified"],
+            "models": detection["models"],
+        }
     return out
 
 
@@ -271,12 +331,14 @@ def set_checkin_time(body: CheckinTimeRequest, user: dict = Depends(require_user
 @router.get("/settings/blocked-windows")
 def get_blocked_windows(user: dict = Depends(require_user)):
     from core.generation import user_blocked_windows
+
     return {"blocked_windows": json.loads(user.get("blocked_windows") or "[]")}
 
 
 @router.put("/settings/blocked-windows")
 def put_blocked_windows(body: BlockedWindowsRequest, user: dict = Depends(require_user)):
     from core.generation import parse_time_window
+
     cleaned = []
     for w in body.blocked_windows:
         text = (w or "").strip()
@@ -303,6 +365,7 @@ def put_blocked_windows(body: BlockedWindowsRequest, user: dict = Depends(requir
 @router.get("/settings/persona")
 def get_persona(user: dict = Depends(require_user)):
     from core.generation import user_persona
+
     return {"persona": user_persona(get_connection(), user["id"])}
 
 
@@ -323,6 +386,7 @@ def put_location(body: LocationRequest, user: dict = Depends(require_user)):
 @router.put("/settings/persona")
 def put_persona(body: PersonaRequest, user: dict = Depends(require_user)):
     from core.generation import user_persona
+
     conn = get_connection()
     p = (getattr(body, "persona", None) or "").strip()
     conn.execute("UPDATE users SET persona=? WHERE id=?", (p, user["id"]))
@@ -343,59 +407,28 @@ def get_settings(user: dict = Depends(require_user)):
 def email_digest(user: dict = Depends(require_user)):
     """Send the full upcoming schedule to the user's email right now. Best-effort."""
     from core.mailer import smtp_configured, send_email_detailed
-    from core.persona import build_daily_email_html
+
     ratelimit.enforce(f"digest:{user['id']}", 5, 3600, "that's enough mail for one hour")
     conn = get_connection()
     if user["email"] and not user.get("verified"):
-        return {"ok": False, "reason": "confirm your email first (check your inbox or resend from Settings)",
-                "hint": sched_email_hint("no-email")}
+        return {
+            "ok": False,
+            "reason": "confirm your email first (check your inbox or resend from Settings)",
+            "hint": sched_email_hint("no-email"),
+        }
     if not user["email"]:
         return {"ok": False, "reason": "no email on file", "hint": sched_email_hint("no-email")}
     if not smtp_configured():
         from core.mailer import smtp_diag
+
         problems = "; ".join(smtp_diag()["problems"])
         return {"ok": False, "reason": problems or "SMTP not configured", "hint": sched_email_hint("smtp")}
     today_d = today_for(user)
     today = today_d.isoformat()
-    horizon = (today_d + timedelta(days=7)).isoformat()
-    goals = conn.execute(
-        "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
-    ).fetchall()
-    tasks = []
-    total_hours = 0.0
-    days_to_nearest = 999
-    for g in goals:
-        for a in conn.execute(
-            "SELECT * FROM actions WHERE goal_id=? AND date>=? AND date<=? ORDER BY date, order_idx",
-            (g["id"], today, horizon),
-        ).fetchall():
-            tasks.append({
-                "date": a["date"], "title": a["title"], "start_time": a["start_time"],
-                "end_time": a["end_time"], "status": a["status"], "goal": g["display_title"],
-                "goal_id": g["id"],
-            })
-            total_hours += (a["duration_min"] or 60) / 60.0
-        dl = generation.days_remaining(g["deadline"], today)
-        if dl >= 0:
-            days_to_nearest = min(days_to_nearest, dl)
-    body_lines = [f"{user['name']}, here's the week ahead. No improvising."]
-    if tasks:
-        by_day = {}
-        for t in tasks:
-            by_day.setdefault(t["date"], []).append(t)
-        for d in sorted(by_day):
-            head = "TODAY" if d == today else d
-            body_lines.append(f"\n— {head} —")
-            for t in by_day[d]:
-                ts = f"{t['start_time']}–{t['end_time']}" if t["start_time"] else ""
-                body_lines.append(f"  {ts} {t['title']} ({t['goal']}) [{t['status']}]")
-    else:
-        body_lines.append("Nothing booked for the week. That's suspicious.")
-    body_lines.append(f"\n~{round(total_hours)}h total in the week. Nearest deadline in {days_to_nearest} days.")
-    body_lines.append("\nEloise")
-    text = "\n".join(body_lines)
-    html = build_daily_email_html(user["name"], tasks, round(total_hours, 1), days_to_nearest)
-    ok, err = send_email_detailed(user["email"], "Eloise - your week, no improvising", text, html)
+    from core import emails
+
+    subject, text, html = emails.render_week(conn, user, today)
+    ok, err = send_email_detailed(user["email"], subject, text, html)
     if ok:
         return {"ok": True, "reason": "sent", "hint": sched_email_hint("ok")}
     return {"ok": False, "reason": err or "send failed", "hint": sched_email_hint("send")}
@@ -404,10 +437,14 @@ def email_digest(user: dict = Depends(require_user)):
 @router.get("/email/status")
 def email_status(user: dict = Depends(require_user)):
     from core.mailer import smtp_diag
+
     diag = smtp_diag()
     hint = sched_email_hint("ok" if diag["configured"] and user["email"] else "smtp")
     if not user.get("is_admin"):
-        diag = {"configured": diag["configured"], "problems": [] if diag["configured"] else ["Email is not switched on for this server."]}
+        diag = {
+            "configured": diag["configured"],
+            "problems": [] if diag["configured"] else ["Email is not switched on for this server."],
+        }
     return {
         **diag,
         "user_has_email": bool(user["email"]),
@@ -429,9 +466,7 @@ def sched_email_hint(code):
 def today(user: dict = Depends(require_user)):
     conn = get_connection()
     today = today_for(user).isoformat()
-    goals = conn.execute(
-        "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
-    ).fetchall()
+    goals = conn.execute("SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall()
     items = []
     interventions = []
     for g in goals:
@@ -439,27 +474,36 @@ def today(user: dict = Depends(require_user)):
             "SELECT * FROM actions WHERE goal_id=? AND date=? ORDER BY order_idx", (g["id"], today)
         ).fetchall()
         for a in acts:
-            items.append({
-                "id": a["id"], "goal_id": g["id"], "goal_title": g["display_title"],
-                "title": a["title"], "start_time": a["start_time"], "end_time": a["end_time"],
-                "status": a["status"],
-            })
+            items.append(
+                {
+                    "id": a["id"],
+                    "goal_id": g["id"],
+                    "goal_title": g["display_title"],
+                    "title": a["title"],
+                    "start_time": a["start_time"],
+                    "end_time": a["end_time"],
+                    "status": a["status"],
+                }
+            )
         ivs = conn.execute(
             "SELECT * FROM interventions WHERE goal_id=? AND acknowledged=0", (g["id"],)
         ).fetchall()
         for iv in ivs:
-            interventions.append({
-                "id": iv["id"], "goal_id": g["id"], "message": iv["message"], "type": iv["type"],
-            })
+            interventions.append(
+                {
+                    "id": iv["id"],
+                    "goal_id": g["id"],
+                    "message": iv["message"],
+                    "type": iv["type"],
+                }
+            )
     return {"items": items, "interventions": interventions, "date": today}
 
 
 @router.post("/interventions/{iv_id}/acknowledge")
 def acknowledge(iv_id: int, user: dict = Depends(require_user)):
     conn = get_connection()
-    row = conn.execute(
-        "SELECT * FROM interventions WHERE id=? AND user_id=?", (iv_id, user["id"])
-    ).fetchone()
+    row = conn.execute("SELECT * FROM interventions WHERE id=? AND user_id=?", (iv_id, user["id"])).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="intervention not found")
     conn.execute("UPDATE interventions SET acknowledged=1 WHERE id=?", (iv_id,))
@@ -471,18 +515,14 @@ def acknowledge(iv_id: int, user: dict = Depends(require_user)):
 def scoreboard(user: dict = Depends(require_user)):
     conn = get_connection()
     today = today_for(user).isoformat()
-    rows = conn.execute(
-        "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall()
     scored = []
     for g in rows:
         try:
             dl = generation.days_remaining(g["deadline"], today)
-        except ValueError:                 # legacy row with a non-date deadline
+        except ValueError:  # legacy row with a non-date deadline
             dl = 0
-        plan = conn.execute(
-            "SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (g["id"],)
-        ).fetchall()
+        plan = conn.execute("SELECT * FROM actions WHERE goal_id=? ORDER BY order_idx", (g["id"],)).fetchall()
         pl_min = sum(a["duration_min"] or 60 for a in plan)
         done_min = sum(a["duration_min"] or 60 for a in plan if a["status"] == "done")
         planned_days = sorted(set(a["date"] for a in plan))
@@ -500,19 +540,23 @@ def scoreboard(user: dict = Depends(require_user)):
             risk = "safe" if pace <= 4.0 else "at_risk"
         else:
             risk = "safe"
-        scored.append({
-            "goal_id": g["id"],
-            "title": g["display_title"],
-            "deadline": g["deadline"],
-            "days_left": dl,
-            "shortfall_hours": buffer_hours,
-            "pace_hours_per_day": 0.0,
-            "days_needed_at_pace": 0,
-            "open_blocker_count": open_blockers,
-            "missed_days": missed,
-            "risk": risk,
-        })
-    scored.sort(key=lambda s: {"safe": 0, "at_risk": 1, "impossible": 2, "overdue": 3}[s["risk"]], reverse=True)
+        scored.append(
+            {
+                "goal_id": g["id"],
+                "title": g["display_title"],
+                "deadline": g["deadline"],
+                "days_left": dl,
+                "shortfall_hours": buffer_hours,
+                "pace_hours_per_day": 0.0,
+                "days_needed_at_pace": 0,
+                "open_blocker_count": open_blockers,
+                "missed_days": missed,
+                "risk": risk,
+            }
+        )
+    scored.sort(
+        key=lambda s: {"safe": 0, "at_risk": 1, "impossible": 2, "overdue": 3}[s["risk"]], reverse=True
+    )
     return {"goals": scored, "worst": (scored[0] if scored else None), "date": today}
 
 
@@ -531,9 +575,7 @@ def schedule(user: dict = Depends(require_user)):
         (today, user["id"]),
     )
     conn.commit()
-    goals = conn.execute(
-        "SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)
-    ).fetchall()
+    goals = conn.execute("SELECT * FROM goals WHERE user_id=? AND status='active'", (user["id"],)).fetchall()
     out = {"dates": {}, "missed_total": 0, "today": today}
     for g in goals:
         acts = conn.execute(
@@ -542,10 +584,16 @@ def schedule(user: dict = Depends(require_user)):
         ).fetchall()
         by_date = {}
         for a in acts:
-            by_date.setdefault(a["date"], []).append({
-                "id": a["id"], "title": a["title"], "start_time": a["start_time"], "end_time": a["end_time"],
-                "status": a["status"], "goal_id": g["id"],
-            })
+            by_date.setdefault(a["date"], []).append(
+                {
+                    "id": a["id"],
+                    "title": a["title"],
+                    "start_time": a["start_time"],
+                    "end_time": a["end_time"],
+                    "status": a["status"],
+                    "goal_id": g["id"],
+                }
+            )
         missed_here = sum(1 for a in acts if a["status"] == "missed")
         out["missed_total"] += missed_here
         out["dates"][str(g["id"])] = {"title": g["display_title"], "by_date": by_date}
@@ -558,6 +606,7 @@ def day_view(date: str = "", user: dict = Depends(require_user)):
     parts of the day that are NOT free (sleep, meals, the user's always-busy
     windows and every goal's own constraints), and the current local time."""
     from datetime import date as _date
+
     conn = get_connection()
     now = now_for(user)
     try:
@@ -571,9 +620,17 @@ def day_view(date: str = "", user: dict = Depends(require_user)):
         "WHERE a.user_id=? AND a.date=? AND g.status='active' ORDER BY a.start_time",
         (user["id"], iso),
     ).fetchall():
-        items.append({"id": a["id"], "goal_id": a["goal_id"], "goal_title": a["display_title"],
-                      "title": a["title"], "start_time": a["start_time"], "end_time": a["end_time"],
-                      "status": a["status"]})
+        items.append(
+            {
+                "id": a["id"],
+                "goal_id": a["goal_id"],
+                "goal_title": a["display_title"],
+                "title": a["title"],
+                "start_time": a["start_time"],
+                "end_time": a["end_time"],
+                "status": a["status"],
+            }
+        )
 
     def _fmt(m):
         m %= 24 * 60
@@ -583,8 +640,9 @@ def day_view(date: str = "", user: dict = Depends(require_user)):
     for w in generation.user_blocked_windows(user):
         busy.append({"label": "always busy", "kind": "busy", "start": _fmt(w[0]), "end": _fmt(w[1])})
     details = {}
-    for g in conn.execute("SELECT constraints, details FROM goals WHERE user_id=? AND status='active'",
-                          (user["id"],)).fetchall():
+    for g in conn.execute(
+        "SELECT constraints, details FROM goals WHERE user_id=? AND status='active'", (user["id"],)
+    ).fetchall():
         for c in json.loads(g["constraints"] or "[]"):
             w = generation.parse_time_window(c)
             if w:
@@ -614,15 +672,18 @@ def day_view(date: str = "", user: dict = Depends(require_user)):
 def triage_view(user: dict = Depends(require_user)):
     """Which goal wins when life does not fit, and which soft commitments should give way."""
     from core import triage
+
     return triage.triage(get_connection(), user, today_for(user).isoformat())
 
 
 @router.get("/outline/{goal_id}")
 def goal_outline(goal_id: int, user: dict = Depends(require_user)):
     """The monthly/weekly roadmap for a far-off goal (empty for short, daily-planned goals)."""
-    row = get_connection().execute(
-        "SELECT outline, deadline FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"])
-    ).fetchone()
+    row = (
+        get_connection()
+        .execute("SELECT outline, deadline FROM goals WHERE id=? AND user_id=?", (goal_id, user["id"]))
+        .fetchone()
+    )
     if not row:
         raise HTTPException(status_code=404, detail="goal not found")
     try:
@@ -639,15 +700,23 @@ def goal_outline(goal_id: int, user: dict = Depends(require_user)):
 # Settings always wins (this never overwrites it).
 # ---------------------------------------------------------------------------
 _ENV_KEYS = (
-    ("LLM_API_KEY", None), ("GEMINI_API_KEY", "gemini"), ("GOOGLE_API_KEY", "gemini"),
-    ("ANTHROPIC_API_KEY", "anthropic"), ("OPENROUTER_API_KEY", "openrouter"),
-    ("GROQ_API_KEY", "groq"), ("MISTRAL_API_KEY", "mistral"), ("DEEPSEEK_API_KEY", "deepseek"),
-    ("XAI_API_KEY", "xai"), ("TOGETHER_API_KEY", "together"), ("OPENAI_API_KEY", None),
+    ("LLM_API_KEY", None),
+    ("GEMINI_API_KEY", "gemini"),
+    ("GOOGLE_API_KEY", "gemini"),
+    ("ANTHROPIC_API_KEY", "anthropic"),
+    ("OPENROUTER_API_KEY", "openrouter"),
+    ("GROQ_API_KEY", "groq"),
+    ("MISTRAL_API_KEY", "mistral"),
+    ("DEEPSEEK_API_KEY", "deepseek"),
+    ("XAI_API_KEY", "xai"),
+    ("TOGETHER_API_KEY", "together"),
+    ("OPENAI_API_KEY", None),
 )
 
 
 def bootstrap_llm_from_env():
     import logging
+
     log = logging.getLogger("eloise.llm")
     conn = get_connection()
     if _load_cfg(conn).get("api_key"):
@@ -656,16 +725,25 @@ def bootstrap_llm_from_env():
         key = (os.environ.get(var) or "").strip()
         if not key:
             continue
-        provider = (os.environ.get("LLM_PROVIDER") or "").strip() or (preset_id if preset_id in PRESET_BY_ID else None)
-        det = autoconfigure(key, base_url=(os.environ.get("LLM_BASE_URL") or "").strip() or None,
-                            provider=provider, model=(os.environ.get("LLM_MODEL") or "").strip() or None)
+        provider = (os.environ.get("LLM_PROVIDER") or "").strip() or (
+            preset_id if preset_id in PRESET_BY_ID else None
+        )
+        det = autoconfigure(
+            key,
+            base_url=(os.environ.get("LLM_BASE_URL") or "").strip() or None,
+            provider=provider,
+            model=(os.environ.get("LLM_MODEL") or "").strip() or None,
+        )
         if not det["ok"]:
             log.warning("%s is set but could not be verified: %s", var, det["error"])
             continue
         cfg = {"api_key": key, "models": det["models"]}
         cfg.update({k: det[k] for k in ("provider", "protocol", "base_url", "model")})
-        conn.execute("INSERT INTO app_settings (key, value) VALUES ('llm', ?) "
-                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(cfg),))
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('llm', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(cfg),),
+        )
         conn.commit()
         log.info("LLM configured from %s: %s / %s", var, det["provider"], det["model"])
         return True

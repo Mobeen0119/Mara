@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from datetime import date as _date
+from datetime import date as _date, timedelta
 from html import escape as _e
 
 logger = logging.getLogger("eloise.emails")
@@ -371,3 +371,190 @@ def send_first_day(conn, user, goal):
         notes=day_notes(conn, user, row["d"], [(goal["display_title"], _tasks(conn, goal["id"], row["d"]))]),
     )
     return _send(conn, user, "first_day_mail", subject, text, html)
+
+
+def _pretty_day(iso, today):
+    d = _date.fromisoformat(iso)
+    tag = (
+        "Today"
+        if iso == today
+        else ("Tomorrow" if (d - _date.fromisoformat(today)).days == 1 else d.strftime("%A"))
+    )
+    return f"{tag} - {d.strftime('%a %d %b')}"
+
+
+def week_notes(conn, user, days, by_day):
+    """Medical/important items for the whole week: ones true on every day are shown once as 'Every day'."""
+    per_day = {d: day_notes(conn, user, d, [("", by_day.get(d, []))]) for d in days}
+    seen = {}
+    for d, notes in per_day.items():
+        for n in notes:
+            seen.setdefault((n["kind"], n["text"]), []).append(d)
+    out = []
+    for (kind, text), where in seen.items():
+        when = (
+            "Every day"
+            if len(where) == len(days)
+            else ", ".join(_date.fromisoformat(x).strftime("%a %d") for x in where)
+        )
+        out.append({"kind": kind, "text": f"{when}: {text}"})
+    order = {"medical": 0, "important": 1, "care": 2}
+    return sorted(out, key=lambda n: order[n["kind"]])[:12]
+
+
+def render_week(conn, user, today, horizon_days=7):
+    """The week as tables: totals, what needs attention, deadlines, then one table of every block by day."""
+    start = _date.fromisoformat(today)
+    days = [(start + timedelta(days=i)).isoformat() for i in range(horizon_days + 1)]
+    goals = conn.execute(
+        "SELECT id, display_title, deadline, open_ended FROM goals WHERE user_id=? AND status='active' ORDER BY id",
+        (user["id"],),
+    ).fetchall()
+    by_day, done, planned, per_goal = {}, 0, 0, {}
+    for g in goals:
+        for t in conn.execute(
+            "SELECT * FROM actions WHERE goal_id=? AND date>=? AND date<=? ORDER BY date, start_time, order_idx",
+            (g["id"], days[0], days[-1]),
+        ):
+            t = dict(t)
+            t["goal"] = g["display_title"]
+            by_day.setdefault(t["date"], []).append(t)
+            planned += 1
+            done += t["status"] == "done"
+            tot = per_goal.setdefault(g["id"], [0, 0])
+            tot[0] += t["status"] == "done"
+            tot[1] += 1
+    for items in by_day.values():
+        items.sort(key=lambda t: (t.get("start_time") or "99:99"))
+    mins = sum(_minutes(t) for items in by_day.values() for t in items)
+    notes = week_notes(conn, user, days, by_day)
+    notes_html, notes_md = _notes_table(notes)
+    th, td = (
+        _TH,
+        "padding:8px 10px;border:1px solid #e0d2bc;vertical-align:top;font:13px/1.45 Helvetica,Arial,sans-serif;color:#2b2118;",
+    )
+
+    def table(head, rows):
+        cells = "".join(f"<th style='{th}'>{_e(h)}</th>" for h in head)
+        return (
+            "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse'>"
+            f"<tr>{cells}</tr>{''.join(rows)}</table>"
+        )
+
+    def row(cells, n=0, extra=""):
+        bg = "#fbf4e8" if n % 2 else "#fffaf2"
+        return (
+            "<tr>"
+            + "".join(f"<td class='cell' style='{td}background:{bg};{extra}'>{c}</td>" for c in cells)
+            + "</tr>"
+        )
+
+    next_due = min(
+        (
+            (_date.fromisoformat(g["deadline"]) - start).days
+            for g in goals
+            if g["deadline"] and not g["open_ended"] and g["deadline"] >= today
+        ),
+        default=None,
+    )
+    stats = table(
+        ["Blocks", "Focused time", "Done so far", "Nearest deadline"],
+        [
+            row(
+                [
+                    str(planned),
+                    _e(_length(mins) or "-"),
+                    f"{done} of {planned}",
+                    "-" if next_due is None else f"in {next_due} day{'s' if next_due != 1 else ''}",
+                ]
+            )
+        ],
+    )
+    deadline_rows = []
+    for n, g in enumerate(goals):
+        d, p = per_goal.get(g["id"], [0, 0])
+        due = "No fixed deadline" if g["open_ended"] or not g["deadline"] else g["deadline"]
+        left = "-" if due[0] == "N" else str((_date.fromisoformat(g["deadline"]) - start).days)
+        deadline_rows.append(row([_e(g["display_title"]), _e(due), left, f"{d} of {p} this week"], n))
+    deadlines = table(["Goal", "Due", "Days left", "Progress"], deadline_rows) if deadline_rows else ""
+
+    body_rows, md = (
+        [],
+        [f"# Your week", "", f"{planned} blocks, {_length(mins) or '0m'} of focused time, {done} done.", ""]
+        + notes_md,
+    )
+    md += ["## Deadlines", "", "| Goal | Due | Days left | Progress |", "| --- | --- | --- | --- |"]
+    for g in goals:
+        d, p = per_goal.get(g["id"], [0, 0])
+        due = "No fixed deadline" if g["open_ended"] or not g["deadline"] else g["deadline"]
+        left = "-" if due[0] == "N" else (_date.fromisoformat(g["deadline"]) - start).days
+        md.append(f"| {g['display_title']} | {due} | {left} | {d} of {p} |")
+    md += [
+        "",
+        "## Day by day",
+        "",
+        "| Day | Time | Task | Goal | Length | Status |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    n = 0
+    for d in days:
+        items = by_day.get(d, [])
+        dm = sum(_minutes(t) for t in items)
+        label = _pretty_day(d, today)
+        body_rows.append(
+            "<tr><td colspan='5' style='padding:9px 10px;background:#2b2118;color:#f4ece0;"
+            f"font:700 13px Helvetica,Arial,sans-serif;border:1px solid #2b2118'>{_e(label)}"
+            f"<span style='float:right;font-weight:400;color:#d9a566'>{len(items)} block{'s' if len(items) != 1 else ''}"
+            f"{' - ' + _length(dm) if dm else ''}</span></td></tr>"
+        )
+        if not items:
+            body_rows.append(
+                row([_e("Nothing planned - a real day off."), "", "", "", ""], 0, "color:#8a7a64;")
+            )
+            md.append(f"| {label} | - | Nothing planned | - | - | - |")
+        for t in items:
+            is_done = t["status"] == "done"
+            strike = "text-decoration:line-through;color:#8a7a64;" if is_done else ""
+            status = (
+                "<b style='color:#2e7d32'>Done</b>"
+                if is_done
+                else (
+                    "<b style='color:#b3261e'>Missed</b>"
+                    if t["status"] == "missed"
+                    else "<b style='color:#8a5a22'>To do</b>"
+                )
+            )
+            length = _length(_minutes(t)) or "-"
+            body_rows.append(
+                row([_e(_span(t)), _e(str(t["title"])), _e(t["goal"]), _e(length), status], n, strike)
+            )
+            md.append(f"| {label} | {_span(t)} | {t['title']} | {t['goal']} | {length} | {t['status']} |")
+            n += 1
+    day_table = table(["Time", "Task", "Goal", "Length", "Status"], body_rows)
+    url = _app_url()
+    button = (
+        f"<p style='margin:26px 0 0'><a href='{_e(url)}' style='display:inline-block;background:#2b2118;color:#f4ece0;"
+        "text-decoration:none;border-radius:10px;padding:12px 22px;font:600 14px Helvetica,Arial,sans-serif'>Open Eloise</a></p>"
+        if url
+        else ""
+    )
+    hello = f"{user['name']}, here is the week ahead."
+    heading = (
+        lambda t: f"<p style='margin:24px 0 8px;font:700 14px Georgia,serif;color:#2b2118;border-left:4px solid #d9a566;padding-left:10px'>{t}</p>"
+    )
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        f"<meta name='color-scheme' content='light dark'>{_CSS}</head><body class='bg' style='margin:0;background:#f4ece0'>"
+        f"<div style='display:none;max-height:0;overflow:hidden'>{planned} blocks, {_e(_length(mins) or '0m')} this week</div>"
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' class='bg' style='background:#f4ece0'>"
+        "<tr><td align='center' style='padding:24px 12px'>"
+        "<table role='presentation' width='680' cellpadding='0' cellspacing='0' class='card' style='width:100%;max-width:680px;"
+        "background:#fffaf2;border-radius:16px;overflow:hidden;border:1px solid #eadfcf'>"
+        "<tr><td style='background:#2b2118;padding:24px 28px'><div style='font:700 22px Georgia,serif;color:#f4ece0'>Eloise</div>"
+        "<div style='font:600 14px Helvetica,Arial,sans-serif;color:#d9a566;margin-top:4px'>Your week</div></td></tr>"
+        f"<tr><td class='pad' style='padding:26px 28px 30px'><p class='ink' style='margin:0 0 14px;font:18px/1.5 Georgia,serif;color:#2b2118'>{_e(hello)}</p>"
+        f"{stats}{notes_html}{heading('Deadlines') + deadlines if deadlines else ''}{heading('Day by day')}{day_table}{button}"
+        "<p class='muted' style='margin:24px 0 0;font:13px Helvetica,Arial,sans-serif;color:#7a6a55'>Mark blocks done in the app. No 'almost'.</p>"
+        "</td></tr></table></td></tr></table></body></html>"
+    )
+    return "Eloise - your week", "\n".join(md), html
